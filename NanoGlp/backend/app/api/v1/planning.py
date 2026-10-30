@@ -1,0 +1,836 @@
+from datetime import date, datetime, time, timedelta
+from typing import List, Optional
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, model_validator
+from sqlalchemy.orm import Session, selectinload
+
+from app.database import get_db
+from app.models.conflict import Conflict, ConflictSeverity
+from app.models.study import Study, StudyStatus
+from app.models.study_step import StudyStep, StepStatus
+from app.models.user import User, UserRole
+from app.models.audit_log import AuditLog
+from app.models.document import Document
+from app.schemas.conflict import ConflictOut
+from app.services.scheduling_engine import (
+    apply_conflict_resolution,
+    build_conflict_resolutions,
+    check_personnel_workload,
+    calculate_personnel_workload,
+    get_study_schedule_detail,
+    schedule_new_study,
+    MAX_DAILY_WORKLOAD_MINUTES,
+)
+from app.services.templates import TEMPLATES, DEFAULT_TEMPLATE_CODE, get_template
+from app.utils.security import get_current_user, require_management_read, require_management_write
+
+router = APIRouter(prefix="/planning", tags=["Operasyonel Planlama ve Çakışma Yönetimi"])
+
+
+class ScheduleStudyRequest(BaseModel):
+    """study_id VEYA study_code verilmelidir. Kod sistemde yoksa DRAFT çalışma açılır."""
+    study_id: Optional[int] = None
+    study_code: Optional[str] = None
+    acclimatization_start_date: date
+    study_director_id: Optional[int] = None
+    former_study_director_name: Optional[str] = None
+    template_code: str = DEFAULT_TEMPLATE_CODE
+    extraction_start_offset_days: Optional[int] = None
+    align_extraction_to_friday: bool = False
+
+    # FAZ 6 & 6.1: Birleştirilmiş çalışma dosyasından (Master Study Profile) gelen zengin GLP verileri
+    title: Optional[str] = None
+    test_type: Optional[str] = None
+    guideline: Optional[str] = None
+    sponsor_name: Optional[str] = None
+    sponsor_contact: Optional[str] = None
+    test_item_name: Optional[str] = None
+    test_item_batch: Optional[str] = None
+    manufacture_date: Optional[str] = None
+    expiry_date: Optional[str] = None
+    test_item_storage_condition: Optional[str] = None
+    physical_state: Optional[str] = None
+    sterility: Optional[str] = None
+    extraction_polar: Optional[bool] = None
+    extraction_polar_solvent: Optional[str] = None
+    extraction_non_polar: Optional[bool] = None
+    extraction_non_polar_solvent: Optional[str] = None
+    extraction_ratio: Optional[str] = None
+    extraction_conditions: Optional[str] = None
+    animal_species_strain: Optional[str] = None
+    animal_count: Optional[int] = None
+    animal_birth_date: Optional[str] = None
+    requested_start_period: Optional[str] = None
+    dossier_metadata: Optional[dict] = None
+    source_document_id: Optional[int] = None
+    source_document_ids: Optional[List[int]] = None
+
+    @model_validator(mode="after")
+    def _require_identifier(self):
+        if self.study_id is None and not (self.study_code and self.study_code.strip()):
+            raise ValueError("study_id veya study_code alanlarından biri zorunludur.")
+        return self
+
+
+class CheckWorkloadRequest(BaseModel):
+    personnel_id: int
+    target_date: date
+    study_id: Optional[int] = None
+
+
+class ResolveConflictRequest(BaseModel):
+    resolution_notes: str
+    resolved_by_id: Optional[int] = None
+
+
+class ApplyResolutionRequest(BaseModel):
+    action: str
+    target_user_id: Optional[int] = None
+
+
+class UpdateStepStatusRequest(BaseModel):
+    status: StepStatus
+    notes: Optional[str] = None
+
+
+def _serialize_step(s: StudyStep) -> dict:
+    return {
+        "id": s.id,
+        "study_id": s.study_id,
+        "study_code": s.study.study_code,
+        "study_title": s.study.title,
+        "study_status": s.study.status.value,
+        "study_day": s.study_day,
+        "step_order": s.step_order,
+        "step_name": s.step_name,
+        "step_type": s.step_type,
+        "planned_start": s.planned_start.isoformat(),
+        "planned_end": s.planned_end.isoformat(),
+        "actual_start": s.actual_start.isoformat() if s.actual_start else None,
+        "actual_end": s.actual_end.isoformat() if s.actual_end else None,
+        "duration_minutes": s.duration_minutes,
+        "is_biological_fixed_time": s.is_biological_fixed_time,
+        "biological_tolerance_minutes": s.biological_tolerance_minutes,
+        "assignee_ids": s.assignee_ids,
+        "assignee_names": [u.full_name for u in s.assignees],
+        "status": s.status.value,
+    }
+
+
+def _apply_dossier_fields_to_study(study: Study, payload: ScheduleStudyRequest) -> None:
+    """Birleştirilmiş çalışma dosyasından (Dossier) gelen alanları Study modeline yazar."""
+    study.acclimatization_start_date = payload.acclimatization_start_date
+    if payload.study_director_id is not None:
+        study.study_director_id = payload.study_director_id
+    for attr in (
+        "title",
+        "test_type",
+        "guideline",
+        "sponsor_name",
+        "sponsor_contact",
+        "test_item_name",
+        "test_item_batch",
+        "manufacture_date",
+        "expiry_date",
+        "test_item_storage_condition",
+        "physical_state",
+        "sterility",
+        "extraction_polar",
+        "extraction_polar_solvent",
+        "extraction_non_polar",
+        "extraction_non_polar_solvent",
+        "extraction_ratio",
+        "extraction_conditions",
+        "animal_species_strain",
+        "animal_count",
+        "animal_birth_date",
+        "requested_start_period",
+        "dossier_metadata",
+    ):
+        val = getattr(payload, attr, None)
+        if val is not None and val != "":
+            setattr(study, attr, val)
+
+
+def _resolve_or_create_draft_study(db: Session, payload: ScheduleStudyRequest) -> Study:
+    try:
+        template = get_template(payload.template_code)
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+
+    if payload.study_id is not None:
+        study = db.query(Study).filter(Study.id == payload.study_id).first()
+        if not study:
+            raise HTTPException(status_code=404, detail="GLP çalışması bulunamadı.")
+        if study.status == StudyStatus.DRAFT:
+            _apply_dossier_fields_to_study(study, payload)
+            db.commit()
+            db.refresh(study)
+        return study
+
+    code = payload.study_code.strip()
+    study = db.query(Study).filter(Study.study_code == code).first()
+    if study:
+        if study.status == StudyStatus.DRAFT:
+            _apply_dossier_fields_to_study(study, payload)
+            db.commit()
+            db.refresh(study)
+        return study
+
+    # Çalışma Yöneticisi: açıkça verilen ya da sistemdeki ilk aktif SD
+    director_id = payload.study_director_id
+    if director_id is None:
+        sd = db.query(User).filter(
+            User.role == UserRole.STUDY_DIRECTOR, User.is_active == True
+        ).order_by(User.id).first()
+        if not sd:
+            raise HTTPException(
+                status_code=400,
+                detail="Sistemde aktif bir Çalışma Yöneticisi (STUDY_DIRECTOR) yok. Önce SD tanımlayın."
+            )
+        director_id = sd.id
+
+    study = Study(
+        study_code=code,
+        title=payload.title or f"{template.standard} {template.title} ({code})",
+        test_item_name=payload.test_item_name or "BELİRTİLMEDİ — SD tarafından girilecek",
+        study_director_id=director_id,
+        status=StudyStatus.DRAFT,
+    )
+    _apply_dossier_fields_to_study(study, payload)
+    db.add(study)
+    db.commit()
+    db.refresh(study)
+
+    db.add(AuditLog(
+        user_id=director_id,
+        entity_name="Study",
+        entity_id=study.id,
+        action="CREATE",
+        reason=f"Planlama ekranından '{code}' kodlu DRAFT çalışma oluşturuldu.",
+    ))
+    db.commit()
+    return study
+
+
+@router.post("/schedule-study", summary="Yeni Çalışma Ekleme ve Çakışma Analizi (Non-Destructive)")
+def api_schedule_new_study(
+    payload: ScheduleStudyRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_management_write),
+):
+    """
+    Onaylanmış mevcut çalışmaların saatlerine DOKUNMADAN (Non-destructive)
+    yeni çalışmanın adımlarını ve çakışmalarını (9 saat iş yükü, biyolojik kilitler, kaynak çakışmaları)
+    tespit eder ve Conflict tablosuna kaydeder.
+    """
+    study = _resolve_or_create_draft_study(db, payload)
+    try:
+        result = schedule_new_study(
+            db=db,
+            study_id=study.id,
+            acclimatization_start_date=payload.acclimatization_start_date,
+            template_code=payload.template_code,
+            extraction_start_offset_days=payload.extraction_start_offset_days,
+            align_extraction_to_friday=payload.align_extraction_to_friday,
+        )
+    except PermissionError as pe:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(pe))
+    except ValueError as ve:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(ve))
+
+    if payload.former_study_director_name:
+        assigned_sd = db.query(User).filter(User.id == study.study_director_id).first()
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                entity_name="Study",
+                entity_id=study.id,
+                action="SD_HANDOVER_ASSIGNMENT",
+                old_values={"document_study_director": payload.former_study_director_name},
+                new_values={
+                    "assigned_study_director_id": study.study_director_id,
+                    "assigned_study_director_name": assigned_sd.full_name if assigned_sd else None,
+                },
+                reason=(
+                    f"Belgede yer alan eski Çalışma Direktörü '{payload.former_study_director_name}' yerine "
+                    f"aktif Çalışma Direktörü '{assigned_sd.full_name if assigned_sd else study.study_director_id}' "
+                    f"{current_user.username} onayıyla atandı."
+                ),
+            )
+        )
+        db.commit()
+
+    if payload.source_document_id is not None:
+        source = db.query(Document).filter(Document.id == payload.source_document_id).first()
+        extracted = (source.extracted_data or {}) if source else {}
+        db.add(AuditLog(
+            user_id=current_user.id,
+            entity_name="Study",
+            entity_id=study.id,
+            action="PLAN_FROM_AI_DOCUMENT",
+            old_values={
+                "ai_study_code": extracted.get("study_code"),
+                "ai_requested_start_date": extracted.get("requested_start_date"),
+            },
+            new_values={
+                "study_code": study.study_code,
+                "acclimatization_start_date": payload.acclimatization_start_date.isoformat(),
+                "source_document_id": payload.source_document_id,
+                "source_sha256": source.sha256 if source else None,
+            },
+            reason=(f"{current_user.username}, AI tarafından '{source.original_filename if source else '?'}' "
+                    f"belgesinden çıkarılan verileri doğrulayarak planlamayı başlattı."),
+        ))
+        db.commit()
+        result["source_document_id"] = payload.source_document_id
+    return result
+
+
+@router.post("/check-workload", summary="Personel Günlük 9 Saat (540 dk) İş Yükü Denetimi")
+def api_check_personnel_workload(
+    payload: CheckWorkloadRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_management_write),
+):
+    """
+    Toplam 540 dakikayı (9 saati) aşarsa sistem CRITICAL PERSONNEL_OVERLAP üretir ve saati sessizce kaydırmaz.
+    """
+    conflict = check_personnel_workload(
+        db=db,
+        personnel_id=payload.personnel_id,
+        target_date=payload.target_date,
+        study_id=payload.study_id,
+    )
+    if conflict:
+        return {
+            "has_conflict": True,
+            "conflict": {
+                "id": conflict.id,
+                "type": conflict.conflict_type.value,
+                "severity": conflict.severity.value,
+                "title": conflict.title,
+                "description": conflict.description,
+            },
+        }
+    return {
+        "has_conflict": False,
+        "message": "Personel iş yükü yasal ve GLP 9 saat (540 dk) sınırları içerisindedir.",
+    }
+
+
+def _collect_active_dates_and_weeks(db: Session) -> dict:
+    """Veritabanındaki tüm iptal edilmemiş görevlerin düştüğü benzersiz tarih ve haftaları (Pazartesi) döner."""
+    rows = (
+        db.query(StudyStep.planned_start, StudyStep.planned_end)
+        .join(StudyStep.study)
+        .filter(
+            StudyStep.status != StepStatus.CANCELLED,
+            Study.status != StudyStatus.CANCELLED,
+        )
+        .order_by(StudyStep.planned_start.asc())
+        .all()
+    )
+    active_dates_set = set()
+    for ps, _pe in rows:
+        if ps:
+            active_dates_set.add(ps.date())
+    sorted_dates = sorted(active_dates_set)
+    active_dates = [d.isoformat() for d in sorted_dates]
+    active_weeks = sorted({(d - timedelta(days=d.weekday())).isoformat() for d in sorted_dates})
+    today = date.today()
+    today_iso = today.isoformat()
+    default_focus_date = today_iso if today_iso in active_dates else (active_dates[0] if active_dates else today_iso)
+    focus_dt = date.fromisoformat(default_focus_date)
+    default_focus_week = (focus_dt - timedelta(days=focus_dt.weekday())).isoformat()
+    return {
+        "active_dates": active_dates,
+        "active_weeks": active_weeks,
+        "default_focus_date": default_focus_date,
+        "default_focus_week": default_focus_week,
+    }
+
+
+@router.get("/workload", summary="Tüm Personelin Günlük İş Yükü (Salt-Okunur)")
+def api_get_daily_workload(
+    target_date: date = Query(default_factory=date.today, description="YYYY-MM-DD"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_management_read),
+):
+    """Her personelin hedef gündeki toplam dakikasını ve görev olan aktif tarihleri döner. Conflict tablosuna yazmaz."""
+    users = db.query(User).filter(User.is_active == True).order_by(User.full_name).all()
+    result = []
+    for u in users:
+        wl = calculate_personnel_workload(db, u.id, target_date)
+        wl.update({
+            "full_name": u.full_name,
+            "email": u.email,
+            "role": u.role.value,
+            "qualifications": u.qualifications or [],
+        })
+        result.append(wl)
+    cal_meta = _collect_active_dates_and_weeks(db)
+    return {
+        "date": target_date.isoformat(),
+        "limit_minutes": MAX_DAILY_WORKLOAD_MINUTES,
+        "personnel": result,
+        **cal_meta,
+    }
+
+
+@router.get("/workload-weekly", summary="Tüm Personelin Haftalık (Pazartesi–Pazar) İş Yükü Matrisi (FAZ 6.3)")
+def api_get_weekly_workload(
+    target_date: date = Query(default_factory=date.today, description="Haftanın herhangi bir günü (YYYY-MM-DD)"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_management_read),
+):
+    """Seçilen haftanın 7 günü (Pzt–Paz) boyunca tüm aktif personelin günlük dakikalarını ve görevlerini döner."""
+    monday = target_date - timedelta(days=target_date.weekday())
+    days = [monday + timedelta(days=i) for i in range(7)]
+    users = db.query(User).filter(User.is_active == True).order_by(User.full_name).all()
+    personnel_matrix = []
+    for u in users:
+        daily = []
+        for d in days:
+            wl = calculate_personnel_workload(db, u.id, d)
+            daily.append({
+                "date": d.isoformat(),
+                "total_minutes": wl["total_minutes"],
+                "exceeds_limit": wl["exceeds_limit"],
+                "task_count": len(wl["tasks"]),
+                "tasks": wl["tasks"],
+            })
+        personnel_matrix.append({
+            "personnel_id": u.id,
+            "full_name": u.full_name,
+            "role": u.role.value,
+            "qualifications": u.qualifications or [],
+            "weekly_total_minutes": sum(item["total_minutes"] for item in daily),
+            "weekly_task_count": sum(item["task_count"] for item in daily),
+            "any_day_exceeds": any(item["exceeds_limit"] for item in daily),
+            "daily": daily,
+        })
+    cal_meta = _collect_active_dates_and_weeks(db)
+    return {
+        "week_start": days[0].isoformat(),
+        "week_end": days[-1].isoformat(),
+        "days": [d.isoformat() for d in days],
+        "limit_minutes": MAX_DAILY_WORKLOAD_MINUTES,
+        "personnel": personnel_matrix,
+        **cal_meta,
+    }
+
+
+@router.get("/calendar", summary="Kalıcı Master Operasyon Takvimi — Tüm Çalışmalar, Adımlar ve Çakışmalar (FAZ 6.3)")
+def api_get_master_calendar(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_management_read),
+):
+    """
+    Sistemde kayıtlı tüm aktif ve taslak çalışmaları (DRAFT, APPROVED, IN_PROGRESS),
+    adımlarını, açık çakışmalarını (tek tık çözüm butonlarıyla birlikte) ve görev olan aktif tarih/haftaları döner.
+    """
+    studies = (
+        db.query(Study)
+        .options(selectinload(Study.study_director))
+        .filter(Study.status != StudyStatus.CANCELLED)
+        .order_by(Study.id.asc())
+        .all()
+    )
+    study_details = [get_study_schedule_detail(db, s) for s in studies]
+
+    conflict_step_ids = {
+        sid
+        for sd in study_details
+        for c in sd["conflicts"]
+        for sid in (c.get("step_ids") or ([c["step_id"]] if c.get("step_id") else []))
+    }
+
+    steps = (
+        db.query(StudyStep)
+        .join(StudyStep.study)
+        .options(selectinload(StudyStep.assignees), selectinload(StudyStep.study))
+        .filter(
+            StudyStep.status != StepStatus.CANCELLED,
+            Study.status != StudyStatus.CANCELLED,
+        )
+        .order_by(StudyStep.planned_start.asc())
+        .all()
+    )
+    all_steps = []
+    for st in steps:
+        serialized = _serialize_step(st)
+        serialized["equipment_id"] = st.equipment_id
+        serialized["assignees"] = [
+            {"id": u.id, "full_name": u.full_name, "role": u.role.value}
+            for u in st.assignees
+        ]
+        serialized["has_conflict"] = st.id in conflict_step_ids
+        all_steps.append(serialized)
+
+    cal_meta = _collect_active_dates_and_weeks(db)
+    return {
+        "studies": study_details,
+        "all_steps": all_steps,
+        **cal_meta,
+    }
+
+
+@router.get("/studies/{study_id}/schedule", summary="Tekil Çalışmanın Kayıtlı Takvim ve Çakışma Detayı (FAZ 6.3)")
+def api_get_study_schedule(
+    study_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_management_read),
+):
+    study = db.query(Study).options(selectinload(Study.study_director)).filter(Study.id == study_id).first()
+    if not study:
+        raise HTTPException(status_code=404, detail="GLP çalışması bulunamadı.")
+    return get_study_schedule_detail(db, study)
+
+
+@router.post("/studies/{study_id}/approve", summary="Taslak Çalışma Planını Onayla ve Aktif Çalışmalara Al (FAZ 6.3)")
+def api_approve_study_plan(
+    study_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_management_write),
+):
+    """
+    DRAFT durumundaki bir çalışmanın çözülmemiş CRITICAL çakışması yoksa statüsünü APPROVED yapar,
+    protocol_approved_at zaman damgasını işler ve GLP AuditLog kaydı oluşturur.
+    """
+    study = db.query(Study).options(selectinload(Study.study_director)).filter(Study.id == study_id).first()
+    if not study:
+        raise HTTPException(status_code=404, detail="GLP çalışması bulunamadı.")
+    if study.status != StudyStatus.DRAFT:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"'{study.study_code}' çalışması zaten '{study.status.value}' durumundadır; yalnızca DRAFT çalışmalar onaylanabilir.",
+        )
+
+    step_count = (
+        db.query(StudyStep)
+        .filter(StudyStep.study_id == study.id, StudyStep.status != StepStatus.CANCELLED)
+        .count()
+    )
+    if step_count == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"'{study.study_code}' çalışması için henüz takvim adımları oluşturulmamış. Önce planlama yapın.",
+        )
+
+    unresolved_critical = (
+        db.query(Conflict)
+        .filter(
+            Conflict.study_id == study.id,
+            Conflict.is_resolved == False,  # noqa: E712
+            Conflict.severity == ConflictSeverity.CRITICAL,
+        )
+        .count()
+    )
+    if unresolved_critical > 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"'{study.study_code}' çalışmasında {unresolved_critical} adet çözülmemiş KRİTİK (CRITICAL) "
+                f"çakışma bulunmaktadır. GLP kuralları gereği kritik çakışmalar çözülmeden çalışma onaylanamaz."
+            ),
+        )
+
+    now = datetime.utcnow()
+    # Varsa kalan WARNING uyarılarını da plan onayıyla kapat
+    open_warnings = (
+        db.query(Conflict)
+        .filter(
+            Conflict.study_id == study.id,
+            Conflict.is_resolved == False,  # noqa: E712
+        )
+        .all()
+    )
+    for wc in open_warnings:
+        wc.is_resolved = True
+        wc.resolved_by_id = current_user.id
+        wc.resolved_at = now
+        wc.resolution_notes = (
+            f"Plan Onayı ({current_user.full_name}): Çalışma planı onaylanarak aktif çalışmalara (APPROVED) alındı."
+        )
+
+    study.status = StudyStatus.APPROVED
+    study.protocol_approved_at = now
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            entity_name="Study",
+            entity_id=study.id,
+            action="APPROVE_STUDY_PLAN",
+            old_values={"status": "DRAFT"},
+            new_values={
+                "status": "APPROVED",
+                "study_code": study.study_code,
+                "protocol_approved_at": now.isoformat(),
+            },
+            reason=(
+                f"{current_user.full_name} ({current_user.role.value}) '{study.study_code}' taslak çalışma "
+                f"planını onaylayarak aktif çalışmalara (APPROVED) aldı."
+            ),
+        )
+    )
+    db.commit()
+    db.refresh(study)
+
+    res = get_study_schedule_detail(db, study)
+    res["approval_message"] = (
+        f"'{study.study_code}' çalışma planı GLP denetim iziyle onaylandı (APPROVED) ve Aktif Çalışmalara alındı."
+    )
+    return res
+
+
+@router.get("/templates", summary="Tanımlı GLP Çalışma Şablonları")
+def api_get_templates(current_user: User = Depends(require_management_read)):
+    """Planlama formunda gösterilecek şablonlar ve gün/adım/rol tanımları."""
+    return {"default": DEFAULT_TEMPLATE_CODE, "templates": [t.to_dict() for t in TEMPLATES.values()]}
+
+
+@router.get("/steps", summary="Zaman Aralığındaki Görevler / Biyolojik Kilometre Taşları")
+def api_get_steps(
+    start: Optional[datetime] = Query(None, description="Başlangıç (varsayılan: şimdi)"),
+    days: int = Query(14, ge=1, le=180),
+    biological_only: bool = Query(False),
+    include_all: bool = Query(False, description="True ise tarih filtresi uygulamadan tüm planlı adımları döner"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    q = (
+        db.query(StudyStep)
+        .join(StudyStep.study)
+        .options(selectinload(StudyStep.assignees), selectinload(StudyStep.study))
+        .filter(
+            StudyStep.status != StepStatus.CANCELLED,
+            Study.status != StudyStatus.CANCELLED,
+        )
+    )
+    if not include_all:
+        start = start or datetime.now()
+        end = start + timedelta(days=days)
+        q = q.filter(
+            StudyStep.planned_end >= start,
+            StudyStep.planned_start <= end,
+        )
+    if current_user.role == UserRole.TECHNICIAN:
+        q = q.join(StudyStep.assignees).filter(User.id == current_user.id)
+    if biological_only:
+        q = q.filter(StudyStep.is_biological_fixed_time == True)  # noqa: E712
+    steps = q.order_by(StudyStep.planned_start).all()
+
+    return [_serialize_step(s) for s in steps]
+
+
+@router.get("/my-tasks", summary="Giriş Yapan Personelin Bugünkü ve Yaklaşan Görevleri (Teknisyen Ekranı)")
+def api_get_my_tasks(
+    target_date: date = Query(default_factory=date.today, description="YYYY-MM-DD"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Oturum açmış personelin (özellikle TECHNICIAN) seçilen tarihteki (varsayılan: bugün)
+    görevlerini, 9 saat iş yükü durumunu ve kendisine atanmış tüm aktif çalışma adımlarını döner.
+    """
+    day_start = datetime.combine(target_date, time.min)
+    day_end = datetime.combine(target_date, time.max)
+
+    all_steps = (
+        db.query(StudyStep)
+        .join(StudyStep.assignees)
+        .join(StudyStep.study)
+        .options(selectinload(StudyStep.assignees), selectinload(StudyStep.study))
+        .filter(
+            User.id == current_user.id,
+            StudyStep.status != StepStatus.CANCELLED,
+            Study.status != StudyStatus.CANCELLED,
+        )
+        .order_by(StudyStep.planned_start)
+        .all()
+    )
+
+    todays_steps = [
+        s for s in all_steps
+        if s.planned_start <= day_end and s.planned_end >= day_start
+    ]
+
+    workload = calculate_personnel_workload(db, current_user.id, target_date)
+
+    return {
+        "user": {
+            "id": current_user.id,
+            "full_name": current_user.full_name,
+            "role": current_user.role.value,
+            "max_daily_hours": current_user.max_daily_hours,
+        },
+        "target_date": target_date.isoformat(),
+        "today_workload": workload,
+        "todays_tasks": [_serialize_step(s) for s in todays_steps],
+        "all_assigned_tasks": [_serialize_step(s) for s in all_steps],
+    }
+
+
+@router.patch("/steps/{step_id}/status", summary="Görev Durumunu Güncelle (GLP Denetim Kayıtlı)")
+def api_update_step_status(
+    step_id: int,
+    payload: UpdateStepStatusRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role == UserRole.QA:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Kalite Güvence (QA) rolü SADECE OKUMA yetkisine sahiptir; görev durumu güncelleyemez.",
+        )
+
+    step = (
+        db.query(StudyStep)
+        .options(selectinload(StudyStep.assignees), selectinload(StudyStep.study))
+        .filter(StudyStep.id == step_id)
+        .first()
+    )
+    if not step:
+        raise HTTPException(status_code=404, detail="Görev adımı bulunamadı.")
+
+    if current_user.role == UserRole.TECHNICIAN and current_user.id not in step.assignee_ids:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Yalnızca kendinize atanmış görevlerin durumunu güncelleyebilirsiniz.",
+        )
+
+    old_status = step.status.value
+    now = datetime.utcnow()
+    step.status = payload.status
+    if payload.status == StepStatus.IN_PROGRESS and not step.actual_start:
+        step.actual_start = now
+    elif payload.status == StepStatus.COMPLETED:
+        if not step.actual_start:
+            step.actual_start = now
+        step.actual_end = now
+
+    db.add(AuditLog(
+        user_id=current_user.id,
+        entity_name="StudyStep",
+        entity_id=step.id,
+        action="UPDATE_STEP_STATUS",
+        old_values={"status": old_status},
+        new_values={"status": payload.status.value},
+        reason=payload.notes or f"{current_user.full_name} görev durumunu {old_status} -> {payload.status.value} olarak güncelledi.",
+    ))
+    db.commit()
+    db.refresh(step)
+    return _serialize_step(step)
+
+
+@router.get("/summary", summary="Yönetici Dashboard Özeti")
+def api_get_summary(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_management_read),
+):
+    today = date.today()
+    day_start = datetime.combine(today, time.min)
+    day_end = datetime.combine(today, time.max)
+
+    active_studies = db.query(Study).filter(
+        Study.status.in_([StudyStatus.APPROVED, StudyStatus.IN_PROGRESS])
+    ).count()
+    draft_studies = db.query(Study).filter(Study.status == StudyStatus.DRAFT).count()
+    critical_conflicts = db.query(Conflict).filter(
+        Conflict.is_resolved == False, Conflict.severity == ConflictSeverity.CRITICAL
+    ).count()
+    open_conflicts = db.query(Conflict).filter(Conflict.is_resolved == False).count()
+    todays_tasks = db.query(StudyStep).filter(
+        StudyStep.status != StepStatus.CANCELLED,
+        StudyStep.planned_start <= day_end,
+        StudyStep.planned_end >= day_start,
+    ).count()
+    total_planned_tasks = (
+        db.query(StudyStep)
+        .join(StudyStep.study)
+        .filter(
+            StudyStep.status != StepStatus.CANCELLED,
+            Study.status != StudyStatus.CANCELLED,
+        )
+        .count()
+    )
+
+    return {
+        "date": today.isoformat(),
+        "active_studies": active_studies,
+        "draft_studies": draft_studies,
+        "critical_conflicts": critical_conflicts,
+        "open_conflicts": open_conflicts,
+        "todays_tasks": todays_tasks,
+        "total_planned_tasks": total_planned_tasks,
+    }
+
+
+@router.get("/conflicts", response_model=List[ConflictOut], summary="Kayıtlı Çakışmaları Listele")
+def api_get_conflicts(
+    study_id: Optional[int] = Query(None),
+    unresolved_only: bool = Query(True),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_management_read),
+):
+    query = db.query(Conflict)
+    if study_id is not None:
+        query = query.filter(Conflict.study_id == study_id)
+    if unresolved_only:
+        query = query.filter(Conflict.is_resolved == False)
+    return query.order_by(Conflict.detected_at.desc()).all()
+
+
+@router.post("/conflicts/{conflict_id}/resolve", summary="Çakışmayı Çözüldü Olarak İşaretle (GLP Gerekçeli)")
+def api_resolve_conflict(
+    conflict_id: int,
+    payload: ResolveConflictRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_management_write),
+):
+    conflict = db.query(Conflict).filter(Conflict.id == conflict_id).first()
+    if not conflict:
+        raise HTTPException(status_code=404, detail="Çakışma kaydı bulunamadı.")
+    if not payload.resolution_notes.strip():
+        raise HTTPException(status_code=400, detail="GLP gereği çözüm gerekçesi zorunludur.")
+
+    resolved_by_id = payload.resolved_by_id or current_user.id
+    conflict.is_resolved = True
+    conflict.resolved_by_id = resolved_by_id
+    conflict.resolved_at = datetime.utcnow()
+    conflict.resolution_notes = payload.resolution_notes
+
+    db.add(AuditLog(
+        user_id=resolved_by_id,
+        entity_name="Conflict",
+        entity_id=conflict_id,
+        action="RESOLVE_CONFLICT",
+        reason=payload.resolution_notes,
+    ))
+    db.commit()
+    return {"status": "success", "message": "Çakışma GLP denetim kaydıyla çözüldü.", "conflict_id": conflict_id}
+
+
+@router.post(
+    "/conflicts/{conflict_id}/apply-resolution",
+    summary="Çakışma / Uyarı için Tek Tık Çözüm Aksiyonunu Uygula (FAZ 6.2)",
+)
+def api_apply_conflict_resolution(
+    conflict_id: int,
+    payload: ApplyResolutionRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_management_write),
+):
+    try:
+        return apply_conflict_resolution(
+            db=db,
+            conflict_id=conflict_id,
+            action=payload.action,
+            user=current_user,
+            target_user_id=payload.target_user_id,
+        )
+    except PermissionError as pe:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(pe))
+    except ValueError as ve:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
