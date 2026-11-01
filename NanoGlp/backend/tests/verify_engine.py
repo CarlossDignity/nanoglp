@@ -99,14 +99,19 @@ def main():
               "24/48/72. saat gözlemleri aynı referans saate kilitli")
         check(ra["status"] == "SCHEDULED_CLEAN", "Boş takvimde çakışma yok")
 
-        print("\n[2] Taslak ↔ taslak — aynı Gün 0 ile ikinci taslak")
+        print("\n[2] Taslak ↔ taslak — aynı Gün 0 ile ikinci taslak (FAZ 6.4: Esnek G0 boş saate yerleşir, Kilitli G7 PERSONNEL_OVERLAP)")
         b = make_draft(db, "T-B")
         rb = schedule_new_study(db, b.id, MONDAY)
         check("T-A" in rb["compared_draft_studies"], "Diğer DRAFT çalışma kıyas kümesinde")
         techs_b = {p["full_name"] for s in rb["steps"] for p in s["assignees"] if p["role"] == "TECHNICIAN"}
         check(techs_b == {t2.full_name}, "Boştaki 2. teknisyen seçildi (saat kaydırılmadan)")
-        check("BIOLOGICAL_TIME_VIOLATION" in types(rb), "Gün 7'de SD iki taslakta → BIOLOGICAL_TIME_VIOLATION")
-        check("PERSONNEL_OVERLAP" in types(rb), "Gün 0'da TFM iki taslakta → PERSONNEL_OVERLAP")
+        g0_b = next(s for s in rb["steps"] if s["study_day"] == 0)
+        check(
+            datetime.fromisoformat(g0_b["planned_start"]).time() == time(11, 0)
+            and datetime.fromisoformat(g0_b["planned_end"]).time() == time(13, 0),
+            "Esnek Gün 0 (TFM) 09:00-11:00 dolu olduğu için otomatik 11:00-13:00 boş dilimine yerleştirildi",
+        )
+        check("PERSONNEL_OVERLAP" in types(rb), "Gün 7'de SD iki taslakta (başka aktif SD yok) → PERSONNEL_OVERLAP")
         check(all(c["related_study_id"] == a.id for c in rb["conflicts"]), "Çakışmalar karşı taslağı (T-A) işaret ediyor")
         check(all(c["severity"] == "CRITICAL" for c in rb["conflicts"]), "Tümü CRITICAL")
         a_times = [(s.planned_start, s.planned_end) for s in db.query(StudyStep).filter_by(study_id=a.id)]
@@ -644,6 +649,8 @@ def main():
                 "GET /api/v1/studies/{id}/export-study-plan → 200 (.docx Word belgesi döndü)",
             )
             import io
+            import re as _re
+            import zipfile as _zipfile
             from docx import Document as DocxReader
             parsed_docx = DocxReader(io.BytesIO(docx_resp.content))
             full_docx_text = "\n".join(
@@ -655,11 +662,24 @@ def main():
                 and "ELISA TIBBI GEREÇLER SAN A.Ş." in full_docx_text
                 and "Hyaluronik Asit HA 30 mg/ml" in full_docx_text
                 and "EDC-NO-230586" in full_docx_text
-                and "%0.9 NaCl" in full_docx_text
+                and "0.9% NaCl" in full_docx_text
                 and "Cottonseed oil" in full_docx_text
                 and "Ezgi Nur AKIN" in full_docx_text
-                and "Emine ARMUTOĞLU" in full_docx_text,
-                "Üretilen .docx içinde Çalışma Kodu, Sponsor, Test Maddesi, Lot, Polar/Apolar Çözücüler, Aktif SD 'Ezgi Nur AKIN', TFM 'Emine ARMUTOĞLU' ve Takvim yer alıyor",
+                and "Emine ARMUTOĞLU" in full_docx_text
+                and "Selin BOLCAN" in full_docx_text
+                and "Dr. Shivadasan ANOOP" in full_docx_text,
+                "Üretilen .docx içinde Çalışma Kodu, Sponsor, Test Maddesi, Lot, Polar/Apolar Çözücüler, Aktif SD 'Ezgi Nur AKIN', TFM 'Emine ARMUTOĞLU', QA 'Selin BOLCAN', Management 'Dr. Shivadasan ANOOP' ve Takvim yer alıyor",
+            )
+            leftover_x = []
+            with _zipfile.ZipFile(io.BytesIO(docx_resp.content)) as _z:
+                for _name in _z.namelist():
+                    if _name.endswith(".xml"):
+                        _txt = _re.sub(r"<[^>]+>", "", _z.read(_name).decode("utf-8", errors="ignore"))
+                        if _re.search(r"X{2,}|GLP20XX|Original\s+X", _txt):
+                            leftover_x.append(_name)
+            check(
+                len(leftover_x) == 0,
+                "FAZ 6.5: Orijinal Nanolab Study Plan (.docx) şablonunda tek bir 'XXX' veya 'GLP20XX' yer tutucusu bile kalmadı",
             )
 
             print("\n[10] FAZ 6.3: Kalıcı Master Takvim (/calendar), Haftalık İş Yükü (/workload-weekly) ve Taslak Onayı (/approve)")
@@ -707,6 +727,38 @@ def main():
             check(
                 all_bio.status_code == 200 and any(s["study_code"] == "GLP2026-026" for s in all_bio.json()),
                 "GET /api/v1/planning/steps?include_all=true → geçmiş/taslak dahil tüm biyolojik kilometre taşlarını döndürdü",
+            )
+
+            print("\n[11] FAZ 6.4: 4 Şablon, Kanonik Sözleşme Eşleştirmesi, Canlı Kalibrasyon DB (/calibration) ve Çözüm Sonrası Re-Validation")
+            tpls_64 = client.get("/api/v1/planning/templates", headers=h_tfm).json()
+            tpl_codes_64 = [t["code"] for t in tpls_64["templates"]]
+            check(
+                all(c in tpl_codes_64 for c in ("ISO_10993_23_IC", "ISO_10993_5_CYTO", "ISO_10993_10_SENS", "ISO_10993_11_ACUTE")),
+                "4 GLP test şablonu (ISO 10993-23, 10993-5, 10993-10, 10993-11) aktif",
+            )
+            cal_get = client.get("/api/v1/planning/calibration", headers=h_tfm)
+            check(
+                cal_get.status_code == 200 and len(cal_get.json()["steps"]) >= 16 and len(cal_get.json()["equipment"]) >= 1,
+                "GET /api/v1/planning/calibration → şablon görev süreleri ve EQ-WB-001 kapasiteleri veritabanından okundu",
+            )
+            cal_put = client.put(
+                "/api/v1/planning/calibration",
+                headers=h_tfm,
+                json={
+                    "reason": "FAZ 6.4 kalibrasyon testi: G0 süresi 150 dk yapıldı",
+                    "template_code": "ISO_10993_23_IC",
+                    "step_order": 1,
+                    "duration_minutes": 150,
+                    "equipment_code": "EQ-WB-001",
+                    "polar_capacity": 4,
+                },
+            )
+            check(
+                cal_put.status_code == 200
+                and any(s["template_code"] == "ISO_10993_23_IC" and s["step_order"] == 1 and s["duration_minutes"] == 150 for s in cal_put.json()["steps"])
+                and cal_put.json()["equipment"][0]["polar_capacity"] == 4
+                and len(cal_put.json()["audit_logs"]) >= 1,
+                "PUT /api/v1/planning/calibration → veritabanını güncelledi ve AuditLog kaydı üretti",
             )
         finally:
             dp._llm_call = original_llm

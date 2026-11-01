@@ -352,7 +352,10 @@ export default function Upload() {
     const f = dossier?.fields || {};
     const val = (k) => f[k]?.value ?? null;
     const chosenCode = selectedStudyCode || dossier?.default_study_code || dossier?.study_codes?.[0] || '';
-    const mappedTest = dossier?.study_code_mappings?.find((m) => m.study_code === chosenCode)?.test_type;
+    const mappedEntry = dossier?.study_code_mappings?.find((m) => m.study_code === chosenCode);
+    const mappedTest = mappedEntry?.test_type;
+    const mappedGuideline = mappedEntry?.guideline;
+    const mappedTemplate = mappedEntry?.suggested_template_code;
     const sdRes = dossier?.sd_resolution;
     const resolvedSdId = selectedSdId
       ? parseInt(selectedSdId, 10)
@@ -365,12 +368,12 @@ export default function Upload() {
           dossier_key: activeDossierKey,
           study_code: chosenCode,
           start_date: val('acclimatization_start_date') || '',
-          template_code: dossier?.suggested_template_code || 'ISO_10993_23_IC',
+          template_code: mappedTemplate || dossier?.suggested_template_code || 'ISO_10993_23_IC',
           study_director_id: resolvedSdId,
           former_study_director_name: sdRes?.requires_handover ? sdRes.document_sd_name : null,
           sd_resolution: sdRes || null,
           test_type: mappedTest || val('test_type'),
-          guideline: val('guideline'),
+          guideline: mappedGuideline || val('guideline'),
           sponsor_name: val('sponsor_name'),
           sponsor_contact: val('sponsor_contact'),
           test_item_name: val('test_item_name'),

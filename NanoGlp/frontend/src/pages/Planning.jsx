@@ -54,6 +54,13 @@ const Chip = ({ children, tone = 'slate' }) => (
 
 const DAY_NAMES_TR = ['Pazartesi', 'Salı', 'Çarşamba', 'Perşembe', 'Cuma', 'Cumartesi', 'Pazar'];
 
+const STUDY_CODE_TEMPLATE_MAP = {
+  'GLP2026-024': 'ISO_10993_5_CYTO',
+  'GLP2026-026': 'ISO_10993_23_IC',
+  'GLP2026-031': 'ISO_10993_10_SENS',
+  'GLP2026-034': 'ISO_10993_11_ACUTE',
+};
+
 function toMondayISO(isoDate) {
   if (!isoDate) return todayISO();
   const [y, m, d] = isoDate.split('-').map(Number);
@@ -108,6 +115,7 @@ export default function Planning({ onScheduled }) {
   const [templates, setTemplates] = useState([]);
   const [templateCode, setTemplateCode] = useState('');
   const [showTemplate, setShowTemplate] = useState(false);
+  const [isFormOpen, setIsFormOpen] = useState(false);
   const [studyCode, setStudyCode] = useState(() => prefill?.study_code || '');
   const [startDate, setStartDate] = useState(() => prefill?.start_date || todayISO());
   const [activeSds, setActiveSds] = useState(() => prefill?.sd_resolution?.active_sds || []);
@@ -177,6 +185,15 @@ export default function Planning({ onScheduled }) {
 
           if (matched) {
             setResult(matched);
+            if (!prefill) {
+              if (matched.study_code) setStudyCode(matched.study_code);
+              if (matched.acclimatization_start_date) setStartDate(matched.acclimatization_start_date);
+              const tplCode =
+                matched.template?.code ||
+                STUDY_CODE_TEMPLATE_MAP[(matched.study_code || '').toUpperCase()];
+              if (tplCode) setTemplateCode(tplCode);
+              if (matched.study_director_id) setSelectedSdId(String(matched.study_director_id));
+            }
           }
         }
       } catch (err) {
@@ -224,16 +241,56 @@ export default function Planning({ onScheduled }) {
 
   const template = templates.find((t) => t.code === templateCode);
 
-  // Gün 0 seçimine göre şablon önizlemesi: hangi gün hangi tarihe / haftanın hangi gününe düşüyor
+  const matchedFormStudy = useMemo(() => {
+    const codeUpper = (studyCode || '').trim().toUpperCase();
+    if (!codeUpper) return null;
+    if (
+      result &&
+      (result.study_code || '').toUpperCase() === codeUpper &&
+      result.acclimatization_start_date === startDate
+    ) {
+      return result;
+    }
+    return (
+      calendarData.studies.find(
+        (s) =>
+          (s.study_code || '').toUpperCase() === codeUpper &&
+          s.acclimatization_start_date === startDate
+      ) || null
+    );
+  }, [studyCode, startDate, result, calendarData.studies]);
+
+  // Gün 0 seçimine göre şablon önizlemesi: mevcut çalışmanın çözülmüş takvimi varsa onu baz alır
   const preview = useMemo(() => {
     if (!template || !startDate) return [];
+    if (matchedFormStudy?.steps?.length === template.steps.length) {
+      return template.steps.map((s, idx) => {
+        const stStep = matchedFormStudy.steps[idx];
+        const dt = stStep?.planned_start ? new Date(stStep.planned_start) : new Date(startDate);
+        return {
+          ...s,
+          day: stStep?.study_day ?? s.day,
+          date: dt,
+          weekend: dt.getDay() === 0 || dt.getDay() === 6,
+        };
+      });
+    }
     const [y, m, d] = startDate.split('-').map(Number);
     return template.steps.map((s) => {
       const dt = new Date(y, m - 1, d + s.day);
       return { ...s, date: dt, weekend: dt.getDay() === 0 || dt.getDay() === 6 };
     });
-  }, [template, startDate]);
-  const weekendLocked = preview.filter((s) => s.weekend && s.is_biological_fixed_time);
+  }, [template, startDate, matchedFormStudy]);
+
+  const weekendLocked = useMemo(() => {
+    if (matchedFormStudy) {
+      const activeWeekendConflicts = (matchedFormStudy.conflicts || []).filter(
+        (c) => c.conflict_type === 'WEEKEND_OVERLAP'
+      );
+      if (activeWeekendConflicts.length === 0) return [];
+    }
+    return preview.filter((s) => s.weekend && s.is_biological_fixed_time);
+  }, [preview, matchedFormStudy]);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -357,20 +414,31 @@ export default function Planning({ onScheduled }) {
     }
   };
 
+  const syncFormWithStudy = (st) => {
+    if (!st) return;
+    if (st.study_code) setStudyCode(st.study_code);
+    if (st.acclimatization_start_date) {
+      setStartDate(st.acclimatization_start_date);
+      setDailyDate(st.acclimatization_start_date);
+      setWeekStart(toMondayISO(st.acclimatization_start_date));
+    }
+    const tplCode =
+      st.template?.code ||
+      STUDY_CODE_TEMPLATE_MAP[(st.study_code || '').toUpperCase()];
+    if (tplCode) setTemplateCode(tplCode);
+    if (st.study_director_id) setSelectedSdId(String(st.study_director_id));
+  };
+
   const handleSelectStudyCard = (st) => {
     setResult(st);
     setError(null);
     setResolutionNotice(null);
-    if (st.acclimatization_start_date) {
-      setDailyDate(st.acclimatization_start_date);
-      setWeekStart(toMondayISO(st.acclimatization_start_date));
-    }
+    syncFormWithStudy(st);
   };
 
   const handleLoadIntoForm = (st) => {
-    setStudyCode(st.study_code);
-    setStartDate(st.acclimatization_start_date || todayISO());
-    if (st.study_director_id) setSelectedSdId(String(st.study_director_id));
+    syncFormWithStudy(st);
+    setIsFormOpen(true);
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
@@ -594,7 +662,7 @@ export default function Planning({ onScheduled }) {
         </div>
       )}
 
-      {prefill && (
+      {prefill && viewMode === 'study' && (
         <div className="rounded-lg border border-blue-300 bg-blue-50 px-4 py-3 text-xs text-blue-900">
           <div className="flex items-start gap-2.5">
             <Sparkles className="w-4 h-4 text-blue-700 shrink-0 mt-0.5" />
@@ -723,125 +791,176 @@ export default function Planning({ onScheduled }) {
         </div>
       )}
 
-      {/* Yeni Çalışma Ekleme / Taslak Yeniden Analiz Formu */}
-      <form onSubmit={handleSubmit} className="bg-white border border-slate-200 rounded-lg shadow-sm">
-        <div className="p-5 grid grid-cols-1 md:grid-cols-[1.3fr_1fr_1fr_auto] gap-4 items-end">
-          <div>
-            <label htmlFor="template" className="block text-xs font-medium text-slate-700 mb-1.5">
-              Test Şablonu
-            </label>
-            <select
-              id="template"
-              value={templateCode}
-              onChange={(e) => setTemplateCode(e.target.value)}
-              className="w-full border border-slate-300 rounded-md px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-600"
-            >
-              {templates.map((t) => (
-                <option key={t.code} value={t.code}>
-                  {t.standard} — {t.title}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div>
-            <label htmlFor="studyCode" className="block text-xs font-medium text-slate-700 mb-1.5">
-              Çalışma Kodu (Yeni veya Mevcut Taslak)
-            </label>
-            <input
-              id="studyCode"
-              required
-              disabled={isReadOnly}
-              value={studyCode}
-              onChange={(e) => setStudyCode(e.target.value)}
-              placeholder="GLP2026-026"
-              className="w-full border border-slate-300 rounded-md px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-600 disabled:bg-slate-100"
-            />
-          </div>
-          <div>
-            <label htmlFor="startDate" className="block text-xs font-medium text-slate-700 mb-1.5">
-              Aklimatizasyon Başlangıcı (Gün 0)
-            </label>
-            <input
-              id="startDate"
-              type="date"
-              required
-              value={startDate}
-              onChange={(e) => setStartDate(e.target.value)}
-              className="w-full border border-slate-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-600"
-            />
-          </div>
+      {/* Yeni Çalışma Ekleme / Taslak Yeniden Analiz Formu (Yalnızca Çalışma Detay sekmesinde, varsayılan daraltılmış) */}
+      {viewMode === 'study' && (
+        <div className="bg-white border border-slate-200 rounded-lg shadow-sm overflow-hidden">
           <button
-            type="submit"
-            disabled={isReadOnly || submitting || !templateCode}
-            title={isReadOnly ? 'QA rolü salt okunur yetkiye sahiptir' : undefined}
-            className="flex items-center justify-center gap-2 bg-blue-700 hover:bg-blue-800 disabled:bg-slate-300 disabled:text-slate-500 text-white text-sm font-medium rounded-md px-5 py-2.5"
+            type="button"
+            onClick={() => setIsFormOpen((v) => !v)}
+            className="w-full px-5 py-3.5 flex flex-wrap items-center justify-between gap-2 text-left hover:bg-slate-50 transition"
           >
-            {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <CalendarPlus className="w-4 h-4" />}
-            {isReadOnly ? 'Salt Okunur (QA)' : submitting ? 'Analiz ediliyor…' : 'Planla ve Analiz Et'}
-          </button>
-        </div>
-
-        {template && (
-          <div className="border-t border-slate-200">
-            <button
-              type="button"
-              onClick={() => setShowTemplate((v) => !v)}
-              className="w-full flex items-center gap-2 px-5 py-2.5 text-xs font-medium text-slate-600 hover:bg-slate-50"
-            >
-              {showTemplate ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
-              Şablon önizlemesi — {template.steps.length} adım (seçilen Gün 0'a göre)
-              {weekendLocked.length > 0 && (
-                <span className="ml-2 text-amber-700 font-semibold">
-                  ⚠ {weekendLocked.length} kilitli adım hafta sonuna düşüyor
+            <div className="flex items-center gap-2 text-sm font-semibold text-blue-800">
+              {isFormOpen ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+              <span>+ Yeni Çalışma Planla veya Tarihi Yeniden Hesapla</span>
+            </div>
+            <div className="flex items-center gap-2 text-xs text-slate-500">
+              {studyCode && (
+                <span className="font-mono font-semibold px-2 py-0.5 rounded bg-slate-100 text-slate-700">
+                  {studyCode} · Gün 0: {startDate}
                 </span>
               )}
-            </button>
-            {showTemplate && (
-              <table className="w-full text-xs">
-                <thead className="bg-slate-50 text-slate-500 uppercase tracking-wide text-[10px]">
-                  <tr>
-                    <th className="text-left px-5 py-2 font-medium">Gün</th>
-                    <th className="text-left px-5 py-2 font-medium">Tarih</th>
-                    <th className="text-left px-5 py-2 font-medium">Adım</th>
-                    <th className="text-left px-5 py-2 font-medium">Saat / Süre</th>
-                    <th className="text-left px-5 py-2 font-medium">Rol</th>
-                    <th className="text-left px-5 py-2 font-medium">Kilit</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {preview.map((s) => (
-                    <tr key={s.order} className={s.weekend && s.is_biological_fixed_time ? 'bg-amber-50' : ''}>
-                      <td className="px-5 py-2 font-mono font-semibold text-slate-700">G{s.day}</td>
-                      <td className={`px-5 py-2 ${s.weekend ? 'text-amber-700 font-medium' : 'text-slate-600'}`}>
-                        {s.date.toLocaleDateString('tr-TR', { weekday: 'short', day: '2-digit', month: '2-digit' })}
-                      </td>
-                      <td className="px-5 py-2 text-slate-800">{s.name}</td>
-                      <td className="px-5 py-2 text-slate-600 whitespace-nowrap">
-                        {s.start} • {fmtMinutes(s.duration_minutes)}
-                      </td>
-                      <td className="px-5 py-2 text-slate-600">{s.roles.map((r) => ROLE_SHORT[r] || r).join(' + ')}</td>
-                      <td className="px-5 py-2">
-                        {s.is_biological_fixed_time ? (
-                          <span className="inline-flex items-center gap-1 text-blue-700 font-medium">
-                            <Lock className="w-3 h-3" /> ±{s.tolerance_minutes} dk
-                          </span>
-                        ) : (
-                          <span className="text-slate-400">Esnek</span>
-                        )}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            )}
-            <p className="px-5 py-2.5 text-[11px] text-slate-500 flex items-start gap-1.5 border-t border-slate-100">
-              <Info className="w-3.5 h-3.5 mt-px shrink-0" />
-              Saat, süre ve tolerans değerleri sistem varsayılanıdır; protokole göre SD tarafından teyit edilmelidir.
-              Kod sistemde yoksa DRAFT çalışma açılır. Onaylı çalışmalar yeniden planlanamaz.
-            </p>
-          </div>
-        )}
-      </form>
+              <span>{isFormOpen ? 'Paneli Daralt' : 'Formu Aç'}</span>
+            </div>
+          </button>
+
+          {isFormOpen && (
+            <form onSubmit={handleSubmit} className="border-t border-slate-200">
+              <div className="p-5 grid grid-cols-1 md:grid-cols-[1.3fr_1fr_1fr_auto] gap-4 items-end">
+                <div>
+                  <label htmlFor="template" className="block text-xs font-medium text-slate-700 mb-1.5">
+                    Test Şablonu
+                  </label>
+                  <select
+                    id="template"
+                    value={templateCode}
+                    onChange={(e) => setTemplateCode(e.target.value)}
+                    className="w-full border border-slate-300 rounded-md px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                  >
+                    {templates.map((t) => (
+                      <option key={t.code} value={t.code}>
+                        {t.standard} — {t.title}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label htmlFor="studyCode" className="block text-xs font-medium text-slate-700 mb-1.5">
+                    Çalışma Kodu (Yeni veya Mevcut Taslak)
+                  </label>
+                  <input
+                    id="studyCode"
+                    required
+                    disabled={isReadOnly}
+                    value={studyCode}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setStudyCode(val);
+                      const upper = val.trim().toUpperCase();
+                      if (STUDY_CODE_TEMPLATE_MAP[upper]) {
+                        setTemplateCode(STUDY_CODE_TEMPLATE_MAP[upper]);
+                      }
+                      const existing = calendarData.studies.find(
+                        (s) => (s.study_code || '').toUpperCase() === upper
+                      );
+                      if (existing?.acclimatization_start_date) {
+                        setStartDate(existing.acclimatization_start_date);
+                      }
+                    }}
+                    placeholder="GLP2026-026"
+                    className="w-full border border-slate-300 rounded-md px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-600 disabled:bg-slate-100"
+                  />
+                </div>
+                <div>
+                  <label htmlFor="startDate" className="block text-xs font-medium text-slate-700 mb-1.5">
+                    Aklimatizasyon Başlangıcı (Gün 0)
+                  </label>
+                  <input
+                    id="startDate"
+                    type="date"
+                    required
+                    value={startDate}
+                    onChange={(e) => setStartDate(e.target.value)}
+                    className="w-full border border-slate-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-600"
+                  />
+                </div>
+                <button
+                  type="submit"
+                  disabled={isReadOnly || submitting || !templateCode}
+                  title={isReadOnly ? 'QA rolü salt okunur yetkiye sahiptir' : undefined}
+                  className="flex items-center justify-center gap-2 bg-blue-700 hover:bg-blue-800 disabled:bg-slate-300 disabled:text-slate-500 text-white text-sm font-medium rounded-md px-5 py-2.5"
+                >
+                  {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <CalendarPlus className="w-4 h-4" />}
+                  {isReadOnly ? 'Salt Okunur (QA)' : submitting ? 'Analiz ediliyor…' : 'Planla ve Analiz Et'}
+                </button>
+              </div>
+
+              {template && (
+                <div className="border-t border-slate-200">
+                  <button
+                    type="button"
+                    onClick={() => setShowTemplate((v) => !v)}
+                    className="w-full flex items-center gap-2 px-5 py-2.5 text-xs font-medium text-slate-600 hover:bg-slate-50"
+                  >
+                    {showTemplate ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+                    Şablon önizlemesi — {template.steps.length} adım (seçilen Gün 0'a göre)
+                    {weekendLocked.length > 0 && (
+                      <span className="ml-2 text-amber-700 font-semibold">
+                        ⚠ {weekendLocked.length} kilitli adım hafta sonuna düşüyor
+                      </span>
+                    )}
+                  </button>
+                  {showTemplate && (
+                    <table className="w-full text-xs">
+                      <thead className="bg-slate-50 text-slate-500 uppercase tracking-wide text-[10px]">
+                        <tr>
+                          <th className="text-left px-5 py-2 font-medium">Gün</th>
+                          <th className="text-left px-5 py-2 font-medium">Tarih</th>
+                          <th className="text-left px-5 py-2 font-medium">Adım</th>
+                          <th className="text-left px-5 py-2 font-medium">Saat / Süre</th>
+                          <th className="text-left px-5 py-2 font-medium">Rol</th>
+                          <th className="text-left px-5 py-2 font-medium">Kilit</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {preview.map((s) => (
+                          <tr
+                            key={s.order}
+                            className={
+                              weekendLocked.some((w) => w.order === s.order) ? 'bg-amber-50' : ''
+                            }
+                          >
+                            <td className="px-5 py-2 font-mono font-semibold text-slate-700">G{s.day}</td>
+                            <td
+                              className={`px-5 py-2 ${
+                                weekendLocked.some((w) => w.order === s.order)
+                                  ? 'text-amber-700 font-medium'
+                                  : 'text-slate-600'
+                              }`}
+                            >
+                              {s.date.toLocaleDateString('tr-TR', { weekday: 'short', day: '2-digit', month: '2-digit' })}
+                            </td>
+                            <td className="px-5 py-2 text-slate-800">{s.name}</td>
+                            <td className="px-5 py-2 text-slate-600 whitespace-nowrap">
+                              {s.start} • {fmtMinutes(s.duration_minutes)}
+                            </td>
+                            <td className="px-5 py-2 text-slate-600">
+                              {s.roles.map((r) => ROLE_SHORT[r] || r).join(' + ')}
+                            </td>
+                            <td className="px-5 py-2">
+                              {s.is_biological_fixed_time ? (
+                                <span className="inline-flex items-center gap-1 text-blue-700 font-medium">
+                                  <Lock className="w-3 h-3" /> ±{s.tolerance_minutes} dk
+                                </span>
+                              ) : (
+                                <span className="text-slate-400">Esnek</span>
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                  <p className="px-5 py-2.5 text-[11px] text-slate-500 flex items-start gap-1.5 border-t border-slate-100">
+                    <Info className="w-3.5 h-3.5 mt-px shrink-0" />
+                    Saat, süre ve tolerans değerleri sistem varsayılanıdır; protokole göre SD tarafından teyit edilmelidir.
+                    Kod sistemde yoksa DRAFT çalışma açılır. Onaylı çalışmalar yeniden planlanamaz.
+                  </p>
+                </div>
+              )}
+            </form>
+          )}
+        </div>
+      )}
 
       {error && <div className="p-4 rounded-md bg-red-50 border border-red-300 text-sm text-red-800">{error}</div>}
 

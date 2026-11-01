@@ -317,8 +317,14 @@ export default function Personnel({ onChanged }) {
                         {p.tasks.map((t) => (
                           <li key={t.step_id} className="px-3 py-2 flex items-center justify-between gap-4">
                             <span className="flex items-center gap-1.5 text-slate-700">
-                              {t.is_biological_fixed_time && <Lock className="w-3 h-3 text-blue-700" />}
-                              {t.step_name}
+                              <span className="font-mono text-[11px] font-bold px-2 py-0.5 rounded bg-blue-50 text-blue-800 border border-blue-200 shrink-0">
+                                [{t.study_code}]
+                              </span>
+                              <span className="font-mono text-[10px] font-semibold px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 shrink-0">
+                                G{t.study_day}
+                              </span>
+                              {t.is_biological_fixed_time && <Lock className="w-3 h-3 text-blue-700 shrink-0" />}
+                              <span>{t.step_name}</span>
                             </span>
                             <span className="text-slate-500 whitespace-nowrap">
                               {fmtTime(t.planned_start)}–{fmtTime(t.planned_end)} • {fmtMinutes(t.minutes)}
@@ -443,7 +449,7 @@ export default function Personnel({ onChanged }) {
                           } hover:bg-blue-50/60`}
                           title={
                             hasWork
-                              ? cell.tasks.map((t) => `${t.step_name} (${t.minutes} dk)`).join('\n')
+                              ? cell.tasks.map((t) => `[${t.study_code}] G${t.study_day} — ${t.step_name} (${t.minutes} dk)`).join('\n')
                               : 'Görev yok'
                           }
                         >

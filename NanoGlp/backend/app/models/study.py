@@ -20,6 +20,7 @@ class Study(Base):
     id = Column(Integer, primary_key=True, index=True)
     study_code = Column(String(100), unique=True, index=True, nullable=False)  # GLP Çalışma No (Örn: GLP2026-024)
     title = Column(String(255), nullable=False)                                # Çalışma Adı
+    template_code = Column(String(60), nullable=True, default="ISO_10993_23_IC")
     test_type = Column(String(255), nullable=True)                             # Test Türü
     guideline = Column(String(255), nullable=True)                             # Standart / Kılavuz (Örn: ISO 10993-23)
 

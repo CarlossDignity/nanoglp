@@ -251,6 +251,71 @@ def _supersede_previous_plan(db: Session, study: Study, now: datetime) -> Tuple[
     return superseded, len(old_ids)
 
 
+def _find_free_slot_for_flexible_step(
+    target_day: date,
+    default_start: datetime,
+    duration_minutes: int,
+    assignees: List[User],
+    busy_steps: List[StudyStep],
+    busy_assignees_map: Dict[int, set],
+) -> Tuple[datetime, datetime]:
+    """
+    FAZ 6.4 (Madde 2B): Esnek (is_biological_fixed_time == False) bir adım atanırken,
+    atanacak personelin varsayılan saat diliminde (örn. 09:00-11:00) başka bir görevi varsa,
+    yeni görevi aynı saate üst üste bindirmek yerine personelin o günkü ilk boş saat dilimine
+    (örn. 11:00-13:00) otomatik yerleştirir.
+    """
+    default_end = default_start + timedelta(minutes=duration_minutes)
+    assignee_ids = {u.id for u in assignees}
+    if not assignee_ids:
+        return default_start, default_end
+
+    # Bu personellerin o günkü mevcut dolu aralıklarını topla
+    day_start_bound = datetime.combine(target_day, WORKDAY_START)
+    day_end_bound = datetime.combine(target_day, WORKDAY_END)
+
+    busy_intervals: List[Tuple[datetime, datetime]] = []
+    for ex in busy_steps:
+        ex_uids = busy_assignees_map.get(ex.id)
+        if ex_uids is None:
+            ex_uids = {u.id for u in ex.assignees}
+        if assignee_ids.intersection(ex_uids):
+            if ex.planned_start.date() == target_day or ex.planned_end.date() == target_day:
+                busy_intervals.append((ex.planned_start, ex.planned_end))
+
+    def _is_free(c_start: datetime, c_end: datetime) -> bool:
+        return all(_overlap_minutes(c_start, c_end, b_s, b_e) == 0 for b_s, b_e in busy_intervals)
+
+    if _is_free(default_start, default_end):
+        return default_start, default_end
+
+    # Aday başlangıç saatleri: önce varsayılan saatten (örn. 09:00) mesai bitimine kadar olan
+    # görev bitiş noktaları ve 30 dk'lık dilimler; bulunamazsa 08:00..default_start arası.
+    post_candidates = {default_start}
+    pre_candidates = set()
+    for _, b_e in busy_intervals:
+        if day_start_bound <= b_e <= day_end_bound - timedelta(minutes=duration_minutes):
+            if b_e >= default_start:
+                post_candidates.add(b_e)
+            else:
+                pre_candidates.add(b_e)
+
+    cursor = day_start_bound
+    while cursor + timedelta(minutes=duration_minutes) <= day_end_bound:
+        if cursor >= default_start:
+            post_candidates.add(cursor)
+        else:
+            pre_candidates.add(cursor)
+        cursor += timedelta(minutes=30)
+
+    for cand_start in sorted(post_candidates) + sorted(pre_candidates):
+        cand_end = cand_start + timedelta(minutes=duration_minutes)
+        if cand_end <= day_end_bound and _is_free(cand_start, cand_end):
+            return cand_start, cand_end
+
+    return default_start, default_end
+
+
 def _assign_roles(
     db: Session,
     study: Study,
@@ -259,11 +324,13 @@ def _assign_roles(
     existing_assignees: Dict[int, set],
 ) -> Tuple[Dict[UserRole, User], List[UserRole]]:
     """
-    Şablondaki rolleri kişilere çözer. Saatlere DOKUNMAZ.
+    Şablondaki rolleri kişilere çözer.
       * STUDY_DIRECTOR → çalışmanın kendi SD'si.
       * Diğer roller → çalışma boyunca TEK kişi (GLP skorlama tutarlılığı). Aday sırası:
-        (1) şablon pencerelerinde en az çakışan dakika, (2) o günlerdeki en düşük iş yükü, (3) en küçük ID.
-    Hiçbir aday boş değilse en az çakışan atanır ve çakışma raporlanır.
+        (1) biyolojik kilitli pencerelerde en az çakışan dakika,
+        (2) tüm şablon pencerelerinde en az çakışan dakika,
+        (3) o günlerdeki en düşük iş yükü,
+        (4) en küçük ID.
     """
     needed: List[UserRole] = []
     for ts, _, _ in planned:
@@ -287,31 +354,39 @@ def _assign_roles(
             unfilled.append(role)
             continue
 
-        windows = [(s, e) for ts, s, e in planned if role in ts.roles]
-        days = sorted({s.date() for s, _ in windows})
+        locked_windows = [(s, e) for ts, s, e in planned if role in ts.roles and ts.is_biological_fixed_time]
+        all_windows = [(s, e) for ts, s, e in planned if role in ts.roles]
+        days = sorted({s.date() for s, _ in all_windows})
 
         def score(user: User):
-            busy = sum(
+            locked_busy = sum(
                 _overlap_minutes(s, e, ex.planned_start, ex.planned_end)
-                for s, e in windows
+                for s, e in locked_windows
+                for ex in existing_steps
+                if user.id in existing_assignees[ex.id]
+            )
+            total_busy = sum(
+                _overlap_minutes(s, e, ex.planned_start, ex.planned_end)
+                for s, e in all_windows
                 for ex in existing_steps
                 if user.id in existing_assignees[ex.id]
             )
             load = sum(calculate_personnel_workload(db, user.id, d)["total_minutes"] for d in days)
-            return busy, load, user.id
+            return locked_busy, total_busy, load, user.id
 
         assignment[role] = min(candidates, key=score)
     return assignment, unfilled
 
 
-def compute_friday_alignment_offset(acclimatization_start_date: date) -> int:
+def compute_friday_alignment_offset(acclimatization_start_date: date, min_offset_days: int = 0) -> int:
     """
     G0 sabit kalarak (minimum 4 gün aklimatizasyon korunarak) G4 ekstraksiyon adımını
     ilk uygun Cuma gününe hizalayan ek aklimatizasyon gün sayısını hesaplar.
     Cuma ekstraksiyon -> Cmt/Paz su banyosunda -> Pazartesi enjeksiyon -> Salı/Çarşamba/Perşembe gözlem (0 hafta sonu insan görevi).
     """
-    base_ex_date = acclimatization_start_date + timedelta(days=4)
-    return (4 - base_ex_date.weekday()) % 7
+    start_offset = max(0, int(min_offset_days))
+    base_ex_date = acclimatization_start_date + timedelta(days=4 + start_offset)
+    return start_offset + ((4 - base_ex_date.weekday()) % 7)
 
 
 def _find_next_available_water_bath_offset(
@@ -387,7 +462,7 @@ def build_conflict_resolutions(
         )
         if study:
             base_day0 = study.acclimatization_start_date or study.target_start_date or date.today()
-            fri_offset = compute_friday_alignment_offset(base_day0)
+            fri_offset = compute_friday_alignment_offset(base_day0, study.extraction_start_offset_days or 0)
             fri_date = base_day0 + timedelta(days=4 + fri_offset)
             resolutions.append(
                 {
@@ -441,7 +516,7 @@ def build_conflict_resolutions(
                 "target_user_name": best_backup.full_name if best_backup else None,
                 "description": (
                     f"O gün iş yükü müsait olan yedek teknisyene ({best_backup.full_name if best_backup else 'Yedek Teknisyen'}) "
-                    f"görevi tek tıkla atar ve çakışmayı çözer."
+                    f"görevi tek tıkla atar ve çakışmayı yeniden denetler."
                 ),
             }
         )
@@ -484,125 +559,59 @@ def build_conflict_resolutions(
     return resolutions
 
 
-def schedule_new_study(
+def evaluate_study_conflicts(
     db: Session,
-    study_id: int,
-    acclimatization_start_date: date,
-    template_code: str = DEFAULT_TEMPLATE_CODE,
-    extraction_start_offset_days: Optional[int] = None,
-    align_extraction_to_friday: bool = False,
-) -> Dict[str, Any]:
+    study: Study,
+    steps: List[StudyStep],
+    existing_steps: List[StudyStep],
+    existing_assignees: Dict[int, set],
+    water_bath: Equipment,
+    unfilled_roles: Optional[List[UserRole]] = None,
+    template: Any = None,
+    preserve_approved_weekend_step_ids: Optional[set] = None,
+) -> List[Tuple[Conflict, List[int]]]:
     """
-    Seçilen şablonun adımlarını Gün 0 = acclimatization_start_date olacak şekilde dizer ve çakışmaları tespit eder.
-
-    * Non-Destructive: APPROVED / IN_PROGRESS çalışmalara dokunulmaz; yalnızca DRAFT çalışma planlanabilir.
-    * Diğer DRAFT çalışmalarla da kıyaslanır (onlar da değiştirilmez).
-    * Saatler kendiliğinden sessizce kaydırılmaz; sorunlar Conflict tablosuna yazılır ve her çakışma için
-      aksiyon alınabilir çözüm butonları (resolutions) sunulur.
-    * Kullanıcı açıkça "Ekstraksiyonu Cuma'ya Hizala" veya "Cihazın Boşaldığı İlk Güne Kaydır" çözümünü
-      tetiklediğinde `extraction_start_offset_days` uygulanır.
+    FAZ 6.4 (Madde 3): Bir çalışmanın tüm adımları için hafta sonu/mesai dışı kontrolü,
+    personel eşzamanlı saat çakışması, Su Banyosu (EQ-WB-001) Polar/Apolar kapasite kontrolü ve
+    9 saatlik (540 dk) günlük iş yükü denetimini çalıştırır.
     """
-    study = db.query(Study).filter(Study.id == study_id).first()
-    if not study:
-        raise ValueError(f"ID={study_id} olan GLP çalışması bulunamadı.")
-    if study.status != StudyStatus.DRAFT:
-        raise PermissionError(
-            f"'{study.study_code}' çalışması {study.status.value} durumundadır. Yalnızca DRAFT çalışmalar "
-            f"(yeniden) planlanabilir; onaylanmış çalışmaların görev saatleri değiştirilemez (Non-Destructive kuralı)."
-        )
-    template = get_template(template_code)
-    now = datetime.utcnow()
-    water_bath = seed_default_equipment(db)
-
-    if align_extraction_to_friday:
-        offset_days = compute_friday_alignment_offset(acclimatization_start_date)
-    elif extraction_start_offset_days is not None:
-        offset_days = max(0, int(extraction_start_offset_days))
-    else:
-        offset_days = 0
-    study.extraction_start_offset_days = offset_days
-    study.acclimatization_start_date = acclimatization_start_date
-
-    # 1) Bu taslağın eski planını kapat
-    superseded_count, removed_steps = _supersede_previous_plan(db, study, now)
-
-    # 2) Kıyas kümesi: onaylı + yürütülen + diğer taslaklar (hepsi salt-okunur)
-    others = db.query(Study).filter(Study.id != study.id, Study.status.in_(COMPARED_STUDY_STATUSES)).all()
-    other_ids = [s.id for s in others]
-    existing_steps: List[StudyStep] = []
-    if other_ids:
-        existing_steps = (
-            db.query(StudyStep)
-            .options(selectinload(StudyStep.assignees), selectinload(StudyStep.study))
-            .filter(StudyStep.study_id.in_(other_ids), StudyStep.status != StepStatus.CANCELLED)
-            .all()
-        )
-    existing_assignees = {ex.id: {u.id for u in ex.assignees} for ex in existing_steps}
-
-    # 3) Şablon → kesin zaman pencereleri (G4 ve sonrası biyolojik zincir olarak birlikte hareket eder)
-    day0 = datetime.combine(acclimatization_start_date, time.min)
-    planned: List[Tuple[TemplateStep, datetime, datetime, int]] = []
-    for ts in template.steps:
-        effective_day = ts.day + (offset_days if ts.day >= 4 else 0)
-        start = day0 + timedelta(days=effective_day, hours=ts.start.hour, minutes=ts.start.minute)
-        planned.append((ts, start, start + timedelta(minutes=ts.duration_minutes), effective_day))
-
-    # 4) Rol → personel
-    planned_3 = [(ts, s, e) for ts, s, e, _ in planned]
-    assignment, unfilled_roles = _assign_roles(db, study, planned_3, existing_steps, existing_assignees)
-
-    # 5) Adımları oluştur
-    new_steps: List[Tuple[TemplateStep, StudyStep]] = []
-    for ts, start, end, effective_day in planned:
-        is_extraction = ts.step_type == "Ekstraksiyon" or "Ekstraksiyon" in ts.name
-        eq_id = (
-            water_bath.id
-            if is_extraction and (study.extraction_polar is True or study.extraction_non_polar is True)
-            else None
-        )
-        step = StudyStep(
-            study_id=study.id,
-            step_order=ts.order,
-            study_day=effective_day,
-            step_name=ts.name,
-            step_type=ts.step_type,
-            planned_start=start,
-            planned_end=end,
-            is_biological_fixed_time=ts.is_biological_fixed_time,
-            biological_tolerance_minutes=ts.tolerance_minutes,
-            equipment_id=eq_id,
-            status=StepStatus.PENDING,
-        )
-        step.assignees = [assignment[r] for r in ts.roles if r in assignment]
-        db.add(step)
-        new_steps.append((ts, step))
-    db.flush()
-
-    # 6) Çakışma tespiti
     findings: List[Tuple[Conflict, List[int]]] = []
+    approved_wk_steps = preserve_approved_weekend_step_ids or set()
 
     def record(conflict: Conflict, step_ids: List[int]):
         db.add(conflict)
         findings.append((conflict, step_ids))
 
-    for role in unfilled_roles:
-        affected = [s.id for ts, s in new_steps if role in ts.roles]
-        record(Conflict(
-            conflict_type=ConflictType.QUALIFICATION_MISMATCH,
-            severity=ConflictSeverity.CRITICAL,
-            title=f"Atanacak aktif personel yok: {role.value}",
-            description=(f"Şablon '{role.value}' rolünde personel gerektiriyor ancak sistemde aktif kayıt yok. "
-                         f"İlgili {len(affected)} adım atamasız bırakıldı."),
-            study_id=study.id,
-            step_id=affected[0] if affected else None,
-        ), affected)
+    if unfilled_roles and template is not None:
+        ts_by_order = {ts.order: ts for ts in template.steps}
+        for role in unfilled_roles:
+            affected = [
+                s.id for s in steps
+                if s.step_order in ts_by_order and role in ts_by_order[s.step_order].roles
+            ]
+            record(
+                Conflict(
+                    conflict_type=ConflictType.QUALIFICATION_MISMATCH,
+                    severity=ConflictSeverity.CRITICAL,
+                    title=f"Atanacak aktif personel yok: {role.value}",
+                    description=(
+                        f"Şablon '{role.value}' rolünde personel gerektiriyor ancak sistemde aktif kayıt yok. "
+                        f"İlgili {len(affected)} adım atamasız bırakıldı."
+                    ),
+                    study_id=study.id,
+                    step_id=affected[0] if affected else None,
+                ),
+                affected,
+            )
 
-    for ts, step in new_steps:
+    for step in steps:
         # 6a) Biyolojik kilitli adım mesai dışı / hafta sonu → WARNING (Nöbetçi personel onayı veya Cuma hizalama sunulur)
         issue = _working_hours_issue(step.planned_start, step.planned_end)
-        if step.is_biological_fixed_time and issue:
+        if step.is_biological_fixed_time and issue and step.id not in approved_wk_steps:
             conflict = register_biological_time_violation(
-                db, step, commit=False,
+                db,
+                step,
+                commit=False,
                 severity=ConflictSeverity.WARNING,
                 title=f"Biyolojik Kilit Mesai Dışında (Hafta Sonu Görevi): Gün {step.study_day} — {step.step_name}",
                 reason=f"Adım {issue}. Saat ötelenemez; nöbetçi / hafta sonu personeli onaylanmalı veya ekstraksiyon Cuma'ya hizalanmalıdır.",
@@ -612,37 +621,50 @@ def schedule_new_study(
         # 6b) Aynı kişinin başka bir çalışmada (onaylı veya taslak) eşzamanlı görevi
         for person in step.assignees:
             for ex in existing_steps:
-                if person.id not in existing_assignees[ex.id]:
+                if person.id not in existing_assignees.get(ex.id, set()):
                     continue
                 ov = _overlap_minutes(step.planned_start, step.planned_end, ex.planned_start, ex.planned_end)
                 if ov <= 0:
                     continue
                 other = ex.study
-                context = (f"{person.full_name}, {other.study_code} ({other.status.value}) çalışmasının "
-                           f"'{ex.step_name}' görevinde ({_fmt(ex.planned_start)}–{ex.planned_end:%H:%M}) zaten "
-                           f"görevli; {ov} dk örtüşme.")
+                context = (
+                    f"{person.full_name}, {other.study_code} ({other.status.value}) çalışmasının "
+                    f"'{ex.step_name}' görevinde ({_fmt(ex.planned_start)}–{ex.planned_end:%H:%M}) zaten "
+                    f"görevli; {ov} dk örtüşme."
+                )
                 if step.is_biological_fixed_time:
-                    conflict = register_biological_time_violation(
-                        db, step, commit=False, related_study_id=other.id,
-                        severity=ConflictSeverity.CRITICAL,
-                        title=f"Biyolojik Kilit + Personel Dolu: Gün {step.study_day} — {person.full_name}",
-                        reason=context,
+                    record(
+                        Conflict(
+                            conflict_type=ConflictType.PERSONNEL_OVERLAP,
+                            severity=ConflictSeverity.CRITICAL,
+                            title=f"Personel Çakışması (Biyolojik Kilitli Adım): Gün {step.study_day} — {person.full_name}",
+                            description=(
+                                f"'{step.step_name}' biyolojik kilitli (planlanan: {_fmt(step.planned_start)}, "
+                                f"tolerans ±{step.biological_tolerance_minutes} dk). {context} "
+                                f"Bu rolde o saatte boşta başka yetkin personel bulunamadı."
+                            ),
+                            study_id=study.id,
+                            step_id=step.id,
+                            related_study_id=other.id,
+                        ),
+                        [step.id],
                     )
-                    findings.append((conflict, [step.id]))
                 else:
-                    record(Conflict(
-                        conflict_type=ConflictType.PERSONNEL_OVERLAP,
-                        severity=ConflictSeverity.CRITICAL,
-                        title=f"Personel Çakışması: Gün {step.study_day} — {person.full_name}",
-                        description=context + " Esnek adım olsa da sistem saati kendiliğinden kaydırmaz; "
-                                              "planlayıcı/SD kararı gereklidir.",
-                        study_id=study.id,
-                        step_id=step.id,
-                        related_study_id=other.id,
-                    ), [step.id])
+                    record(
+                        Conflict(
+                            conflict_type=ConflictType.PERSONNEL_OVERLAP,
+                            severity=ConflictSeverity.CRITICAL,
+                            title=f"Personel Çakışması: Gün {step.study_day} — {person.full_name}",
+                            description=context + " Gün içinde boş saat dilimi bulunamadı; planlayıcı/SD kararı gereklidir.",
+                            study_id=study.id,
+                            step_id=step.id,
+                            related_study_id=other.id,
+                        ),
+                        [step.id],
+                    )
 
-        # 6c) Cihaz çakışması — FAZ 6.2: Çalkalamalı Su Banyosu 1 (EQ-WB-001) Polar (Max: 3) & Apolar (Max: 1) 72s Kapasite Kilidi
-        is_extraction = ts.step_type == "Ekstraksiyon" or "Ekstraksiyon" in ts.name
+        # 6c) Cihaz çakışması — Çalkalamalı Su Banyosu 1 (EQ-WB-001) Polar & Apolar 72s Kapasite Kilidi
+        is_extraction = step.step_type == "Ekstraksiyon" or "Ekstraksiyon" in step.step_name
         if is_extraction and (study.extraction_polar is True or study.extraction_non_polar is True):
             wb_start = step.planned_start
             wb_end = step.planned_start + timedelta(hours=72)
@@ -706,28 +728,291 @@ def schedule_new_study(
         elif step.equipment_id and step.equipment_id != water_bath.id:
             for ex in existing_steps:
                 if ex.equipment_id == step.equipment_id and _overlap_minutes(
-                        step.planned_start, step.planned_end, ex.planned_start, ex.planned_end) > 0:
-                    record(Conflict(
-                        conflict_type=ConflictType.EQUIPMENT_OVERLAP,
-                        severity=ConflictSeverity.CRITICAL,
-                        title=f"Cihaz Çakışması: Gün {step.study_day} — Ekipman #{step.equipment_id}",
-                        description=f"Cihaz, {ex.study.study_code} çalışmasının '{ex.step_name}' adımında kullanımda.",
-                        study_id=study.id,
-                        step_id=step.id,
-                        related_study_id=ex.study_id,
-                    ), [step.id])
+                    step.planned_start, step.planned_end, ex.planned_start, ex.planned_end
+                ) > 0:
+                    record(
+                        Conflict(
+                            conflict_type=ConflictType.EQUIPMENT_OVERLAP,
+                            severity=ConflictSeverity.CRITICAL,
+                            title=f"Cihaz Çakışması: Gün {step.study_day} — Ekipman #{step.equipment_id}",
+                            description=f"Cihaz, {ex.study.study_code} çalışmasının '{ex.step_name}' adımında kullanımda.",
+                            study_id=study.id,
+                            step_id=step.id,
+                            related_study_id=ex.study_id,
+                        ),
+                        [step.id],
+                    )
 
     db.flush()
 
     # 6d) KURAL 1: kişi-gün bazında 9 saat kontrolü (tüm çalışmalar dahil)
     person_days: Dict[Tuple[int, date], Tuple[User, List[int]]] = {}
-    for _, step in new_steps:
+    for step in steps:
         for person in step.assignees:
             person_days.setdefault((person.id, step.planned_start.date()), (person, []))[1].append(step.id)
     for (_, day), (person, step_ids) in sorted(person_days.items(), key=lambda kv: (kv[0][1], kv[0][0])):
         conflict = _build_workload_conflict(db, person, day, study.id, step_id=step_ids[0])
         if conflict is not None:
             findings.append((conflict, step_ids))
+
+    db.flush()
+    return findings
+
+
+def revalidate_study_conflicts(
+    db: Session,
+    study: Study,
+    preserve_weekend_approvals: bool = True,
+) -> List[Tuple[Conflict, List[int]]]:
+    """
+    FAZ 6.4 (Madde 3 & 6): Çözüm uygulandıktan veya ilişkili bir çalışma kaydırıldıktan sonra
+    çalışmanın adımlarının G etiketlerini (`study_day = (step_date - g0_date).days`) doğrular ve
+    çakışma motorunu (hafta sonu, personel 9 saat / saat çakışması, cihaz kapasitesi) yeniden çalıştırır.
+    """
+    if study.status != StudyStatus.DRAFT:
+        open_conflicts = (
+            db.query(Conflict)
+            .filter(Conflict.study_id == study.id, Conflict.is_resolved == False)  # noqa: E712
+            .order_by(Conflict.id.asc())
+            .all()
+        )
+        return [(c, [c.step_id] if c.step_id else []) for c in open_conflicts]
+
+    now = datetime.utcnow()
+    base_day0 = study.acclimatization_start_date or study.target_start_date or date.today()
+    water_bath = seed_default_equipment(db)
+    template = get_template(getattr(study, "template_code", None) or DEFAULT_TEMPLATE_CODE, db=db)
+
+    approved_wk_steps = set()
+    if preserve_weekend_approvals:
+        prev_approved = (
+            db.query(Conflict)
+            .filter(
+                Conflict.study_id == study.id,
+                Conflict.is_resolved == True,  # noqa: E712
+                Conflict.conflict_type == ConflictType.BIOLOGICAL_TIME_VIOLATION,
+                Conflict.resolution_notes.like("GLP Hafta Sonu Nöbetçi Personel Onayı%"),
+            )
+            .all()
+        )
+        approved_wk_steps = {c.step_id for c in prev_approved if c.step_id is not None}
+
+    # Mevcut açık çakışmaları yeniden doğrulama öncesi SUPERSEDED olarak kapat
+    note = f"SUPERSEDED: {study.study_code} çakışma denetimi {now:%d.%m.%Y %H:%M} UTC itibarıyla yeniden çalıştırıldı."
+    db.query(Conflict).filter(
+        Conflict.study_id == study.id,
+        Conflict.is_resolved == False,  # noqa: E712
+    ).update(
+        {Conflict.is_resolved: True, Conflict.resolved_at: now, Conflict.resolution_notes: note},
+        synchronize_session=False,
+    )
+    db.flush()
+
+    steps = (
+        db.query(StudyStep)
+        .options(selectinload(StudyStep.assignees))
+        .filter(StudyStep.study_id == study.id, StudyStep.status != StepStatus.CANCELLED)
+        .order_by(StudyStep.step_order)
+        .all()
+    )
+    for st in steps:
+        st.study_day = (st.planned_start.date() - base_day0).days
+    if steps:
+        study.target_end_date = max(s.planned_end for s in steps).date()
+
+    others = db.query(Study).filter(Study.id != study.id, Study.status.in_(COMPARED_STUDY_STATUSES)).all()
+    other_ids = [s.id for s in others]
+    existing_steps: List[StudyStep] = []
+    if other_ids:
+        existing_steps = (
+            db.query(StudyStep)
+            .options(selectinload(StudyStep.assignees), selectinload(StudyStep.study))
+            .filter(StudyStep.study_id.in_(other_ids), StudyStep.status != StepStatus.CANCELLED)
+            .all()
+        )
+    existing_assignees = {ex.id: {u.id for u in ex.assignees} for ex in existing_steps}
+
+    findings = evaluate_study_conflicts(
+        db=db,
+        study=study,
+        steps=steps,
+        existing_steps=existing_steps,
+        existing_assignees=existing_assignees,
+        water_bath=water_bath,
+        template=template,
+        preserve_approved_weekend_step_ids=approved_wk_steps,
+    )
+    db.flush()
+    return findings
+
+
+def schedule_new_study(
+    db: Session,
+    study_id: int,
+    acclimatization_start_date: date,
+    template_code: str = DEFAULT_TEMPLATE_CODE,
+    extraction_start_offset_days: Optional[int] = None,
+    align_extraction_to_friday: bool = False,
+) -> Dict[str, Any]:
+    """
+    Seçilen şablonun adımlarını Gün 0 = acclimatization_start_date olacak şekilde dizer ve çakışmaları tespit eder.
+
+    * Non-Destructive: APPROVED / IN_PROGRESS çalışmalara dokunulmaz; yalnızca DRAFT çalışma planlanabilir.
+    * Diğer DRAFT çalışmalarla da kıyaslanır (onlar da değiştirilmez).
+    * FAZ 6.4 (Madde 2B): Esnek (is_biological_fixed_time == False) adımlarda personelin o saatte başka görevi
+      varsa aynı günkü ilk boş saat dilimine (örn. 11:00-13:00) otomatik yerleştirilir. Biyolojik kilitli
+      adımlarda saat sabit tutulur; çakışma varsa aynı roldeki boştaki diğer yetkin personele atanır, yoksa
+      PERSONNEL_OVERLAP üretilir.
+    * FAZ 6.4 (Madde 5 & 6): Şablon süreleri/toleransları ve Su Banyosu kapasiteleri doğrudan veritabanından okunur;
+      tüm adımların G kodları `(step_date - g0_date).days` ile birebir senkronize edilir.
+    """
+    study = db.query(Study).filter(Study.id == study_id).first()
+    if not study:
+        raise ValueError(f"ID={study_id} olan GLP çalışması bulunamadı.")
+    if study.status != StudyStatus.DRAFT:
+        raise PermissionError(
+            f"'{study.study_code}' çalışması {study.status.value} durumundadır. Yalnızca DRAFT çalışmalar "
+            f"(yeniden) planlanabilir; onaylanmış çalışmaların görev saatleri değiştirilemez (Non-Destructive kuralı)."
+        )
+    resolved_template_code = template_code or getattr(study, "template_code", None) or DEFAULT_TEMPLATE_CODE
+    template = get_template(resolved_template_code, db=db)
+    study.template_code = template.code
+    now = datetime.utcnow()
+    water_bath = seed_default_equipment(db)
+
+    if align_extraction_to_friday:
+        min_off = extraction_start_offset_days if extraction_start_offset_days is not None else (study.extraction_start_offset_days or 0)
+        offset_days = compute_friday_alignment_offset(acclimatization_start_date, min_off)
+    elif extraction_start_offset_days is not None:
+        offset_days = max(0, int(extraction_start_offset_days))
+    else:
+        offset_days = 0
+    study.extraction_start_offset_days = offset_days
+    study.acclimatization_start_date = acclimatization_start_date
+
+    # 1) Bu taslağın eski planını kapat
+    superseded_count, removed_steps = _supersede_previous_plan(db, study, now)
+
+    # 2) Kıyas kümesi: onaylı + yürütülen + diğer taslaklar (hepsi salt-okunur)
+    others = db.query(Study).filter(Study.id != study.id, Study.status.in_(COMPARED_STUDY_STATUSES)).all()
+    other_ids = [s.id for s in others]
+    existing_steps: List[StudyStep] = []
+    if other_ids:
+        existing_steps = (
+            db.query(StudyStep)
+            .options(selectinload(StudyStep.assignees), selectinload(StudyStep.study))
+            .filter(StudyStep.study_id.in_(other_ids), StudyStep.status != StepStatus.CANCELLED)
+            .all()
+        )
+    existing_assignees = {ex.id: {u.id for u in ex.assignees} for ex in existing_steps}
+
+    # 3) Şablon → baz zaman pencereleri (G4 ve sonrası biyolojik zincir olarak birlikte hareket eder)
+    day0 = datetime.combine(acclimatization_start_date, time.min)
+    planned: List[Tuple[TemplateStep, datetime, datetime, int]] = []
+    for ts in template.steps:
+        effective_day = ts.day + (offset_days if ts.day >= 4 else 0)
+        start = day0 + timedelta(days=effective_day, hours=ts.start.hour, minutes=ts.start.minute)
+        planned.append((ts, start, start + timedelta(minutes=ts.duration_minutes), effective_day))
+
+    # 4) Rol → varsayılan personel
+    planned_3 = [(ts, s, e) for ts, s, e, _ in planned]
+    assignment, unfilled_roles = _assign_roles(db, study, planned_3, existing_steps, existing_assignees)
+
+    # 5) Adımları oluştur (Esnek adımlarda boş saat dilimi arama + Biyolojik kilitli adımlarda yedek yetkin personel kontrolü)
+    new_steps: List[Tuple[TemplateStep, StudyStep]] = []
+    for ts, start, end, _effective_day in planned:
+        step_assignees: List[User] = []
+        if ts.is_biological_fixed_time:
+            for r in ts.roles:
+                default_person = assignment.get(r)
+                if default_person is None:
+                    continue
+                has_overlap = any(
+                    default_person.id in existing_assignees.get(ex.id, set())
+                    and _overlap_minutes(start, end, ex.planned_start, ex.planned_end) > 0
+                    for ex in existing_steps
+                )
+                if has_overlap and r != UserRole.STUDY_DIRECTOR:
+                    candidates = (
+                        db.query(User)
+                        .filter(User.role == r, User.is_active == True)  # noqa: E712
+                        .order_by(User.id.asc())
+                        .all()
+                    )
+                    free_candidates = [
+                        u for u in candidates
+                        if all(
+                            u.id not in existing_assignees.get(ex.id, set())
+                            or _overlap_minutes(start, end, ex.planned_start, ex.planned_end) == 0
+                            for ex in existing_steps
+                        )
+                    ]
+                    if free_candidates:
+                        chosen = min(
+                            free_candidates,
+                            key=lambda u: (calculate_personnel_workload(db, u.id, start.date())["total_minutes"], u.id),
+                        )
+                        step_assignees.append(chosen)
+                        continue
+                step_assignees.append(default_person)
+        else:
+            step_assignees = [assignment[r] for r in ts.roles if r in assignment]
+            busy_pool = existing_steps + [s for _, s in new_steps]
+            busy_map = dict(existing_assignees)
+            for _, prior_s in new_steps:
+                busy_map[prior_s.id] = {u.id for u in prior_s.assignees}
+            start, end = _find_free_slot_for_flexible_step(
+                target_day=start.date(),
+                default_start=start,
+                duration_minutes=ts.duration_minutes,
+                assignees=step_assignees,
+                busy_steps=busy_pool,
+                busy_assignees_map=busy_map,
+            )
+
+        # FAZ 6.4 (Madde 6): G etiketi her zaman (step_date - g0_date).days ile birebir uyumlu
+        computed_day = (start.date() - acclimatization_start_date).days
+        is_extraction = ts.step_type == "Ekstraksiyon" or "Ekstraksiyon" in ts.name
+        eq_id = (
+            water_bath.id
+            if is_extraction and (study.extraction_polar is True or study.extraction_non_polar is True)
+            else None
+        )
+        step = StudyStep(
+            study_id=study.id,
+            step_order=ts.order,
+            study_day=computed_day,
+            step_name=ts.name,
+            step_type=ts.step_type,
+            planned_start=start,
+            planned_end=end,
+            is_biological_fixed_time=ts.is_biological_fixed_time,
+            biological_tolerance_minutes=ts.tolerance_minutes,
+            equipment_id=eq_id,
+            status=StepStatus.PENDING,
+        )
+        step.assignees = step_assignees
+        db.add(step)
+        new_steps.append((ts, step))
+    db.flush()
+
+    # 6) Çakışma tespiti
+    step_objs = [s for _, s in new_steps]
+    findings = evaluate_study_conflicts(
+        db=db,
+        study=study,
+        steps=step_objs,
+        existing_steps=existing_steps,
+        existing_assignees=existing_assignees,
+        water_bath=water_bath,
+        unfilled_roles=unfilled_roles,
+        template=template,
+    )
+
+    # Diğer DRAFT çalışmaların bu çalışmayla ilişkili çakışmaları SUPERSEDED olduğu için onları da yeniden doğrula
+    for other_study in others:
+        if other_study.status == StudyStatus.DRAFT:
+            revalidate_study_conflicts(db, other_study, preserve_weekend_approvals=True)
 
     # 7) Çalışma meta verisi + GLP denetim izi
     study.target_start_date = acclimatization_start_date
@@ -761,7 +1046,7 @@ def schedule_new_study(
         findings=findings,
         superseded_count=superseded_count,
         others=others,
-        steps=[s for _, s in new_steps],
+        steps=step_objs,
         existing_steps=existing_steps,
     )
 
@@ -856,7 +1141,7 @@ def get_study_schedule_detail(db: Session, study: Study) -> Dict[str, Any]:
     FAZ 6.3 — Veritabanında kayıtlı (DRAFT, APPROVED veya IN_PROGRESS) bir çalışmanın mevcut adımlarını,
     açık çakışmalarını ve tek tık çözüm önerilerini yeniden planlama yapmadan (salt-okunur) döner.
     """
-    template = get_template(DEFAULT_TEMPLATE_CODE)
+    template = get_template(getattr(study, "template_code", None) or DEFAULT_TEMPLATE_CODE, db=db)
     base_day0 = study.acclimatization_start_date or study.target_start_date or date.today()
     others = db.query(Study).filter(Study.id != study.id, Study.status.in_(COMPARED_STUDY_STATUSES)).all()
     other_ids = [s.id for s in others]
@@ -903,8 +1188,9 @@ def apply_conflict_resolution(
     target_user_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
-    FAZ 6.2 — Kullanıcının çakışma kartındaki "Tek Tık Çözüm Butonu"na tıklamasıyla tetiklenen
-    karar destek aksiyonlarını yürütür, AuditLog'a yazar ve güncellenmiş çalışma takvimini döner.
+    FAZ 6.2 & 6.4 — Kullanıcının çakışma kartındaki "Tek Tık Çözüm Butonu"na tıklamasıyla tetiklenen
+    karar destek aksiyonlarını yürütür, takvim veya personel değiştiğinde çakışma motorunu yeniden
+    çalıştırır (re-validation), AuditLog'a yazar ve güncellenmiş çalışma takvimini döner.
     """
     conflict = db.query(Conflict).filter(Conflict.id == conflict_id).first()
     if not conflict:
@@ -914,7 +1200,7 @@ def apply_conflict_resolution(
         raise ValueError("Çakışmanın bağlı olduğu çalışma bulunamadı.")
 
     now = datetime.utcnow()
-    template = get_template(DEFAULT_TEMPLATE_CODE)
+    template = get_template(getattr(study, "template_code", None) or DEFAULT_TEMPLATE_CODE, db=db)
     base_day0 = study.acclimatization_start_date or study.target_start_date or date.today()
 
     if action == "APPROVE_WEEKEND_DUTY":
@@ -941,6 +1227,8 @@ def apply_conflict_resolution(
                 wc.resolution_notes = note
                 resolved_ids.append(wc.id)
 
+        db.flush()
+        revalidate_study_conflicts(db, study, preserve_weekend_approvals=True)
         db.add(
             AuditLog(
                 user_id=user.id,
@@ -954,7 +1242,7 @@ def apply_conflict_resolution(
         db.commit()
 
     elif action == "ALIGN_EXTRACTION_TO_FRIDAY":
-        offset = compute_friday_alignment_offset(base_day0)
+        offset = compute_friday_alignment_offset(base_day0, study.extraction_start_offset_days or 0)
         res = schedule_new_study(
             db=db,
             study_id=study.id,
@@ -1011,24 +1299,57 @@ def apply_conflict_resolution(
         if not backup:
             raise ValueError("Devredilecek aktif yedek teknisyen bulunamadı.")
 
-        # İlgili adımdaki (veya o gündeki) teknisyeni yedek teknisyenle değiştir
+        ts_by_order = {ts.order: ts for ts in template.steps}
         steps_to_update = (
             [step]
             if step
-            else db.query(StudyStep).filter(StudyStep.study_id == study.id).all()
+            else db.query(StudyStep).filter(StudyStep.study_id == study.id, StudyStep.status != StepStatus.CANCELLED).all()
         )
+        others = db.query(Study).filter(Study.id != study.id, Study.status.in_(COMPARED_STUDY_STATUSES)).all()
+        other_ids = [s.id for s in others]
+        existing_steps = (
+            db.query(StudyStep)
+            .options(selectinload(StudyStep.assignees), selectinload(StudyStep.study))
+            .filter(StudyStep.study_id.in_(other_ids), StudyStep.status != StepStatus.CANCELLED)
+            .all()
+            if other_ids
+            else []
+        )
+        existing_assignees = {ex.id: {u.id for u in ex.assignees} for ex in existing_steps}
+
         for st in steps_to_update:
-            non_techs = [u for u in st.assignees if u.role != UserRole.TECHNICIAN]
-            st.assignees = non_techs + [backup]
+            ts_def = ts_by_order.get(st.step_order)
+            requires_tech = (ts_def and UserRole.TECHNICIAN in ts_def.roles) or any(
+                u.role == UserRole.TECHNICIAN for u in st.assignees
+            )
+            if requires_tech:
+                non_techs = [u for u in st.assignees if u.role != UserRole.TECHNICIAN]
+                st.assignees = non_techs + [backup]
+            if not st.is_biological_fixed_time:
+                dur = int((st.planned_end - st.planned_start).total_seconds() // 60) or 120
+                new_s, new_e = _find_free_slot_for_flexible_step(
+                    target_day=st.planned_start.date(),
+                    default_start=st.planned_start,
+                    duration_minutes=dur,
+                    assignees=st.assignees,
+                    busy_steps=existing_steps,
+                    busy_assignees_map=existing_assignees,
+                )
+                st.planned_start = new_s
+                st.planned_end = new_e
 
         note = (
             f"Yedek Teknisyen Devri ({user.full_name}): Görev iş yükü müsait olan "
-            f"'{backup.full_name}' personeline devredildi ve çakışma çözüldü."
+            f"'{backup.full_name}' personeline devredildi ve çakışma denetimi yenilendi."
         )
         conflict.is_resolved = True
         conflict.resolved_by_id = user.id
         conflict.resolved_at = now
         conflict.resolution_notes = note
+        db.flush()
+
+        # FAZ 6.4 (Madde 3): Çözüm uygulandıktan sonra çalışmanın çakışmalarını yeniden doğrula
+        revalidate_study_conflicts(db, study, preserve_weekend_approvals=True)
 
         db.add(
             AuditLog(
@@ -1099,16 +1420,26 @@ def apply_conflict_resolution(
 
     # Güncel çalışma durumunu döndür
     others = db.query(Study).filter(Study.id != study.id, Study.status.in_(COMPARED_STUDY_STATUSES)).all()
+    other_ids = [s.id for s in others]
+    existing_steps = (
+        db.query(StudyStep)
+        .options(selectinload(StudyStep.study), selectinload(StudyStep.assignees))
+        .filter(StudyStep.study_id.in_(other_ids), StudyStep.status != StepStatus.CANCELLED)
+        .all()
+        if other_ids
+        else []
+    )
     steps = (
         db.query(StudyStep)
         .options(selectinload(StudyStep.assignees))
-        .filter(StudyStep.study_id == study.id)
+        .filter(StudyStep.study_id == study.id, StudyStep.status != StepStatus.CANCELLED)
         .order_by(StudyStep.step_order)
         .all()
     )
     open_conflicts = (
         db.query(Conflict)
         .filter(Conflict.study_id == study.id, Conflict.is_resolved == False)  # noqa: E712
+        .order_by(Conflict.id.asc())
         .all()
     )
     findings = [(c, [c.step_id] if c.step_id else []) for c in open_conflicts]
@@ -1121,6 +1452,7 @@ def apply_conflict_resolution(
         superseded_count=0,
         others=others,
         steps=steps,
+        existing_steps=existing_steps,
     )
     res["resolution_applied"] = {"action": action, "message": "Çözüm başarıyla uygulandı ve denetim izine kaydedildi."}
     return res

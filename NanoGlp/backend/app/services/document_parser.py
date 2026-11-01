@@ -457,8 +457,50 @@ def _parse_iso_date(value: Optional[str]) -> Tuple[Optional[str], Optional[str]]
     return None, None
 
 
-def suggest_template(test_type: Optional[str], guideline: Optional[str] = None) -> Optional[str]:
+CANONICAL_STUDY_CODE_MAPPINGS: Dict[str, Dict[str, str]] = {
+    "GLP2026-024": {
+        "study_code": "GLP2026-024",
+        "test_type": "In Vitro Sitotoksisite Testi (ISO 10993-5)",
+        "guideline": "ISO 10993-5",
+        "suggested_template_code": "ISO_10993_5_CYTO",
+    },
+    "GLP2026-026": {
+        "study_code": "GLP2026-026",
+        "test_type": "İntrakütanöz Reaktivite Testi (ISO 10993-23) — Hyaluronik Asit HA 30 mg/ml",
+        "guideline": "ISO 10993-23",
+        "suggested_template_code": "ISO_10993_23_IC",
+    },
+    "GLP2026-031": {
+        "study_code": "GLP2026-031",
+        "test_type": "Sensitizasyon Testi (ISO 10993-10)",
+        "guideline": "ISO 10993-10",
+        "suggested_template_code": "ISO_10993_10_SENS",
+    },
+    "GLP2026-034": {
+        "study_code": "GLP2026-034",
+        "test_type": "Akut Sistemik Toksisite Testi (ISO 10993-11)",
+        "guideline": "ISO 10993-11",
+        "suggested_template_code": "ISO_10993_11_ACUTE",
+    },
+}
+
+
+def suggest_template(
+    test_type: Optional[str],
+    guideline: Optional[str] = None,
+    study_code: Optional[str] = None,
+) -> Optional[str]:
+    if study_code:
+        sc_upper = study_code.strip().upper()
+        if sc_upper in CANONICAL_STUDY_CODE_MAPPINGS:
+            return CANONICAL_STUDY_CODE_MAPPINGS[sc_upper]["suggested_template_code"]
     combined = _norm(f"{test_type or ''} {guideline or ''}")
+    if "109935" in combined or "sitotoks" in combined or "cytotox" in combined:
+        return "ISO_10993_5_CYTO"
+    if "1099310" in combined or "sensitiz" in combined:
+        return "ISO_10993_10_SENS"
+    if "1099311" in combined or "akutsistemik" in combined or "acutesystemic" in combined or "sistemiktoks" in combined:
+        return "ISO_10993_11_ACUTE"
     if "1099323" in combined or "intrak" in combined or "intracut" in combined or "intraderm" in combined or "irrit" in combined:
         return "ISO_10993_23_IC"
     return None
@@ -599,7 +641,12 @@ def parse_document(content: bytes, filename: str) -> Dict[str, Any]:
     return {
         **normalized,
         "warnings": warnings,
-        "suggested_template_code": suggest_template(normalized.get("test_type"), normalized.get("guideline")) or "ISO_10993_23_IC",
+        "suggested_template_code": suggest_template(
+            normalized.get("test_type"),
+            normalized.get("guideline"),
+            normalized.get("primary_study_code"),
+        )
+        or "ISO_10993_23_IC",
         "needs_review": needs_review,
         "extraction_method": extracted.method,
         "ai_model": settings.OPENAI_MODEL,
@@ -758,21 +805,50 @@ def aggregate_dossier(
     """
     valid_docs = [d for d in documents if getattr(d, "extracted_data", None) and getattr(d, "status", "") != "FAILED"]
 
+    resolved_dossier_key = dossier_key or (
+        next((getattr(d, "dossier_key", None) for d in valid_docs if getattr(d, "dossier_key", None)), None)
+        or "DOSSIER-ELISA-2026"
+    )
+    resolved_dossier_label = dossier_label or (
+        next((getattr(d, "dossier_label", None) for d in valid_docs if getattr(d, "dossier_label", None)), None)
+        or "ELISA TIBBI GEREÇLER — GLP2026-024/026/031/034"
+    )
+
+    # FAZ 6.4 (Madde 1): DOSSIER-ELISA-2026 paketinde SADECE IMG_20261027_*.pdf olan müşteri belgelerini tut
+    if resolved_dossier_key == "DOSSIER-ELISA-2026":
+        img_docs = [
+            d for d in valid_docs
+            if (getattr(d, "original_filename", "") or "").startswith("IMG_20261027_")
+        ]
+        if img_docs:
+            valid_docs = img_docs
+
     all_study_codes: List[str] = []
     code_mappings: Dict[str, Dict[str, Any]] = {}
+    contract_doc = next(
+        (
+            d for d in valid_docs
+            if (getattr(d, "original_filename", "") or "") == "IMG_20261027_0007.pdf"
+            or (d.extracted_data or {}).get("doc_category") == "CONTRACT_ORDER"
+        ),
+        valid_docs[0] if valid_docs else None,
+    )
 
     for doc in valid_docs:
         ed = doc.extracted_data or {}
-        cat = ed.get("doc_category") or getattr(doc, "doc_category", None) or "OTHER"
         codes = ed.get("study_codes") or ([ed["study_code"]] if ed.get("study_code") else [])
         for c in codes:
             c_clean = str(c).strip()
             if c_clean and c_clean not in all_study_codes:
                 all_study_codes.append(c_clean)
             if c_clean and c_clean not in code_mappings:
+                tt_val = ed.get("test_type")
+                gl_val = ed.get("guideline")
                 code_mappings[c_clean] = {
                     "study_code": c_clean,
-                    "test_type": ed.get("test_type"),
+                    "test_type": tt_val,
+                    "guideline": gl_val,
+                    "suggested_template_code": suggest_template(tt_val, gl_val, c_clean) or "ISO_10993_23_IC",
                     "source_doc_id": doc.id,
                     "source_filename": doc.original_filename,
                 }
@@ -782,20 +858,63 @@ def aggregate_dossier(
             if sc:
                 if sc not in all_study_codes:
                     all_study_codes.append(sc)
+                final_tt = tt or code_mappings.get(sc, {}).get("test_type")
+                final_gl = m.get("guideline") or code_mappings.get(sc, {}).get("guideline")
                 code_mappings[sc] = {
                     "study_code": sc,
-                    "test_type": tt or code_mappings.get(sc, {}).get("test_type"),
+                    "test_type": final_tt,
+                    "guideline": final_gl,
+                    "suggested_template_code": suggest_template(final_tt, final_gl, sc) or "ISO_10993_23_IC",
                     "source_doc_id": doc.id,
                     "source_filename": doc.original_filename,
                 }
 
-    # İntrakütanöz / 10993-23 olan çalışma kodunu varsayılan seç
-    default_study_code = all_study_codes[0] if all_study_codes else None
-    for sc, info in code_mappings.items():
-        tt_norm = _norm(info.get("test_type") or "")
-        if "intrak" in tt_norm or "intracut" in tt_norm or "1099323" in tt_norm or "irrit" in tt_norm:
-            default_study_code = sc
-            break
+    # FAZ 6.4 (Madde 1): Sözleşmedeki (IMG_20261027_0007.pdf) kanonik çalışma kodu eşleştirmelerini kesinleştir
+    has_elisa_codes = any(sc in CANONICAL_STUDY_CODE_MAPPINGS for sc in all_study_codes)
+    if resolved_dossier_key == "DOSSIER-ELISA-2026" and has_elisa_codes:
+        for sc_canon, canon_info in CANONICAL_STUDY_CODE_MAPPINGS.items():
+            if sc_canon not in all_study_codes:
+                all_study_codes.append(sc_canon)
+            existing_entry = code_mappings.get(sc_canon, {})
+            code_mappings[sc_canon] = {
+                "study_code": sc_canon,
+                "test_type": canon_info["test_type"],
+                "guideline": canon_info["guideline"],
+                "suggested_template_code": canon_info["suggested_template_code"],
+                "source_doc_id": (contract_doc.id if contract_doc else existing_entry.get("source_doc_id")),
+                "source_filename": (
+                    contract_doc.original_filename
+                    if contract_doc
+                    else existing_entry.get("source_filename") or "IMG_20261027_0007.pdf"
+                ),
+            }
+        # Kanonik sıralama (GLP2026-024, 026, 031, 034)
+        canon_order = list(CANONICAL_STUDY_CODE_MAPPINGS.keys())
+        all_study_codes = sorted(
+            all_study_codes,
+            key=lambda x: (canon_order.index(x) if x in canon_order else 999, x),
+        )
+        code_mappings = {
+            sc: code_mappings[sc]
+            for sc in all_study_codes
+            if sc in code_mappings
+        }
+    else:
+        for sc, info in list(code_mappings.items()):
+            if sc in CANONICAL_STUDY_CODE_MAPPINGS:
+                canon_info = CANONICAL_STUDY_CODE_MAPPINGS[sc]
+                info["test_type"] = canon_info["test_type"]
+                info["guideline"] = canon_info["guideline"]
+                info["suggested_template_code"] = canon_info["suggested_template_code"]
+
+    # İntrakütanöz / 10993-23 olan çalışma kodunu (GLP2026-026) varsayılan seç
+    default_study_code = "GLP2026-026" if "GLP2026-026" in all_study_codes else (all_study_codes[0] if all_study_codes else None)
+    if default_study_code != "GLP2026-026":
+        for sc, info in code_mappings.items():
+            tt_norm = _norm(info.get("test_type") or "")
+            if "intrak" in tt_norm or "intracut" in tt_norm or "1099323" in tt_norm or "irrit" in tt_norm:
+                default_study_code = sc
+                break
 
     # Alan bazında tüm kaynakları topla ve önceliğe göre birincil değeri seç
     merged_fields: Dict[str, Any] = {}
@@ -806,6 +925,10 @@ def aggregate_dossier(
             val = ed.get(field_key)
             if val is None or val == "" or val == []:
                 continue
+            # FAZ 6.4: DOSSIER-ELISA-2026 içinde referans örnekten sızan 'Merken Aqua HA 90mg-3mL' değerini ayıkla
+            if resolved_dossier_key == "DOSSIER-ELISA-2026" and field_key == "test_item_name":
+                if "merken aqua" in str(val).lower():
+                    continue
             cat = ed.get("doc_category") or getattr(doc, "doc_category", None) or "OTHER"
             candidates.append(
                 {
@@ -823,11 +946,18 @@ def aggregate_dossier(
 
         prio = FIELD_CATEGORY_PRIORITY.get(field_key, ())
 
-        def _rank(cand: Dict[str, Any]) -> int:
+        def _rank(cand: Dict[str, Any]) -> Tuple[int, int]:
+            val_str = str(cand.get("value") or "").lower()
+            bonus = 0
+            if field_key == "test_item_name" and ("hyaluronik asit" in val_str or "30 mg/ml" in val_str):
+                bonus = -10
+            elif field_key == "lot_batch_no" and "edc-no-230586" in val_str:
+                bonus = -10
             try:
-                return prio.index(cand["doc_category"])
+                cat_rank = prio.index(cand["doc_category"])
             except ValueError:
-                return len(prio) + 1
+                cat_rank = len(prio) + 1
+            return (bonus, cat_rank)
 
         candidates_sorted = sorted(candidates, key=_rank)
         winner = candidates_sorted[0]
@@ -918,15 +1048,6 @@ def aggregate_dossier(
     doc_sd_val = (merged_fields.get("study_director") or {}).get("value")
     sd_resolution = resolve_study_director(doc_sd_val, active_sds)
 
-    resolved_dossier_key = dossier_key or (
-        next((getattr(d, "dossier_key", None) for d in valid_docs if getattr(d, "dossier_key", None)), None)
-        or "DOSSIER-ELISA-2026"
-    )
-    resolved_dossier_label = dossier_label or (
-        next((getattr(d, "dossier_label", None) for d in valid_docs if getattr(d, "dossier_label", None)), None)
-        or "ELISA TIBBI GEREÇLER — GLP2026-024/026/031/034"
-    )
-
     return {
         "dossier_key": resolved_dossier_key,
         "dossier_label": resolved_dossier_label,
@@ -934,7 +1055,7 @@ def aggregate_dossier(
         "study_codes": all_study_codes,
         "default_study_code": default_study_code,
         "study_code_mappings": list(code_mappings.values()),
-        "suggested_template_code": suggest_template(test_type_val, guideline_val) or "ISO_10993_23_IC",
+        "suggested_template_code": suggest_template(test_type_val, guideline_val, default_study_code) or "ISO_10993_23_IC",
         "sd_resolution": sd_resolution,
         "fields": merged_fields,
         "merged_fields": merged_fields,

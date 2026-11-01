@@ -54,6 +54,8 @@ export const getRooms = () => api.get('/rooms');
 // Operasyonel Planlama & Çakışma Yönetimi Servisleri
 export const getSummary = () => api.get('/planning/summary');
 export const getTemplates = () => api.get('/planning/templates');
+export const getCalibration = () => api.get('/planning/calibration');
+export const updateCalibration = (data) => api.put('/planning/calibration', data);
 export const getSteps = (params) => api.get('/planning/steps', { params });
 export const getCalendar = () => api.get('/planning/calendar');
 export const getStudySchedule = (studyId) => api.get(`/planning/studies/${studyId}/schedule`);

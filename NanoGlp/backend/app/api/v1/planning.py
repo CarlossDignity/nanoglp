@@ -11,7 +11,11 @@ from app.models.study_step import StudyStep, StepStatus
 from app.models.user import User, UserRole
 from app.models.audit_log import AuditLog
 from app.models.document import Document
+from app.models.equipment import Equipment
+from app.models.calibration import SystemCalibration
 from app.schemas.conflict import ConflictOut
+from app.seed import seed_default_equipment
+from app.services.document_parser import CANONICAL_STUDY_CODE_MAPPINGS
 from app.services.scheduling_engine import (
     apply_conflict_resolution,
     build_conflict_resolutions,
@@ -21,7 +25,13 @@ from app.services.scheduling_engine import (
     schedule_new_study,
     MAX_DAILY_WORKLOAD_MINUTES,
 )
-from app.services.templates import TEMPLATES, DEFAULT_TEMPLATE_CODE, get_template
+from app.services.templates import (
+    TEMPLATES,
+    DEFAULT_TEMPLATE_CODE,
+    ensure_default_calibrations,
+    get_all_templates_calibrated,
+    get_template,
+)
 from app.utils.security import get_current_user, require_management_read, require_management_write
 
 router = APIRouter(prefix="/planning", tags=["Operasyonel Planlama ve Çakışma Yönetimi"])
@@ -120,6 +130,8 @@ def _serialize_step(s: StudyStep) -> dict:
 def _apply_dossier_fields_to_study(study: Study, payload: ScheduleStudyRequest) -> None:
     """Birleştirilmiş çalışma dosyasından (Dossier) gelen alanları Study modeline yazar."""
     study.acclimatization_start_date = payload.acclimatization_start_date
+    if payload.template_code:
+        study.template_code = payload.template_code
     if payload.study_director_id is not None:
         study.study_director_id = payload.study_director_id
     for attr in (
@@ -153,8 +165,23 @@ def _apply_dossier_fields_to_study(study: Study, payload: ScheduleStudyRequest) 
 
 
 def _resolve_or_create_draft_study(db: Session, payload: ScheduleStudyRequest) -> Study:
+    # FAZ 6.4 (Madde 1): GLP2026-024, 031, 034 kodlarının yanlışlıkla ISO_10993_23_IC ile planlanmasını engelle
+    code_hint = (payload.study_code or "").strip().upper()
+    if not code_hint and payload.study_id is not None:
+        existing_st = db.query(Study).filter(Study.id == payload.study_id).first()
+        if existing_st and existing_st.study_code:
+            code_hint = existing_st.study_code.strip().upper()
+    if code_hint in CANONICAL_STUDY_CODE_MAPPINGS:
+        canon = CANONICAL_STUDY_CODE_MAPPINGS[code_hint]
+        if payload.template_code == DEFAULT_TEMPLATE_CODE and canon["suggested_template_code"] != DEFAULT_TEMPLATE_CODE:
+            payload.template_code = canon["suggested_template_code"]
+        if not payload.test_type:
+            payload.test_type = canon["test_type"]
+        if not payload.guideline:
+            payload.guideline = canon["guideline"]
+
     try:
-        template = get_template(payload.template_code)
+        template = get_template(payload.template_code, db=db)
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
 
@@ -172,6 +199,8 @@ def _resolve_or_create_draft_study(db: Session, payload: ScheduleStudyRequest) -
     study = db.query(Study).filter(Study.study_code == code).first()
     if study:
         if study.status == StudyStatus.DRAFT:
+            if not payload.title:
+                study.title = f"{template.standard} {template.title} ({code})"
             _apply_dossier_fields_to_study(study, payload)
             db.commit()
             db.refresh(study)
@@ -192,6 +221,7 @@ def _resolve_or_create_draft_study(db: Session, payload: ScheduleStudyRequest) -
 
     study = Study(
         study_code=code,
+        template_code=template.code,
         title=payload.title or f"{template.standard} {template.title} ({code})",
         test_item_name=payload.test_item_name or "BELİRTİLMEDİ — SD tarafından girilecek",
         study_director_id=director_id,
@@ -584,10 +614,253 @@ def api_approve_study_plan(
     return res
 
 
+class CalibrationStepUpdateItem(BaseModel):
+    id: Optional[int] = None
+    template_code: Optional[str] = None
+    step_order: Optional[int] = None
+    step_name: Optional[str] = None
+    start_time: Optional[str] = None
+    duration_minutes: Optional[int] = None
+    tolerance_minutes: Optional[int] = None
+
+
+class CalibrationUpdateRequest(BaseModel):
+    reason: str
+    step_id: Optional[int] = None
+    template_code: Optional[str] = None
+    step_order: Optional[int] = None
+    step_name: Optional[str] = None
+    start_time: Optional[str] = None
+    duration_minutes: Optional[int] = None
+    tolerance_minutes: Optional[int] = None
+    steps: Optional[List[CalibrationStepUpdateItem]] = None
+    equipment_code: Optional[str] = None
+    polar_capacity: Optional[int] = None
+    non_polar_capacity: Optional[int] = None
+
+
+def _build_calibration_response(db: Session) -> dict:
+    ensure_default_calibrations(db)
+    seed_default_equipment(db)
+
+    cal_rows = (
+        db.query(SystemCalibration)
+        .order_by(SystemCalibration.template_code.asc(), SystemCalibration.step_order.asc())
+        .all()
+    )
+    eq_rows = db.query(Equipment).order_by(Equipment.id.asc()).all()
+    audit_rows = (
+        db.query(AuditLog)
+        .filter(AuditLog.entity_name.in_(["SystemCalibration", "Equipment"]))
+        .order_by(AuditLog.timestamp.desc(), AuditLog.id.desc())
+        .limit(50)
+        .all()
+    )
+    user_ids = {a.user_id for a in audit_rows if a.user_id is not None}
+    users_by_id = (
+        {u.id: u for u in db.query(User).filter(User.id.in_(user_ids)).all()}
+        if user_ids
+        else {}
+    )
+
+    tpl_titles = {k: f"{v.standard} — {v.title}" for k, v in TEMPLATES.items()}
+
+    return {
+        "steps": [
+            {
+                "id": r.id,
+                "template_code": r.template_code,
+                "template_label": tpl_titles.get(r.template_code, r.template_code),
+                "step_order": r.step_order,
+                "study_day": r.study_day,
+                "step_name": r.step_name,
+                "step_type": r.category,
+                "category": r.category,
+                "start_time": r.start_time,
+                "duration_minutes": r.duration_minutes,
+                "is_biological_fixed_time": r.is_biological_fixed_time,
+                "tolerance_minutes": r.tolerance_minutes,
+            }
+            for r in cal_rows
+        ],
+        "equipment": [
+            {
+                "id": eq.id,
+                "code": eq.code,
+                "name": eq.name,
+                "category": eq.category,
+                "polar_capacity": eq.polar_capacity,
+                "non_polar_capacity": eq.non_polar_capacity,
+                "status": eq.status.value if eq.status else "AVAILABLE",
+            }
+            for eq in eq_rows
+        ],
+        "audit_logs": [
+            {
+                "id": a.id,
+                "timestamp": a.timestamp.isoformat() if a.timestamp else None,
+                "user_id": a.user_id,
+                "editor": users_by_id[a.user_id].full_name if a.user_id in users_by_id else "Sistem Yetkilisi",
+                "editor_role": users_by_id[a.user_id].role.value if a.user_id in users_by_id else "SYSADMIN",
+                "entity_name": a.entity_name,
+                "entity_id": a.entity_id,
+                "action": a.action,
+                "old_values": a.old_values,
+                "new_values": a.new_values,
+                "reason": a.reason,
+            }
+            for a in audit_rows
+        ],
+    }
+
+
+@router.get("/calibration", summary="Sistem Kalibrasyonu — Görev Süreleri, Toleranslar ve Su Banyosu Kapasiteleri (FAZ 6.4)")
+def api_get_calibration(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_management_read),
+):
+    return _build_calibration_response(db)
+
+
+@router.put("/calibration", summary="Sistem Kalibrasyonunu Güncelle ve GLP AuditLog Kaydı Üret (FAZ 6.4)")
+def api_update_calibration(
+    payload: CalibrationUpdateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_management_write),
+):
+    reason = (payload.reason or "").strip()
+    if len(reason) < 3:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="GLP denetim izi gereği değişiklik gerekçesi (en az 3 karakter) zorunludur.",
+        )
+
+    ensure_default_calibrations(db)
+    water_bath = seed_default_equipment(db)
+
+    step_items: List[CalibrationStepUpdateItem] = list(payload.steps or [])
+    if payload.step_id is not None or (payload.template_code and payload.step_order is not None):
+        step_items.append(
+            CalibrationStepUpdateItem(
+                id=payload.step_id,
+                template_code=payload.template_code,
+                step_order=payload.step_order,
+                step_name=payload.step_name,
+                start_time=payload.start_time,
+                duration_minutes=payload.duration_minutes,
+                tolerance_minutes=payload.tolerance_minutes,
+            )
+        )
+
+    for item in step_items:
+        row = None
+        if item.id is not None:
+            row = db.query(SystemCalibration).filter(SystemCalibration.id == item.id).first()
+        elif item.template_code and item.step_order is not None:
+            row = (
+                db.query(SystemCalibration)
+                .filter(
+                    SystemCalibration.template_code == item.template_code,
+                    SystemCalibration.step_order == item.step_order,
+                )
+                .first()
+            )
+        if not row:
+            raise HTTPException(status_code=404, detail="Güncellenecek kalibrasyon adımı bulunamadı.")
+
+        old_vals = {
+            "template_code": row.template_code,
+            "step_order": row.step_order,
+            "step_name": row.step_name,
+            "start_time": row.start_time,
+            "duration_minutes": row.duration_minutes,
+            "tolerance_minutes": row.tolerance_minutes,
+        }
+        if item.step_name is not None and item.step_name.strip():
+            row.step_name = item.step_name.strip()
+        if item.start_time is not None and item.start_time.strip():
+            row.start_time = item.start_time.strip()
+        if item.duration_minutes is not None:
+            if item.duration_minutes < 1 or item.duration_minutes > 1440:
+                raise HTTPException(status_code=400, detail="Görev süresi 1–1440 dakika arasında olmalıdır.")
+            row.duration_minutes = int(item.duration_minutes)
+        if item.tolerance_minutes is not None:
+            if item.tolerance_minutes < 0 or item.tolerance_minutes > 720:
+                raise HTTPException(status_code=400, detail="Biyolojik tolerans 0–720 dakika arasında olmalıdır.")
+            row.tolerance_minutes = int(item.tolerance_minutes)
+        row.updated_at = datetime.utcnow()
+
+        new_vals = {
+            "template_code": row.template_code,
+            "step_order": row.step_order,
+            "step_name": row.step_name,
+            "start_time": row.start_time,
+            "duration_minutes": row.duration_minutes,
+            "tolerance_minutes": row.tolerance_minutes,
+        }
+        if old_vals != new_vals:
+            db.add(
+                AuditLog(
+                    user_id=current_user.id,
+                    entity_name="SystemCalibration",
+                    entity_id=row.id,
+                    action="UPDATE_SYSTEM_CALIBRATION",
+                    old_values=old_vals,
+                    new_values=new_vals,
+                    reason=reason,
+                )
+            )
+
+    if payload.polar_capacity is not None or payload.non_polar_capacity is not None:
+        eq_code = (payload.equipment_code or "EQ-WB-001").strip()
+        eq = db.query(Equipment).filter(Equipment.code == eq_code).first() or water_bath
+        old_eq = {
+            "code": eq.code,
+            "name": eq.name,
+            "polar_capacity": eq.polar_capacity,
+            "non_polar_capacity": eq.non_polar_capacity,
+        }
+        if payload.polar_capacity is not None:
+            if payload.polar_capacity < 1 or payload.polar_capacity > 99:
+                raise HTTPException(status_code=400, detail="Polar kapasite 1–99 arasında olmalıdır.")
+            eq.polar_capacity = int(payload.polar_capacity)
+        if payload.non_polar_capacity is not None:
+            if payload.non_polar_capacity < 1 or payload.non_polar_capacity > 99:
+                raise HTTPException(status_code=400, detail="Apolar kapasite 1–99 arasında olmalıdır.")
+            eq.non_polar_capacity = int(payload.non_polar_capacity)
+        new_eq = {
+            "code": eq.code,
+            "name": eq.name,
+            "polar_capacity": eq.polar_capacity,
+            "non_polar_capacity": eq.non_polar_capacity,
+        }
+        if old_eq != new_eq:
+            db.add(
+                AuditLog(
+                    user_id=current_user.id,
+                    entity_name="Equipment",
+                    entity_id=eq.id,
+                    action="UPDATE_EQUIPMENT_CAPACITY",
+                    old_values=old_eq,
+                    new_values=new_eq,
+                    reason=reason,
+                )
+            )
+
+    db.commit()
+    return _build_calibration_response(db)
+
+
 @router.get("/templates", summary="Tanımlı GLP Çalışma Şablonları")
-def api_get_templates(current_user: User = Depends(require_management_read)):
-    """Planlama formunda gösterilecek şablonlar ve gün/adım/rol tanımları."""
-    return {"default": DEFAULT_TEMPLATE_CODE, "templates": [t.to_dict() for t in TEMPLATES.values()]}
+def api_get_templates(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_management_read),
+):
+    """Planlama formunda gösterilecek şablonlar ve veritabanı kalibrasyonuyla güncel gün/adım/rol tanımları."""
+    return {
+        "default": DEFAULT_TEMPLATE_CODE,
+        "templates": [t.to_dict() for t in get_all_templates_calibrated(db)],
+    }
 
 
 @router.get("/steps", summary="Zaman Aralığındaki Görevler / Biyolojik Kilometre Taşları")

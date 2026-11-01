@@ -6,9 +6,11 @@ from app.models.study_step import StudyStep, StepStatus
 from app.models.conflict import Conflict, ConflictType, ConflictSeverity
 from app.models.audit_log import AuditLog
 from app.models.document import Document
+from app.models.calibration import SystemCalibration
 
 __all__ = [
     "Document",
+    "SystemCalibration",
     "User",
     "UserRole",
     "Room",

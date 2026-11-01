@@ -6,12 +6,13 @@ from app.config import settings
 from app.database import engine, Base, SessionLocal
 import app.models  # Modellerin Base.metadata'ya kaydolması için import edilir
 from app.seed import seed_default_equipment
+from app.services.templates import ensure_default_calibrations
 from app.api.v1.api import api_router
 from app.api.v1.planning import router as planning_router
 
 
 def _ensure_sqlite_columns() -> None:
-    """Mevcut SQLite tablolarına FAZ 6.1 & 6.2'de eklenen yeni sütunları veri silmeden ekler ve varsayılanları tamamlar."""
+    """Mevcut SQLite tablolarına FAZ 6.1–6.4'te eklenen yeni sütunları veri silmeden ekler ve varsayılanları tamamlar."""
     try:
         insp = inspect(engine)
         with engine.begin() as conn:
@@ -28,12 +29,21 @@ def _ensure_sqlite_columns() -> None:
                     text(
                         "UPDATE documents SET dossier_key = 'DOSSIER-ELISA-2026', "
                         "dossier_label = 'ELISA TIBBI GEREÇLER — GLP2026-024/026/031/034' "
-                        "WHERE dossier_key IS NULL OR dossier_key = ''"
+                        "WHERE (dossier_key IS NULL OR dossier_key = '') AND original_filename LIKE 'IMG_20261027_%'"
+                    )
+                )
+                conn.execute(
+                    text(
+                        "UPDATE documents SET dossier_key = 'DOSSIER-REF-ARCHIVE', "
+                        "dossier_label = 'Referans Standartlar ve Arşiv Belgeleri' "
+                        "WHERE (dossier_key IS NULL OR dossier_key = '' OR dossier_key = 'DOSSIER-ELISA-2026') "
+                        "AND original_filename NOT LIKE 'IMG_20261027_%'"
                     )
                 )
         db = SessionLocal()
         try:
             seed_default_equipment(db)
+            ensure_default_calibrations(db)
         finally:
             db.close()
     except Exception:
