@@ -26,6 +26,7 @@ class Equipment(Base):
     calibration_due_date = Column(Date, nullable=True) # Kalibrasyon geçerlilik tarihi
     polar_capacity = Column(Integer, default=3, nullable=True)      # Polar ekstraksiyon eşzamanlı çalışma kapasitesi (Max: 3)
     non_polar_capacity = Column(Integer, default=1, nullable=True)  # Apolar (Non-Polar) eşzamanlı çalışma kapasitesi (Max: 1)
+    max_concurrent_studies = Column(Integer, default=1, nullable=True)  # FAZ 8.1: 24-72s uzun süreli cihazlarda eşzamanlı çalışma kapasitesi
     notes = Column(String(255), nullable=True)
     
     created_at = Column(DateTime, default=datetime.utcnow)

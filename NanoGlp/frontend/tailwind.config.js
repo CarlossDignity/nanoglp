@@ -6,6 +6,12 @@ export default {
   ],
   theme: {
     extend: {
+      boxShadow: {
+        xs: '0 1px 2px 0 rgb(15 23 42 / 0.04)',
+      },
+      fontFamily: {
+        sans: ['Inter', 'ui-sans-serif', 'system-ui', '-apple-system', 'Segoe UI', 'Roboto', 'Helvetica Neue', 'Arial', 'sans-serif'],
+      },
       colors: {
         glp: {
           50: '#f0fdf4',

@@ -13,6 +13,7 @@ import Settings from './pages/Settings';
 import Upload from './pages/Upload';
 import MyTasks from './pages/MyTasks';
 import UserManagement from './pages/UserManagement';
+import SampleTracking from './pages/SampleTracking';
 import { useAuth, MANAGEMENT_VIEW_ROLES, USER_ADMIN_ROLES } from './state/AuthContext';
 import { getHealth, getStudies, getPersonnel, getConflicts } from './services/api';
 
@@ -88,15 +89,23 @@ export default function App() {
               <Route
                 path="/"
                 element={
-                  <ProtectedRoute allowedRoles={MANAGEMENT_VIEW_ROLES}>
+                  <ProtectedRoute menuKey="dashboard" allowedRoles={MANAGEMENT_VIEW_ROLES}>
                     <Dashboard key={conflicts.length} onNavigate={(id) => navigate(`/${id}`)} />
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/samples"
+                element={
+                  <ProtectedRoute menuKey="samples">
+                    <SampleTracking />
                   </ProtectedRoute>
                 }
               />
               <Route
                 path="/upload"
                 element={
-                  <ProtectedRoute allowedRoles={MANAGEMENT_VIEW_ROLES}>
+                  <ProtectedRoute menuKey="upload" allowedRoles={MANAGEMENT_VIEW_ROLES}>
                     <Upload personnel={personnel} />
                   </ProtectedRoute>
                 }
@@ -104,7 +113,7 @@ export default function App() {
               <Route
                 path="/planning"
                 element={
-                  <ProtectedRoute allowedRoles={MANAGEMENT_VIEW_ROLES}>
+                  <ProtectedRoute menuKey="planning" allowedRoles={MANAGEMENT_VIEW_ROLES}>
                     <Planning onScheduled={refresh} />
                   </ProtectedRoute>
                 }
@@ -112,7 +121,7 @@ export default function App() {
               <Route
                 path="/personnel"
                 element={
-                  <ProtectedRoute allowedRoles={MANAGEMENT_VIEW_ROLES}>
+                  <ProtectedRoute menuKey="personnel" allowedRoles={MANAGEMENT_VIEW_ROLES}>
                     <Personnel onChanged={refresh} />
                   </ProtectedRoute>
                 }
@@ -120,7 +129,7 @@ export default function App() {
               <Route
                 path="/studies"
                 element={
-                  <ProtectedRoute allowedRoles={MANAGEMENT_VIEW_ROLES}>
+                  <ProtectedRoute menuKey="studies" allowedRoles={MANAGEMENT_VIEW_ROLES}>
                     <Studies studies={studies} personnel={personnel} onRefresh={refresh} />
                   </ProtectedRoute>
                 }
@@ -128,7 +137,7 @@ export default function App() {
               <Route
                 path="/conflicts"
                 element={
-                  <ProtectedRoute allowedRoles={MANAGEMENT_VIEW_ROLES}>
+                  <ProtectedRoute menuKey="conflicts" allowedRoles={MANAGEMENT_VIEW_ROLES}>
                     <ConflictsPage conflicts={conflicts} />
                   </ProtectedRoute>
                 }
@@ -136,7 +145,7 @@ export default function App() {
               <Route
                 path="/users"
                 element={
-                  <ProtectedRoute allowedRoles={USER_ADMIN_ROLES}>
+                  <ProtectedRoute menuKey="users" allowedRoles={USER_ADMIN_ROLES}>
                     <UserManagement onChanged={refresh} />
                   </ProtectedRoute>
                 }
@@ -144,7 +153,7 @@ export default function App() {
               <Route
                 path="/settings"
                 element={
-                  <ProtectedRoute allowedRoles={MANAGEMENT_VIEW_ROLES}>
+                  <ProtectedRoute menuKey="settings" allowedRoles={MANAGEMENT_VIEW_ROLES}>
                     <Settings personnel={personnel} />
                   </ProtectedRoute>
                 }
@@ -152,7 +161,7 @@ export default function App() {
               <Route
                 path="/my-tasks"
                 element={
-                  <ProtectedRoute>
+                  <ProtectedRoute menuKey="my_tasks">
                     <MyTasks />
                   </ProtectedRoute>
                 }

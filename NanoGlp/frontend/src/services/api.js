@@ -36,11 +36,15 @@ export const loginApi = (username, password) =>
   api.post('/auth/login', { username, password });
 export const getMe = () => api.get('/auth/me');
 
-// Kullanıcı Yönetimi (Sadece SYSADMIN ve TFM)
+// Kullanıcı ve Rol Yönetimi (SYSADMIN ve TFM)
 export const getUsers = () => api.get('/users');
 export const createUser = (data) => api.post('/users', data);
 export const updateUser = (id, data) => api.put(`/users/${id}`, data);
 export const deleteUser = (id) => api.delete(`/users/${id}`);
+export const getRoles = () => api.get('/users/roles');
+export const createRole = (data) => api.post('/users/roles', data);
+export const updateRole = (roleCode, data) => api.put(`/users/roles/${roleCode}`, data);
+export const deleteRole = (roleCode) => api.delete(`/users/roles/${roleCode}`);
 
 // Temel Servisler
 export const getHealth = () => api.get('/health');
@@ -118,6 +122,74 @@ export const reparseDocument = (id) =>
 export const reparseAllDocuments = (params) =>
   api.post('/documents/reparse-all', {}, { params, timeout: 600000 });
 export const deleteDocument = (id) => api.delete(`/documents/${id}`);
+
+// FAZ 8.1: Test Kısıtlama Takvimi, Kafes Kapasitesi, Uzun Süreli Cihazlar
+export const getRestrictions = () => api.get('/restrictions');
+export const createRestriction = (data) => api.post('/restrictions', data);
+export const updateRestriction = (id, data) => api.put(`/restrictions/${id}`, data);
+export const deleteRestriction = (id) => api.delete(`/restrictions/${id}`);
+export const previewRestrictionShift = (data) => api.post('/restrictions/preview-shift', data);
+export const getRoomCapacities = () => api.get('/room-capacities');
+export const updateRoomCapacity = (code, data) => api.put(`/room-capacities/${code}`, data);
+export const getLongEquipment = () => api.get('/long-equipment');
+export const updateLongEquipment = (code, data) => api.put(`/long-equipment/${code}`, data);
+
+// FAZ 8.1: Numune & Çalışma Takip
+export const getSamples = () => api.get('/samples');
+export const getSample = (id) => api.get(`/samples/${id}`);
+export const createSample = (data) => api.post('/samples', data);
+export const updateSample = (id, data) => api.put(`/samples/${id}`, data);
+export const deleteSample = (id) => api.delete(`/samples/${id}`);
+export const planSample = (id, data = {}) => api.post(`/samples/${id}/plan`, data, { timeout: 120000 });
+export const autoScheduleAllSamples = () => api.post('/samples/auto-schedule-all', {}, { timeout: 300000 });
+export const sampleWorkflowAction = (id, step, data) => api.post(`/samples/${id}/workflow/${step}`, data);
+export const importSamplesExcel = (file) => {
+  const form = new FormData();
+  form.append('file', file);
+  return api.post('/samples/import-excel', form, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 120000,
+  });
+};
+export const downloadSampleStudyPlan = async (sampleId, studyCode = '') => {
+  const res = await api.get(`/samples/${sampleId}/study-plan-docx`, { responseType: 'blob', timeout: 180000 });
+  const blob = new Blob([res.data], {
+    type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  });
+  const url = window.URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `GLP_Study_Plan_Draft_${(studyCode || `Sample_${sampleId}`).replace(/[^A-Za-z0-9_.-]+/g, '_')}.docx`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.URL.revokeObjectURL(url);
+};
+
+export const getSampleDocuments = (id) => api.get(`/samples/${id}/documents`);
+export const uploadSampleDocuments = (id, files, overwrite = false) => {
+  const form = new FormData();
+  Array.from(files).forEach((f) => form.append('files', f));
+  return api.post(`/samples/${id}/documents`, form, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+    params: overwrite ? { overwrite: true } : {},
+    timeout: 600000,
+  });
+};
+
+/** Blob yanıtlı isteklerde FastAPI hata gövdesini (JSON) okunabilir metne çevirir. */
+export const extractBlobError = async (err, fallback = 'İşlem başarısız.') => {
+  const data = err?.response?.data;
+  if (data instanceof Blob) {
+    try {
+      const parsed = JSON.parse(await data.text());
+      if (typeof parsed?.detail === 'string') return parsed.detail;
+    } catch {
+      /* yut */
+    }
+  }
+  return err?.response?.data?.detail && typeof err.response.data.detail === 'string' ? err.response.data.detail : fallback;
+};
 
 /** FastAPI hata gövdesini okunabilir metne çevirir. */
 export const extractError = (err, fallback = 'Beklenmeyen bir hata oluştu.') => {

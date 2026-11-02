@@ -1,0 +1,1653 @@
+"""
+FAZ 8.1 — Numune ve Çalışma Takip servisi.
+
+* 11 adımlı numune iş akışı (dikey stepper) durum hesabı, rol bazlı yetkiler
+* Excel (.xlsx / .csv) içe aktarma (sütun adlarını otomatik eşler)
+* Numuneden otomatik taslak çalışma + takvim üretimi (kısıtlama ve kafes/cihaz kurallarıyla)
+* Örnek veri tohumlama (GLP2026-072 / 031 / 076 / 073 / 026 ...)
+"""
+import copy
+import csv
+import io
+import re
+import unicodedata
+from datetime import date, datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
+
+from sqlalchemy.orm import Session
+
+from app.models.audit_log import AuditLog
+from app.models.sample import APPROVAL_ROLES, WORKFLOW_STEPS, SampleRecord
+from app.models.study import Study, StudyStatus
+from app.models.study_step import StepStatus, StudyStep
+from app.models.user import User, UserRole
+from app.services.capacity_service import get_auto_schedule_notice, next_business_day
+from app.services.templates import DEFAULT_TEMPLATE_CODE, TEMPLATES, get_template, resolve_template_code
+
+SUPER_ROLES = {"SYSADMIN", "ADMIN", "TFM"}
+PLAN_ROLES = {"SYSADMIN", "ADMIN", "TFM", "STUDY_DIRECTOR", "PLANNING_COORDINATOR"}
+TRM_ROLES = {"TRM_KABUL", "TRM_ACCEPTANCE"}
+SAMPLE_ACCESS_ROLES = SUPER_ROLES | {"SALES", "TRM_KABUL", "TRM_ACCEPTANCE", "STUDY_DIRECTOR", "PLANNING_COORDINATOR", "QA", "EXECUTIVE"}
+
+STATUS_LABELS = {
+    "EXPECTED": "Beklenen",
+    "PLANNED": "Planlanan",
+    "ONGOING": "Devam eden",
+    "COMPLETED": "Biten",
+    "CANCELLED": "İptal",
+}
+
+SALES_FIELDS = (
+    "requested_analysis", "test_item_name", "billing_company", "sponsor_name", "contacts",
+    "quote_no", "sales_manager", "expected_arrival_date", "payment_status", "study_agreement_date",
+)
+TRM_FIELDS = (
+    "sample_status", "test_item_code", "istanbul_arrival_date", "lab_arrival_date", "received_quantity",
+    "lot_no", "expiry_date", "storage_condition", "sample_note",
+    "manufacture_date", "extraction_polar_solvent", "extraction_non_polar_solvent",
+    "animal_consumable_status", "animal_procurement_date",
+)
+PLANNING_FIELDS = ("template_code", "study_director_name", "glp_type", "test_laboratory")
+DATE_FIELDS = {
+    "expected_arrival_date", "istanbul_arrival_date", "lab_arrival_date", "planned_start", "planned_end",
+    "animal_procurement_date", "experiment_start_date", "experiment_end_date", "draft_report_date",
+    "final_report_date", "study_agreement_date",
+}
+
+
+def role_of(user: User) -> str:
+    return user.role.value if hasattr(user.role, "value") else str(user.role)
+
+
+# ---------------------------------------------------------------------------
+# YETKİLER
+# ---------------------------------------------------------------------------
+def sample_permissions(user: User) -> Dict[str, Any]:
+    """Rol bazlı numune ekranı yetkileri (kayıt düzenleme, planlama, belge yükleme, iş akışı)."""
+    r = role_of(user)
+    steps_allowed = [
+        s["no"] for s in WORKFLOW_STEPS
+        if s["kind"] in ("manual", "auto_or_manual") and (r in SUPER_ROLES or r in s["roles"])
+    ]
+    approvals = [k for k, v in APPROVAL_ROLES.items() if r in ("SYSADMIN", "ADMIN") or r in v["roles"]]
+    return {
+        "role": r,
+        "can_edit_sales": r in SUPER_ROLES or r == "SALES",
+        "can_edit_trm": r in SUPER_ROLES or r in TRM_ROLES,
+        "can_plan": r in PLAN_ROLES,
+        "can_import": r in SUPER_ROLES | {"SALES", "TRM_KABUL", "TRM_ACCEPTANCE", "STUDY_DIRECTOR", "PLANNING_COORDINATOR"},
+        "can_delete": r in SUPER_ROLES,
+        "can_upload_documents": r in SUPER_ROLES | {"SALES", "TRM_KABUL", "TRM_ACCEPTANCE", "STUDY_DIRECTOR", "PLANNING_COORDINATOR"},
+        "can_assign_planning": r in PLAN_ROLES or r == "SALES",
+        "workflow_steps": steps_allowed,
+        "approval_roles": approvals,
+    }
+
+
+# ---------------------------------------------------------------------------
+# YARDIMCILAR
+# ---------------------------------------------------------------------------
+def _ascii(s: Any) -> str:
+    s = unicodedata.normalize("NFKD", str(s or ""))
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return s.replace("ı", "i").replace("İ", "I")
+
+
+def norm_key(s: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", _ascii(s).lower()).strip()
+
+
+def parse_date_any(v: Any) -> Optional[date]:
+    if v is None or v == "":
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    s = re.sub(r"\s+", " ", str(v)).strip()
+    if not s or s == "-" or norm_key(s) in ("baslandi", "baslanmadi", "planning", "beklemede"):
+        return None
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d", "%d.%m.%y", "%d %B %Y", "%d %B%Y", "%d %b %Y"):
+        try:
+            return datetime.strptime(s[:10] if fmt.startswith("%Y-") else s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+# FAZ 8.3: İntrakütanöz/İrritasyon kuralları Akut'tan ÖNCE gelmeli (çünkü "intrakutanoz" içinde "akut" alt dizisi vardır)
+_TEMPLATE_PATTERNS = (
+    (r"(6\s*ay|26\s*hafta|26\s*week|6\s*month|180\s*gun).*implant|implant.*(6\s*ay|26\s*hafta|26\s*week|6\s*month|180\s*gun)", "ISO_10993_6_IMP_26W"),
+    (r"(3\s*ay|13\s*hafta|13\s*week|3\s*month|90\s*gun).*implant|implant.*(3\s*ay|13\s*hafta|13\s*week|3\s*month|90\s*gun)", "ISO_10993_6_IMP_13W"),
+    (r"implant", "ISO_10993_6_IMP"),
+    (r"pirojen|pyrogen|usp\s*151", "ISO_10993_11_PYRO"),
+    (r"hemol", "ISO_10993_4_HEMO"),
+    (r"subkronik|subchronic|(90\s*gun|13\s*hafta).*(toks|sistemik)|(toks|sistemik).*(90\s*gun|13\s*hafta)", "ISO_10993_11_SUBCHRONIC"),
+    (r"subakut|subacute|(14\s*gun|28\s*gun).*(toks|sistemik)|(toks|sistemik).*(14\s*gun|28\s*gun)", "ISO_10993_11_SUBACUTE"),
+    (r"intrakut|intracut|intradermal|irritasyon|irritation|reaktivite|reactivity|oral\s*mukoza|okuler|ocular", "ISO_10993_23_IC"),
+    (r"sitotoks|cytotox|in\s*vitro", "ISO_10993_5_CYTO"),
+    (r"sensiti|hassas|gpmt|maximi", "ISO_10993_10_SENS"),
+    (r"sistemik|systemic|\b(akut|acute)\b|vivoacute", "ISO_10993_11_ACUTE"),
+    (r"fiziksel|kimyasal|monogram|monograf|kalinti|tayin", "PHYS_CHEM_MONO"),
+)
+
+
+def infer_template_code(text: Optional[str]) -> Optional[str]:
+    t = norm_key(text)
+    for pattern, code in _TEMPLATE_PATTERNS:
+        if re.search(pattern, t):
+            return code
+    return None
+
+
+def find_study(db: Session, code: str) -> Optional[Study]:
+    return db.query(Study).filter(Study.study_code == code).first()
+
+
+def match_study_director(db: Session, name: Optional[str], include_inactive: bool = False) -> Optional[User]:
+    q = db.query(User).filter(User.role == UserRole.STUDY_DIRECTOR)
+    if not include_inactive:
+        q = q.filter(User.is_active == True)  # noqa: E712
+    sds = q.order_by(User.id).all()
+    if name:
+        key = norm_key(name)
+        for u in sds:
+            if norm_key(u.full_name) == key:
+                return u
+        for u in sds:
+            uk = norm_key(u.full_name)
+            if key and (key in uk or uk in key):
+                return u
+        if "burcu" in key:
+            for u in sds:
+                if "burcu" in norm_key(u.full_name):
+                    return u
+    return None
+
+
+def _wf(sample: SampleRecord) -> Dict[str, Any]:
+    return dict(sample.workflow or {})
+
+
+def _study_has_steps(db: Session, study: Optional[Study]) -> bool:
+    if study is None:
+        return False
+    return (
+        db.query(StudyStep).filter(StudyStep.study_id == study.id, StudyStep.status != StepStatus.CANCELLED).count() > 0
+    )
+
+
+def sync_dates_from_study(db: Session, sample: SampleRecord, study: Optional[Study]) -> None:
+    """Çalışma takvimi oluşmuşsa numune satırındaki başlangıç/bitiş tarihlerini çalışma kaydından eşitler."""
+    if study is not None and _study_has_steps(db, study):
+        if study.acclimatization_start_date:
+            sample.planned_start = study.acclimatization_start_date
+        if study.target_end_date:
+            sample.planned_end = study.target_end_date
+        notice = get_auto_schedule_notice(study)
+        sample.auto_schedule_notice = notice.get("text") if notice else None
+
+
+# ---------------------------------------------------------------------------
+# DURUM, İŞ AKIŞI VE GECİKME HESABI
+# ---------------------------------------------------------------------------
+def _approvals_done(state: Dict[str, Any]) -> bool:
+    ap = state.get("approvals") or {}
+    return all(k in ap for k in APPROVAL_ROLES)
+
+
+def build_stepper(
+    sample: SampleRecord, study: Optional[Study], has_schedule: bool, perms: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    today = date.today()
+    wf = _wf(sample)
+    start, end = sample.planned_start, sample.planned_end
+    out: List[Dict[str, Any]] = []
+    for sd in WORKFLOW_STEPS:
+        no, st = sd["no"], wf.get(str(sd["no"]), {})
+        done, done_at, done_by, due = False, st.get("done_at"), st.get("done_by"), None
+        marker = st.get("marker")
+        abroad = bool(st.get("abroad") or marker == "yurt dışı")
+        extra: Dict[str, Any] = {}
+        if marker:
+            extra["marker"] = marker
+        if abroad:
+            extra["abroad"] = True
+        if no == 4:
+            if sample.lab_arrival_date:
+                done, done_at, done_by = True, sample.lab_arrival_date.isoformat(), "TRM Kabul"
+                due = sample.lab_arrival_date
+            else:
+                done = bool(st.get("done") or marker == "+")
+                due = sample.expected_arrival_date
+        elif no == 5:
+            done = bool(has_schedule or st.get("done") or marker == "+")
+            due = start
+            done_by = done_by or ("Sistem (otomatik takvim)" if has_schedule else None)
+        elif no == 6 or no == 11:
+            ap = st.get("approvals") or {}
+            done = bool(_approvals_done(st) or st.get("done") or marker == "+")
+            extra["approvals"] = [
+                {
+                    "key": k,
+                    "label": v["label"],
+                    "full": v["full"],
+                    "signed": k in ap or (done and not ap),
+                    "by": (ap.get(k) or {}).get("by") or (v["label"] if (done and not ap) else None),
+                    "at": (ap.get(k) or {}).get("at") or (done_at if (done and not ap) else None),
+                    "can_sign": k in perms["approval_roles"],
+                }
+                for k, v in APPROVAL_ROLES.items()
+            ]
+            if no == 11 and end:
+                due = sample.final_report_date or (end + timedelta(days=7))
+            if no == 6:
+                due = start
+        elif no == 7:
+            due = start
+            if marker == "+":
+                done = True
+            elif marker == "-" and (sample.stored_status or "").upper() in ("EXPECTED", "PLANNED"):
+                done = False
+            else:
+                done = bool((start and start <= today and (sample.stored_status or "").upper() not in ("EXPECTED", "PLANNED")) or st.get("done"))
+            done_at = done_at or (start.isoformat() if done and start else None)
+        elif no == 8:
+            due = end
+            if marker == "+":
+                done = True
+            elif marker == "-" and (sample.stored_status or "").upper() in ("EXPECTED", "PLANNED"):
+                done = False
+            else:
+                done = bool((end and end <= today and (sample.stored_status or "").upper() not in ("EXPECTED", "PLANNED")) or st.get("done"))
+            done_at = done_at or (end.isoformat() if done and end else None)
+        elif no == 9:
+            due = sample.draft_report_date or ((end + timedelta(days=3)) if end else None)
+            done = bool(st.get("done") or marker == "+")
+        else:
+            done = bool(st.get("done") or marker == "+")
+        out.append(
+            {
+                "no": no,
+                "title": sd["title"],
+                "owner": sd["owner"],
+                "kind": sd["kind"],
+                "done": done,
+                "done_at": done_at,
+                "done_by": done_by,
+                "due_date": due.isoformat() if due else None,
+                "overdue": bool((not done) and (not abroad) and due and due < today and no in (9, 11)),
+                "can_edit": no in perms["workflow_steps"] and sd["kind"] in ("manual", "auto_or_manual")
+                and not (no == 4 and bool(sample.lab_arrival_date)),
+                **extra,
+            }
+        )
+    current_set = False
+    for s in out:
+        if s.get("abroad"):
+            s["state"] = "abroad"
+        elif s["done"]:
+            s["state"] = "done"
+        elif not current_set:
+            s["state"] = "current"
+            current_set = True
+        else:
+            s["state"] = "pending"
+    return out
+
+
+def effective_status(sample: SampleRecord, stepper: List[Dict[str, Any]]) -> str:
+    today = date.today()
+    stored = (sample.stored_status or "").upper()
+    if stored == "CANCELLED":
+        return "CANCELLED"
+    final_done = next((s["done"] for s in stepper if s["no"] == 11), False)
+    if final_done or stored == "COMPLETED":
+        return "COMPLETED"
+    # FAZ 8.3: Excel'den gelen resmi durum (raw_status_text) mevcutsa EXPECTED / PLANNED / ONGOING ayrımını koru
+    if sample.raw_status_text:
+        if stored in ("EXPECTED", "PLANNED", "ONGOING", "COMPLETED"):
+            return stored
+    if stored == "EXPECTED" and not sample.lab_arrival_date and not (sample.sample_status or "").lower().startswith("kabul"):
+        return "EXPECTED"
+    if stored == "ONGOING" or (sample.planned_start and sample.planned_start <= today):
+        return "ONGOING"
+    if sample.planned_start or stored == "PLANNED" or sample.lab_arrival_date or (sample.sample_status or "").lower().startswith("kabul"):
+        return "PLANNED"
+    return "EXPECTED"
+
+
+def overdue_reasons(sample: SampleRecord, status: str, stepper: List[Dict[str, Any]]) -> List[str]:
+    today = date.today()
+    reasons: List[str] = []
+    if status in ("COMPLETED", "CANCELLED"):
+        return reasons
+    if status == "EXPECTED" and sample.expected_arrival_date and sample.expected_arrival_date < today:
+        reasons.append(f"Beklenen numune geliş tarihi geçti ({sample.expected_arrival_date:%d.%m.%Y})")
+    for s in stepper:
+        if s["no"] == 9 and s["overdue"]:
+            reasons.append(f"Taslak rapor gecikti (son tarih {date.fromisoformat(s['due_date']):%d.%m.%Y})")
+        if s["no"] == 11 and s["overdue"]:
+            reasons.append(f"Final rapor gecikti (son tarih {date.fromisoformat(s['due_date']):%d.%m.%Y})")
+    return reasons
+
+
+def serialize_sample(
+    db: Session,
+    s: SampleRecord,
+    perms: Dict[str, Any],
+    all_samples: Optional[List[SampleRecord]] = None,
+    detailed: bool = True,
+) -> Dict[str, Any]:
+    study = find_study(db, s.study_code)
+    has_schedule = _study_has_steps(db, study)
+    if has_schedule:
+        sync_dates_from_study(db, s, study)
+    stepper = build_stepper(s, study, has_schedule, perms)
+    status = effective_status(s, stepper)
+    reasons = overdue_reasons(s, status, stepper)
+    end = s.planned_end
+    related: List[Dict[str, Any]] = []
+    if s.test_item_code:
+        pool = all_samples if all_samples is not None else db.query(SampleRecord).filter(
+            SampleRecord.test_item_code == s.test_item_code
+        ).all()
+        for o in pool:
+            if o.id != s.id and (o.test_item_code or "").strip().lower() == s.test_item_code.strip().lower():
+                related.append({"id": o.id, "study_code": o.study_code, "requested_analysis": o.requested_analysis})
+    sd_user = match_study_director(db, s.study_director_name, include_inactive=True)
+    draft_dt = s.draft_report_date or ((end + timedelta(days=3)) if end else None)
+    final_dt = s.final_report_date or ((end + timedelta(days=7)) if end else None)
+    data = {
+        "id": s.id,
+        "serial_no": s.serial_no,
+        "glp_type": s.glp_type or "GLP",
+        "test_laboratory": s.test_laboratory,
+        "study_code": s.study_code,
+        "template_code": s.template_code,
+        "requested_analysis": s.requested_analysis,
+        "test_item_name": s.test_item_name,
+        "billing_company": s.billing_company,
+        "sponsor_name": s.sponsor_name,
+        "contacts": s.contacts or [],
+        "quote_no": s.quote_no,
+        "sales_manager": s.sales_manager,
+        "study_agreement_date": s.study_agreement_date.isoformat() if s.study_agreement_date else None,
+        "expected_arrival_date": s.expected_arrival_date.isoformat() if s.expected_arrival_date else None,
+        "sample_status": s.sample_status,
+        "test_item_code": s.test_item_code,
+        "istanbul_arrival_date": s.istanbul_arrival_date.isoformat() if s.istanbul_arrival_date else None,
+        "lab_arrival_date": s.lab_arrival_date.isoformat() if s.lab_arrival_date else None,
+        "received_quantity": s.received_quantity,
+        "animal_consumable_status": s.animal_consumable_status,
+        "animal_procurement_date": s.animal_procurement_date.isoformat() if s.animal_procurement_date else None,
+        "lot_no": s.lot_no,
+        "expiry_date": s.expiry_date,
+        "storage_condition": s.storage_condition,
+        "sample_note": s.sample_note,
+        "manufacture_date": s.manufacture_date,
+        "extraction_polar_solvent": s.extraction_polar_solvent,
+        "extraction_non_polar_solvent": s.extraction_non_polar_solvent,
+        "extraction_polar": s.extraction_polar,
+        "extraction_non_polar": s.extraction_non_polar,
+        "document_autofill": s.document_autofill,
+        "study_director_name": s.study_director_name,
+        "study_director_id": sd_user.id if sd_user else None,
+        "payment_status": s.payment_status,
+        "raw_status_text": s.raw_status_text,
+        "status": status,
+        "status_label": STATUS_LABELS[status],
+        "scheduled": has_schedule,
+        "study": (
+            {"id": study.id, "status": study.status.value, "has_schedule": has_schedule} if study is not None else None
+        ),
+        "dates": {
+            "start": s.planned_start.isoformat() if s.planned_start else None,
+            "end": end.isoformat() if end else None,
+            "experiment_start": s.experiment_start_date.isoformat() if s.experiment_start_date else None,
+            "experiment_end": s.experiment_end_date.isoformat() if s.experiment_end_date else None,
+            "draft_report": draft_dt.isoformat() if draft_dt else None,
+            "final_report": final_dt.isoformat() if final_dt else None,
+        },
+        "auto_schedule_notice": s.auto_schedule_notice,
+        "overdue_reasons": reasons,
+        "is_overdue": bool(reasons),
+        "related": related,
+        "progress": sum(1 for st in stepper if st["done"]),
+        "abroad_steps": sum(1 for st in stepper if st.get("abroad")),
+    }
+    if detailed:
+        data["workflow"] = stepper
+    else:
+        data["workflow_progress"] = {
+            "done": data["progress"],
+            "total": len(stepper),
+            "abroad": data["abroad_steps"],
+        }
+    return data
+
+
+def build_summary(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    open_items = [i for i in items if i["status"] not in ("COMPLETED", "CANCELLED")]
+    sd_counts: Dict[str, int] = {}
+    for i in open_items:
+        name = (i.get("study_director_name") or "").strip() or "Atanmamış"
+        sd_counts[name] = sd_counts.get(name, 0) + 1
+    burcu_lbl = "Burcu DİGER KULAKSIZ" if "Burcu DİGER KULAKSIZ" in sd_counts and "Burcu DİGER KULAK" not in sd_counts else "Burcu DİGER KULAK"
+    preferred = ["Ezgi Nur AKIN", "Ayşe Özgür", burcu_lbl, "Atanmamış"]
+    ordered = [{"name": n, "open_count": sd_counts.get(n, 0)} for n in preferred]
+    ordered += [{"name": n, "open_count": c} for n, c in sd_counts.items() if n not in preferred]
+    return {
+        "expected": sum(1 for i in items if i["status"] == "EXPECTED"),
+        "planned": sum(1 for i in items if i["status"] == "PLANNED"),
+        "planned_unscheduled": sum(1 for i in items if i["status"] == "PLANNED" and not i["scheduled"]),
+        "ongoing": sum(1 for i in items if i["status"] == "ONGOING"),
+        "completed": sum(1 for i in items if i["status"] == "COMPLETED"),
+        "cancelled": sum(1 for i in items if i["status"] == "CANCELLED"),
+        "overdue": sum(1 for i in items if i["is_overdue"]),
+        "glp_count": sum(1 for i in items if (i.get("glp_type") or "GLP") == "GLP"),
+        "non_glp_count": sum(1 for i in items if (i.get("glp_type") or "GLP") == "NON-GLP"),
+        "total": len(items),
+        "by_study_director": ordered,
+    }
+
+
+# ---------------------------------------------------------------------------
+# ALAN GÜNCELLEME (ROL BAZLI)
+# ---------------------------------------------------------------------------
+def apply_field_updates(sample: SampleRecord, payload: Dict[str, Any], fields: Tuple[str, ...]) -> List[str]:
+    changed: List[str] = []
+    for f in fields:
+        if f not in payload:
+            continue
+        val = payload[f]
+        if f in DATE_FIELDS:
+            val = parse_date_any(val)
+        elif f == "contacts":
+            val = [
+                {"name": str(c.get("name") or "").strip(), "email": str(c.get("email") or "").strip()}
+                for c in (val or []) if isinstance(c, dict) and (c.get("name") or c.get("email"))
+            ]
+        elif f == "template_code":
+            val = resolve_template_code(val) if val else None
+        elif isinstance(val, str):
+            val = val.strip() or None
+        if getattr(sample, f) != val:
+            setattr(sample, f, val)
+            changed.append(f)
+    return changed
+
+
+# ---------------------------------------------------------------------------
+# NUMUNEDEN OTOMATİK TASLAK ÇALIŞMA + TAKVİM
+# ---------------------------------------------------------------------------
+def default_start_for_sample(sample: SampleRecord) -> date:
+    today = date.today()
+    arrival = sample.lab_arrival_date or sample.expected_arrival_date or today
+    return next_business_day(max(today + timedelta(days=1), arrival))
+
+
+def plan_sample(
+    db: Session,
+    sample: SampleRecord,
+    user: User,
+    start_date: Optional[date] = None,
+    preserve_status: bool = False,
+    allow_non_draft: bool = False,
+) -> Dict[str, Any]:
+    from app.services.scheduling_engine import schedule_new_study  # döngüsel içe aktarmayı önlemek için yerel
+
+    tpl_code = resolve_template_code(sample.template_code) or infer_template_code(sample.requested_analysis) or DEFAULT_TEMPLATE_CODE
+    if tpl_code not in TEMPLATES:
+        tpl_code = DEFAULT_TEMPLATE_CODE
+    tpl = get_template(tpl_code, db=db)
+
+    study = find_study(db, sample.study_code)
+    if study is not None and study.status != StudyStatus.DRAFT and not allow_non_draft:
+        raise PermissionError(
+            f"'{sample.study_code}' çalışması {study.status.value} durumundadır; onaylı çalışmaların takvimi "
+            f"otomatik değiştirilmez. Takvimi Planlama ekranından görüntüleyebilirsiniz."
+        )
+
+    sd = match_study_director(db, sample.study_director_name)
+    if sd is None:
+        sd = (
+            db.query(User).filter(User.role == UserRole.STUDY_DIRECTOR, User.is_active == True)  # noqa: E712
+            .order_by(User.id).first()
+        )
+    if study is None and sd is None:
+        raise ValueError("Sistemde aktif bir Çalışma Yöneticisi (STUDY_DIRECTOR) yok; önce kullanıcı tanımlayın.")
+
+    contact_txt = "; ".join(
+        f"{c.get('name', '')} <{c.get('email', '')}>".replace(" <>", "") for c in (sample.contacts or [])
+    ) or None
+    item_name = sample.test_item_name or "BELİRTİLMEDİ — SD tarafından girilecek"
+    fields = dict(
+        template_code=tpl.code,
+        title=f"{tpl.standard} {tpl.title} — {item_name} ({sample.study_code})",
+        test_type=sample.requested_analysis or tpl.title,
+        guideline=tpl.standard,
+        sponsor_name=sample.sponsor_name or sample.billing_company,
+        sponsor_contact=contact_txt,
+        test_item_name=item_name,
+        test_item_batch=sample.lot_no,
+        expiry_date=sample.expiry_date,
+        manufacture_date=sample.manufacture_date,
+        test_item_storage_condition=sample.storage_condition,
+        extraction_polar=sample.extraction_polar,
+        extraction_polar_solvent=sample.extraction_polar_solvent,
+        extraction_non_polar=sample.extraction_non_polar,
+        extraction_non_polar_solvent=sample.extraction_non_polar_solvent,
+    )
+    orig_study_status = study.status if study is not None else StudyStatus.DRAFT
+    if study is None:
+        study = Study(study_code=sample.study_code, study_director_id=sd.id, status=StudyStatus.DRAFT, **fields)
+        db.add(study)
+        db.flush()
+        db.add(
+            AuditLog(
+                user_id=user.id, entity_name="Study", entity_id=study.id, action="CREATE",
+                reason=f"{user.username}: Numune & Çalışma Takip ekranından '{sample.study_code}' DRAFT çalışması oluşturuldu.",
+            )
+        )
+    else:
+        for k, v in fields.items():
+            if v not in (None, ""):
+                setattr(study, k, v)
+        if sd is not None and sample.study_director_name:
+            study.study_director_id = sd.id
+        if allow_non_draft and study.status != StudyStatus.DRAFT:
+            study.status = StudyStatus.DRAFT
+    db.commit()
+
+    g0 = start_date or sample.planned_start or default_start_for_sample(sample)
+    result = schedule_new_study(db, study.id, g0, template_code=tpl.code)
+
+    db.refresh(study)
+    if allow_non_draft and orig_study_status != StudyStatus.DRAFT:
+        study.status = orig_study_status
+    sample.template_code = tpl.code
+    sample.planned_start = study.acclimatization_start_date
+    sample.planned_end = study.target_end_date
+    if not sample.draft_report_date and sample.planned_end:
+        sample.draft_report_date = sample.planned_end + timedelta(days=3)
+    if not sample.final_report_date and sample.planned_end:
+        sample.final_report_date = sample.planned_end + timedelta(days=7)
+    if not sample.study_director_name and study.study_director:
+        sample.study_director_name = study.study_director.full_name
+    if not preserve_status and not sample.raw_status_text and (sample.stored_status or "").upper() in ("", "EXPECTED"):
+        sample.stored_status = "PLANNED"
+    notice = result.get("auto_schedule_notice") or {}
+    sample.auto_schedule_notice = notice.get("text") if notice else None
+    db.add(
+        AuditLog(
+            user_id=user.id, entity_name="SampleRecord", entity_id=sample.id, action="SAMPLE_AUTO_SCHEDULE",
+            new_values={
+                "study_code": sample.study_code, "template": tpl.code,
+                "day0": sample.planned_start.isoformat() if sample.planned_start else None,
+                "end": sample.planned_end.isoformat() if sample.planned_end else None,
+                "auto_shifted": bool(notice),
+            },
+            reason=f"{user.username}: '{sample.study_code}' numunesi için otomatik taslak takvim oluşturuldu.",
+        )
+    )
+    db.commit()
+    return {
+        "study_id": study.id,
+        "study_code": study.study_code,
+        "start": sample.planned_start.isoformat() if sample.planned_start else None,
+        "end": sample.planned_end.isoformat() if sample.planned_end else None,
+        "status": result.get("status"),
+        "total_conflicts": result.get("total_conflicts"),
+        "critical_conflicts": result.get("critical_conflicts"),
+        "warning_conflicts": result.get("warning_conflicts"),
+        "auto_schedule_notice": result.get("auto_schedule_notice"),
+        "capacity_info": result.get("capacity_info"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# EXCEL / CSV İÇE AKTARMA
+# ---------------------------------------------------------------------------
+_COLUMN_SYNONYMS: Dict[str, Tuple[str, ...]] = {
+    "study_code": ("glp no", "glp", "glp kodu", "calisma kodu", "calisma no", "study code", "study no", "study", "glp calisma no"),
+    "requested_analysis": ("talep edilen analiz", "analiz", "test", "test adi", "talep edilen test", "analiz adi"),
+    "test_item_name": ("test maddesinin adi", "test maddesi", "test maddesi adi", "numune adi", "urun adi", "urun", "test item"),
+    "billing_company": ("fatura edilecek firma", "fatura firma", "fatura edilecek firma unvani", "fatura unvani"),
+    "sponsor_name": ("sponsor", "firma", "musteri", "sponsor firma", "firma unvani"),
+    "contacts": ("ilgili kisiler", "ilgili kisi", "iletisim", "e posta", "email", "eposta", "mail", "yetkili"),
+    "quote_no": ("teklif no", "teklif numarasi", "teklif", "quote no"),
+    "sales_manager": ("satis yoneticisi", "satis temsilcisi", "satis sorumlusu", "satis"),
+    "expected_arrival_date": ("beklenen gelis tarihi", "beklenen tarih", "beklenen numune gelis tarihi", "tahmini gelis"),
+    "sample_status": ("numune durumu", "durum", "kabul durumu"),
+    "test_item_code": ("test madde kodu", "test maddesi kodu", "ti no", "ti kodu", "ti", "trm kodu", "test item code"),
+    "istanbul_arrival_date": ("istanbula gelis tarihi", "istanbul gelis tarihi", "istanbul gelis"),
+    "lab_arrival_date": ("laboratuvara gelis tarihi", "laboratuvar gelis tarihi", "lab gelis tarihi", "lab gelis", "edirne gelis tarihi"),
+    "received_quantity": ("teslim alinan miktar", "miktar", "adet", "teslim miktari"),
+    "lot_no": ("lot", "lot no", "seri no", "lot seri no", "lot numarasi", "batch"),
+    "expiry_date": ("skt", "son kullanma tarihi", "son kullanim tarihi", "expiry"),
+    "storage_condition": ("saklama kosulu", "saklama kosullari", "saklama"),
+    "sample_note": ("numune notu", "not", "notlar", "aciklama"),
+    "study_director_name": ("calisma yoneticisi", "calisma direktoru", "cy", "sd", "study director"),
+}
+_HEADER_LOOKUP = {norm_key(s): field for field, syns in _COLUMN_SYNONYMS.items() for s in syns}
+_HEADER_LOOKUP.update({norm_key(f): f for f in _COLUMN_SYNONYMS})
+
+
+def _parse_contacts(raw: Any) -> List[Dict[str, str]]:
+    if raw is None or str(raw).strip() == "":
+        return []
+    contacts: List[Dict[str, str]] = []
+    for part in re.split(r"[;\n]+", str(raw)):
+        part = part.strip()
+        if not part:
+            continue
+        m = re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", part)
+        email = m.group(0) if m else ""
+        name = re.sub(r"[<>(),]", " ", part.replace(email, "")).strip() if email else part
+        contacts.append({"name": name, "email": email})
+    return contacts
+
+
+def read_tabular_file(filename: str, content: bytes) -> List[Dict[str, Any]]:
+    """`.xlsx` (openpyxl) veya `.csv` dosyasından başlık satırını otomatik bulup sözlük listesi döner."""
+    ext = (filename or "").lower().rsplit(".", 1)[-1]
+    rows: List[List[Any]] = []
+    if ext in ("xlsx", "xlsm"):
+        from openpyxl import load_workbook
+
+        wb = load_workbook(io.BytesIO(content), data_only=True, read_only=True)
+        ws = wb.worksheets[0]
+        rows = [list(r) for r in ws.iter_rows(values_only=True)]
+        wb.close()
+    elif ext in ("csv", "txt"):
+        text = None
+        for enc in ("utf-8-sig", "cp1254", "latin-1"):
+            try:
+                text = content.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        text = text or ""
+        try:
+            dialect = csv.Sniffer().sniff(text[:4096], delimiters=",;\t")
+        except csv.Error:
+            class _Fallback(csv.excel):
+                delimiter = ";" if text.count(";") > text.count(",") else ","
+
+            dialect = _Fallback
+        rows = [list(r) for r in csv.reader(io.StringIO(text), dialect)]
+    else:
+        raise ValueError("Yalnızca .xlsx veya .csv dosyaları içe aktarılabilir.")
+
+    header_idx, header_map = None, {}
+    for idx, row in enumerate(rows[:15]):
+        mapping = {}
+        for ci, cell in enumerate(row):
+            field = _HEADER_LOOKUP.get(norm_key(cell))
+            if field and field not in mapping.values():
+                mapping[ci] = field
+        if len(mapping) >= 2 and "study_code" in mapping.values():
+            header_idx, header_map = idx, mapping
+            break
+    if header_idx is None:
+        raise ValueError(
+            "Başlık satırı tanınamadı. En az 'GLP No / Çalışma Kodu' sütunu ve bir veri sütunu içeren başlık satırı gerekir."
+        )
+    out = []
+    for row in rows[header_idx + 1:]:
+        rec = {field: (row[ci] if ci < len(row) else None) for ci, field in header_map.items()}
+        if any(v not in (None, "") for v in rec.values()):
+            out.append(rec)
+    return out
+
+
+def import_rows(db: Session, records: List[Dict[str, Any]], user: User) -> Dict[str, Any]:
+    created = updated = skipped = 0
+    errors: List[str] = []
+    for n, rec in enumerate(records, start=1):
+        code = str(rec.get("study_code") or "").strip().upper().replace(" ", "")
+        if not code:
+            skipped += 1
+            errors.append(f"Satır {n}: çalışma kodu (GLP No) boş — atlandı.")
+            continue
+        sample = db.query(SampleRecord).filter(SampleRecord.study_code == code).first()
+        is_new = sample is None
+        if is_new:
+            sample = SampleRecord(study_code=code, workflow={})
+            db.add(sample)
+        payload: Dict[str, Any] = {}
+        for k, v in rec.items():
+            if k == "study_code" or v is None or (isinstance(v, str) and not v.strip()):
+                continue
+            if k == "contacts":
+                payload[k] = _parse_contacts(v)
+            elif k in DATE_FIELDS:
+                pd = parse_date_any(v)
+                if pd is None:
+                    errors.append(f"Satır {n} ({code}): '{k}' tarihi anlaşılamadı: {v!r}")
+                    continue
+                payload[k] = pd
+            else:
+                payload[k] = str(v).strip() if not isinstance(v, (int, float)) else str(v)
+        if is_new or "template_code" not in payload:
+            inferred = infer_template_code(payload.get("requested_analysis") or sample.requested_analysis)
+            if inferred and not sample.template_code:
+                payload["template_code"] = inferred
+        apply_field_updates(sample, payload, SALES_FIELDS + TRM_FIELDS + PLANNING_FIELDS)
+        if is_new:
+            sample.stored_status = "PLANNED" if sample.lab_arrival_date else "EXPECTED"
+            created += 1
+        else:
+            updated += 1
+    db.add(
+        AuditLog(
+            user_id=user.id, entity_name="SampleRecord", entity_id=0, action="SAMPLE_EXCEL_IMPORT",
+            new_values={"created": created, "updated": updated, "skipped": skipped},
+            reason=f"{user.username}: Excel/CSV içe aktarma — {created} yeni, {updated} güncellenen, {skipped} atlanan kayıt.",
+        )
+    )
+    db.commit()
+    return {"created": created, "updated": updated, "skipped": skipped, "errors": errors[:50], "total_rows": len(records)}
+
+
+# ---------------------------------------------------------------------------
+# ÖRNEK VERİ TOHUMLAMA (yalnızca eksik kayıtlar eklenir; mevcutlara dokunulmaz)
+# ---------------------------------------------------------------------------
+SEED_USERS = (
+    ("ayse.ozgur", "Ayşe Özgür", "STUDY_DIRECTOR"),
+    ("burcu.diger", "Burcu DİGER KULAK", "STUDY_DIRECTOR"),
+    ("ilknur.toklu", "İlknur Toklu", "SALES"),
+    ("trm_kabul", "TRM Kabul", "TRM_KABUL"),
+)
+
+_MERKEN_COMMON = dict(
+    test_item_name="MERKEN PLLA+HA",
+    sponsor_name="MERKEN",
+    billing_company="MERKEN",
+    sales_manager="İlknur Toklu",
+    test_item_code="TI-2026-0016",
+    sample_status="Kabul edildi",
+    istanbul_arrival_date=date(2026, 10, 26),
+    lab_arrival_date=date(2026, 10, 28),
+    received_quantity="30 adet / 30 pieces",
+    stored_status="PLANNED",
+)
+
+SEED_SAMPLES: Tuple[Dict[str, Any], ...] = (
+    dict(
+        study_code="GLP2026-072", template_code="ISO_10993_6_IMP", requested_analysis="İmplantasyon Testi (Deri Altı) — ISO 10993-6",
+        study_director_name="Ezgi Nur AKIN", workflow={"1": {"done": True, "done_by": "İlknur Toklu", "done_at": "2026-10-20"}},
+        **_MERKEN_COMMON,
+    ),
+    dict(
+        study_code="GLP2026-076", template_code="ISO_10993_5_CYTO", requested_analysis="In Vitro Sitotoksisite — ISO 10993-5",
+        study_director_name="Ayşe Özgür", workflow={"1": {"done": True, "done_by": "İlknur Toklu", "done_at": "2026-10-20"}},
+        **_MERKEN_COMMON,
+    ),
+    dict(
+        study_code="GLP2026-073", template_code="ISO_10993_10_SENS", requested_analysis="Sensitizasyon Testi — ISO 10993-10",
+        study_director_name="Burcu DİGER KULAK", workflow={"1": {"done": True, "done_by": "İlknur Toklu", "done_at": "2026-10-20"}},
+        **_MERKEN_COMMON,
+    ),
+    dict(
+        study_code="GLP2026-031", template_code="ISO_10993_10_SENS", requested_analysis="Sensitizasyon Testi — ISO 10993-10",
+        test_item_name="Merken Aqua HA 90mg/3mL", sponsor_name="MERKEN", billing_company="MERKEN", sales_manager="İlknur Toklu",
+        test_item_code="TI-2026-0009", sample_status="Kabul edildi", istanbul_arrival_date=date(2026, 10, 14),
+        lab_arrival_date=date(2026, 10, 16), received_quantity="20 adet / 20 pieces", stored_status="ONGOING",
+        planned_start=date(2026, 10, 26), planned_end=date(2026, 11, 4), study_director_name="Ezgi Nur AKIN",
+        workflow={
+            "1": {"done": True, "done_by": "İlknur Toklu", "done_at": "2026-10-05"},
+            "2": {"done": True, "done_by": "Ezgi Nur AKIN", "done_at": "2026-10-12"},
+            "3": {"done": True, "done_by": "Ezgi Nur AKIN", "done_at": "2026-10-19"},
+            "6": {"approvals": {
+                "CY": {"by": "Ezgi Nur AKIN", "at": "2026-10-22T10:00:00"},
+                "KG": {"by": "Kalite Güvence Birimi", "at": "2026-10-22T14:00:00"},
+                "TBY": {"by": "Emine ARMUTOĞLU", "at": "2026-10-23T09:30:00"},
+            }},
+        },
+    ),
+    dict(
+        study_code="GLP2026-026", template_code="ISO_10993_23_IC", requested_analysis="İntrakütanöz Reaktivite Testi — ISO 10993-23",
+        test_item_name="Hyaluronik Asit HA 30 mg/ml", sponsor_name="ELISA TIBBI GEREÇLER SAN A.Ş.",
+        billing_company="ELISA TIBBI GEREÇLER SAN A.Ş.", sales_manager="İlknur Toklu", sample_status="Kabul edildi",
+        lab_arrival_date=date(2026, 7, 24), stored_status="ONGOING", planned_start=date(2026, 7, 30), planned_end=date(2026, 8, 12),
+        study_director_name="Ezgi Nur AKIN",
+        workflow={
+            "1": {"done": True, "done_by": "İlknur Toklu", "done_at": "2026-07-10"},
+            "2": {"done": True, "done_by": "Ezgi Nur AKIN", "done_at": "2026-07-15"},
+            "3": {"done": True, "done_by": "Ezgi Nur AKIN", "done_at": "2026-07-22"},
+            "6": {"approvals": {
+                "CY": {"by": "Ezgi Nur AKIN", "at": "2026-07-27T10:00:00"},
+                "KG": {"by": "Kalite Güvence Birimi", "at": "2026-07-27T15:00:00"},
+                "TBY": {"by": "Emine ARMUTOĞLU", "at": "2026-07-28T09:00:00"},
+            }},
+            "9": {"done": True, "done_by": "Ezgi Nur AKIN", "done_at": "2026-08-15"},
+        },
+    ),
+    dict(
+        study_code="GLP2026-078", template_code="ISO_10993_11_ACUTE", requested_analysis="Akut Sistemik Toksisite — ISO 10993-11",
+        test_item_name="(Numune bekleniyor)", sales_manager="İlknur Toklu", sample_status="Bekleniyor",
+        expected_arrival_date=date(2026, 11, 9), stored_status="EXPECTED", study_director_name=None, workflow={},
+    ),
+)
+
+
+def seed_sample_tracking(db: Session) -> Dict[str, int]:
+    """Numune takip örnek kullanıcılarını ve kayıtlarını (yoksa) ekler. Mevcut kayıtlara dokunmaz."""
+    from app.models.role_permission import ensure_default_role_permissions
+    from app.seed import DEFAULT_PASSWORD  # noqa: F401
+    from app.utils.security import get_password_hash
+
+    ensure_default_role_permissions(db)
+    new_users = new_samples = 0
+    hashed = None
+    for username, full_name, role in SEED_USERS:
+        if db.query(User).filter(User.username == username).first():
+            continue
+        hashed = hashed or get_password_hash("NanoLab2026!")
+        db.add(
+            User(
+                username=username, full_name=full_name, role=role, is_active=True,
+                max_daily_hours=9, qualifications=[], hashed_password=hashed,
+            )
+        )
+        new_users += 1
+    for rec in SEED_SAMPLES:
+        if db.query(SampleRecord).filter(SampleRecord.study_code == rec["study_code"]).first():
+            continue
+        db.add(SampleRecord(contacts=[], **copy.deepcopy(rec)))
+        new_samples += 1
+    db.commit()
+    return {"users": new_users, "samples": new_samples}
+
+
+# ---------------------------------------------------------------------------
+# FAZ 8.3 — STUDY STATUS LAST VERSION (2).XLSX TAM İÇE AKTARIM, PERSONEL & İŞ AKIŞI EŞLEŞTİRME
+# ---------------------------------------------------------------------------
+EXCEL_PERSONNEL_ACCOUNTS: Tuple[Tuple[str, str, str, bool], ...] = (
+    # Study Directors (SD)
+    ("ezgi.nur", "Ezgi Nur AKIN", "STUDY_DIRECTOR", True),
+    ("ayse.ozgur", "Ayşe Özgür", "STUDY_DIRECTOR", True),
+    ("burcu.diger", "Burcu DİGER KULAKSIZ", "STUDY_DIRECTOR", True),
+    ("ceyla.abay", "Ceyla Abay", "STUDY_DIRECTOR", True),
+    # Yiğit Babaoğlu işten ayrıldı: sadece geçmiş (Biten/Finished) çalışmalarda pasif kayıt olarak korunur;
+    # aktif SYSADMIN "yigit" (Yiğit Kadir) hesabına kesinlikle dokunulmaz!
+    ("yigit.babaoglu", "Yiğit Babaoğlu", "STUDY_DIRECTOR", False),
+    # Üst Yönetim (GM / GMY)
+    ("shivadasan.anoop", "Dr. Shivadasan Anoop", "EXECUTIVE", True),
+    ("ozkan.bey", "Özkan Bey", "EXECUTIVE", True),
+    # Satış Yöneticileri (SALES)
+    ("ilknur.toklu", "İlknur Toklu", "SALES", True),
+    ("aysenur.dural", "Ayşenur Dural", "SALES", True),
+    ("tugrul.tuzlali", "Tuğrul Tuzlalı", "SALES", True),
+    ("nil.discioglu", "Nil Dişçioğlu", "SALES", True),
+    ("alp.soganci", "Alp Soğancı", "SALES", True),
+    # TRM Kabul, QA ve TFM
+    ("trm_kabul", "TRM Kabul", "TRM_KABUL", True),
+    ("trm.acceptance", "TRM Acceptance", "TRM_ACCEPTANCE", True),
+    ("selin.bolcan", "Selin Bolcan", "QA", True),
+    ("emine.armutoglu", "Emine ARMUTOĞLU", "TFM", True),
+)
+
+
+def normalize_sales_manager(raw: Optional[str]) -> Optional[str]:
+    if not raw or not str(raw).strip():
+        return None
+    s = str(raw).strip()
+    k = norm_key(s)
+    if "ilknur" in k:
+        return "İlknur Toklu"
+    if "aysenur" in k or "ayse nur" in k:
+        return "Ayşenur Dural"
+    if "tugrul" in k:
+        return "Tuğrul Tuzlalı"
+    if "nil" in k:
+        return "Nil Dişçioğlu"
+    if "alp" in k:
+        return "Alp Soğancı"
+    return s
+
+
+def normalize_study_director_name(raw: Optional[str]) -> Optional[str]:
+    if not raw or not str(raw).strip():
+        return None
+    s = str(raw).strip()
+    k = norm_key(s)
+    if "ezgi" in k:
+        return "Ezgi Nur AKIN"
+    if "ayse" in k:
+        return "Ayşe Özgür"
+    if "burcu" in k:
+        return "Burcu DİGER KULAKSIZ"
+    if "ceyla" in k:
+        return "Ceyla Abay"
+    if "yigit" in k:
+        return "Yiğit Babaoğlu"
+    return s
+
+
+def ensure_excel_personnel_users(db: Session) -> Dict[str, Any]:
+    """Excel'deki tüm personel için kullanıcı hesaplarını (varsayılan şifre NanoLab2026!) oluşturur/günceller."""
+    from app.models.role_permission import ensure_default_role_permissions
+    from app.utils.security import get_password_hash
+
+    ensure_default_role_permissions(db)
+    hashed = get_password_hash("NanoLab2026!")
+    created: List[str] = []
+    updated: List[str] = []
+    for username, full_name, role, is_active in EXCEL_PERSONNEL_ACCOUNTS:
+        u = db.query(User).filter(User.username == username).first()
+        if u is None:
+            u = User(
+                username=username,
+                full_name=full_name,
+                role=role,
+                is_active=is_active,
+                max_daily_hours=9,
+                qualifications=[],
+                hashed_password=hashed,
+            )
+            db.add(u)
+            created.append(username)
+        else:
+            changed = False
+            if username == "burcu.diger" and u.full_name != "Burcu DİGER KULAKSIZ":
+                u.full_name = "Burcu DİGER KULAKSIZ"
+                changed = True
+            if username == "yigit.babaoglu" and u.is_active != False:  # noqa: E712
+                u.is_active = False
+                changed = True
+            if not u.hashed_password:
+                u.hashed_password = hashed
+                changed = True
+            if changed:
+                updated.append(username)
+    db.commit()
+    return {"created": created, "updated": updated}
+
+
+def is_study_status_workbook(filename: str, content: bytes) -> bool:
+    ext = (filename or "").lower().rsplit(".", 1)[-1]
+    if ext not in ("xlsx", "xlsm"):
+        return False
+    try:
+        from openpyxl import load_workbook
+
+        wb = load_workbook(io.BytesIO(content), data_only=True, read_only=True)
+        names = [norm_key(n) for n in wb.sheetnames]
+        wb.close()
+        return any("glp medikal" in n for n in names)
+    except Exception:
+        return False
+
+
+def _wf_firm_cat(f: Any) -> str:
+    k = norm_key(f)
+    for token, cat in (
+        ("db medikal", "db"),
+        ("disera", "disera"),
+        ("saniter", "saniter"),
+        ("alkan", "alkan"),
+        ("medfors", "medfors"),
+        ("inovabella", "inovabella"),
+        ("elisa", "elisa"),
+        ("toxlab", "toxlab"),
+        ("t lab", "toxlab"),
+        ("plasti", "plastimed"),
+        ("meditera", "meditera"),
+        ("acto", "acto"),
+        ("merken", "merken"),
+        ("turkuaz", "turkuaz"),
+        ("burak", "burak"),
+        ("global", "global"),
+        ("biomeks", "biomeks"),
+        ("inter", "inter"),
+        ("tria", "tria"),
+        ("sonomed", "sonomed"),
+        ("aksu", "aksu"),
+        ("ortosem", "ortosem"),
+    ):
+        if token in k:
+            return cat
+    return k.split()[0] if k else ""
+
+
+def _wf_test_cat(t: Any) -> str:
+    k = norm_key(t)
+    if "implant" in k:
+        return "imp"
+    if "sitotok" in k or "cytotox" in k:
+        return "cyto"
+    if "sensit" in k or "hassas" in k:
+        return "sens"
+    if "irrit" in k or "intrakut" in k or "intracut" in k or "intradermal" in k or "oral" in k or "okuler" in k or "ocular" in k:
+        return "irr"
+    if re.search(r"\b(akut|acute)\b|vivoacute|sistemik|systemic", k):
+        return "acute"
+    if "subakut" in k or "subacute" in k:
+        return "subacute"
+    if "subkronik" in k or "subchronic" in k:
+        return "subchronic"
+    if "pirojen" in k or "pyrogen" in k:
+        return "pyro"
+    if "hemol" in k:
+        return "hemo"
+    return k
+
+
+def _marker_str(val: Any) -> str:
+    s = str(val or "").strip()
+    if not s:
+        return "-"
+    low = norm_key(s)
+    if "yurt" in low:
+        return "yurt dışı"
+    if "+" in s:
+        return "+"
+    return "-"
+
+
+def _build_workflow_from_markers(
+    markers: List[str],
+    sd_name: Optional[str],
+    sales_name: Optional[str],
+    agreement_dt: Optional[date],
+    arrival_dt: Optional[date],
+    start_dt: Optional[date],
+    end_dt: Optional[date],
+    draft_dt: Optional[date],
+    final_dt: Optional[date],
+) -> Dict[str, Any]:
+    wf: Dict[str, Any] = {}
+    sd_lbl = sd_name or "Çalışma Yöneticisi"
+    sales_lbl = sales_name or "Satış"
+    for idx, m in enumerate(markers, start=1):
+        key = str(idx)
+        if m == "yurt dışı":
+            wf[key] = {"done": False, "marker": "yurt dışı", "abroad": True}
+        elif m == "+":
+            done_at = None
+            done_by = sd_lbl
+            if idx == 1:
+                done_by = sales_lbl
+                done_at = agreement_dt.isoformat() if agreement_dt else None
+            elif idx == 4:
+                done_by = "TRM Kabul"
+                done_at = arrival_dt.isoformat() if arrival_dt else None
+            elif idx in (5, 6, 7):
+                done_at = start_dt.isoformat() if start_dt else None
+            elif idx == 8:
+                done_at = end_dt.isoformat() if end_dt else None
+            elif idx == 9:
+                done_at = draft_dt.isoformat() if draft_dt else None
+            elif idx == 10:
+                done_by = sales_lbl
+                done_at = (final_dt or draft_dt or end_dt).isoformat() if (final_dt or draft_dt or end_dt) else None
+            elif idx == 11:
+                done_at = final_dt.isoformat() if final_dt else None
+            entry: Dict[str, Any] = {"done": True, "marker": "+", "done_by": done_by, "done_at": done_at}
+            if idx in (6, 11):
+                stamp = (done_at or date.today().isoformat()) + "T10:00:00"
+                entry["approvals"] = {
+                    "CY": {"by": sd_lbl, "at": stamp},
+                    "KG": {"by": "Selin Bolcan", "at": stamp},
+                    "TBY": {"by": "Emine ARMUTOĞLU", "at": stamp},
+                }
+            wf[key] = entry
+        else:
+            wf[key] = {"done": False, "marker": "-"}
+    return wf
+
+
+def _build_default_workflow_for_status(
+    stored_status: str,
+    sd_name: Optional[str],
+    sales_name: Optional[str],
+    agreement_dt: Optional[date],
+    arrival_dt: Optional[date],
+    start_dt: Optional[date],
+    end_dt: Optional[date],
+    draft_dt: Optional[date],
+    final_dt: Optional[date],
+    payment_status: Optional[str],
+) -> Dict[str, Any]:
+    paid = "yapildi" in norm_key(payment_status) and "yapilmadi" not in norm_key(payment_status)
+    if stored_status == "COMPLETED":
+        markers = ["+"] * 11
+    elif stored_status == "ONGOING":
+        markers = [
+            "+", "+", "+", "+", "+", "+", "+",
+            "+" if end_dt else "-",
+            "+" if draft_dt else "-",
+            "+" if paid else "-",
+            "-",
+        ]
+    elif stored_status == "PLANNED":
+        markers = [
+            "+",
+            "+",
+            "-",
+            "+" if arrival_dt else "-",
+            "-", "-", "-", "-", "-",
+            "+" if paid else "-",
+            "-",
+        ]
+    else:
+        markers = ["+", "-", "-", "-", "-", "-", "-", "-", "-", "+" if paid else "-", "-"]
+    return _build_workflow_from_markers(
+        markers, sd_name, sales_name, agreement_dt, arrival_dt, start_dt, end_dt, draft_dt, final_dt
+    )
+
+
+def _clean_code(raw: Any, sira_no: int) -> str:
+    s = str(raw or "").strip()
+    if norm_key(s) == "yurt disi":
+        return f"GLP2026-YD{sira_no:02d}"
+    return re.sub(r"\s+", "", s).upper()
+
+
+def _clean_ti_code(raw: Any) -> Optional[str]:
+    if raw is None:
+        return None
+    s = re.sub(r"\s+", " ", str(raw)).strip()
+    if not s or norm_key(s) in ("beklemede", "waiting", "pending", "-", "yok"):
+        return None
+    return s
+
+
+def _map_status(raw_status: Optional[str], has_arrival: bool) -> str:
+    k = norm_key(raw_status)
+    if "biten" in k or "finished" in k or "completed" in k:
+        return "COMPLETED"
+    if "devem" in k or "devam" in k or "on going" in k or "ongoing" in k:
+        return "ONGOING"
+    if "planlanan" in k or "planning" in k or "planned" in k:
+        return "PLANNED"
+    if "beklenen" in k or "expected" in k:
+        return "EXPECTED"
+    return "PLANNED" if has_arrival else "EXPECTED"
+
+
+def import_study_status_workbook(
+    db: Session,
+    content: bytes,
+    user: User,
+    auto_schedule: bool = True,
+    prune_non_excel: bool = True,
+) -> Dict[str, Any]:
+    """
+    `Study Status last version (2).xlsx` çok sekmeli çalışma dosyasını (88 GLP + 5 Non-GLP + 47 Numune İş Akışı)
+    tam olarak içe aktarır, personel hesaplarını tamamlar ve bekleyen/planlanan çalışmaları otomatik takvimler.
+    """
+    from openpyxl import load_workbook
+
+    ensure_excel_personnel_users(db)
+    wb = load_workbook(io.BytesIO(content), data_only=True)
+
+    ws_glp = next((wb[n] for n in wb.sheetnames if "glp medikal" in norm_key(n)), None)
+    ws_nglp = next((wb[n] for n in wb.sheetnames if "non glp" in norm_key(n)), None)
+    ws_wf = next((wb[n] for n in wb.sheetnames if "is akisi" in norm_key(n)), None)
+    ws_sp = next((wb[n] for n in wb.sheetnames if "sponsor" in norm_key(n)), None)
+    if ws_glp is None:
+        wb.close()
+        raise ValueError("'GLP Medikal' sekmesi bulunamadı.")
+
+    # 1) Sponsor sözleşme sekmesinden yedek iletişim / sözleşme tarihi sözlüğü
+    sponsor_lookup: Dict[str, Dict[str, Any]] = {}
+    if ws_sp is not None:
+        for r in range(4, ws_sp.max_row + 1):
+            firm = ws_sp.cell(r, 2).value
+            sp_col = ws_sp.cell(r, 3).value
+            if not firm and not sp_col:
+                continue
+            fk = _wf_firm_cat(firm or sp_col)
+            person = ws_sp.cell(r, 5).value
+            mail = ws_sp.cell(r, 6).value
+            ag_date = parse_date_any(ws_sp.cell(r, 12).value)
+            if fk and fk not in sponsor_lookup and (person or mail or ag_date):
+                sponsor_lookup[fk] = {
+                    "person": str(person).strip() if person else "",
+                    "email": str(mail).strip() if mail else "",
+                    "agreement_date": ag_date,
+                }
+
+    # 2) NUMUNE İŞ AKIŞI sekmesi (47 satır: R5..R51)
+    # Sütunlar: Col 1=Firma Adı, Col 2=Numune/Test Adı, Col 3..7=Adım 1..5,
+    # Col 8..10=Adım 6 (ÇY, KG, TBY), Col 11..14=Adım 7..10, Col 15..17=Adım 11 (ÇY, KG, TBY)
+    wf_rows: List[Dict[str, Any]] = []
+    if ws_wf is not None:
+        for r in range(5, ws_wf.max_row + 1):
+            firm = ws_wf.cell(r, 1).value
+            test_name = ws_wf.cell(r, 2).value
+            if not firm and not test_name:
+                continue
+            m1_5 = [_marker_str(ws_wf.cell(r, c).value) for c in range(3, 8)]
+            m6 = _marker_str(ws_wf.cell(r, 8).value or ws_wf.cell(r, 9).value or ws_wf.cell(r, 10).value)
+            m7_10 = [_marker_str(ws_wf.cell(r, c).value) for c in range(11, 15)]
+            m11 = _marker_str(ws_wf.cell(r, 15).value or ws_wf.cell(r, 16).value or ws_wf.cell(r, 17).value)
+            markers = m1_5 + [m6] + m7_10 + [m11]
+            wf_rows.append(
+                {
+                    "row": r,
+                    "firm": str(firm or "").strip(),
+                    "test": str(test_name or "").strip(),
+                    "firm_cat": _wf_firm_cat(firm),
+                    "test_cat": _wf_test_cat(test_name),
+                    "markers": markers,
+                }
+            )
+
+    # 3) GLP Medikal sekmesi (satır 8..95 -> 88 GLP çalışması)
+    glp_parsed: List[Dict[str, Any]] = []
+    for r in range(8, ws_glp.max_row + 1):
+        sira_raw = ws_glp.cell(r, 1).value
+        if sira_raw is None or str(sira_raw).strip() == "":
+            continue
+        try:
+            sira_no = int(float(str(sira_raw).strip()))
+        except ValueError:
+            continue
+        raw_code = ws_glp.cell(r, 8).value
+        study_code = _clean_code(raw_code, sira_no)
+        if not study_code:
+            continue
+        req_analysis = re.sub(r"\s+", " ", str(ws_glp.cell(r, 2).value or "")).strip() or None
+        test_item = re.sub(r"\s+", " ", str(ws_glp.cell(r, 3).value or "")).strip() or None
+        sd_name = normalize_study_director_name(ws_glp.cell(r, 4).value)
+        billing = re.sub(r"\s+", " ", str(ws_glp.cell(r, 5).value or "")).strip() or None
+        raw_sp = re.sub(r"\s+", " ", str(ws_glp.cell(r, 6).value or "")).strip()
+        sponsor = raw_sp if (raw_sp and raw_sp != "-") else billing
+        person_mail_raw = str(ws_glp.cell(r, 7).value or "").strip()
+        sales_mgr = normalize_sales_manager(ws_glp.cell(r, 9).value)
+        quote_no = re.sub(r"\s+", " ", str(ws_glp.cell(r, 10).value or "")).strip() or None
+        if quote_no == "-":
+            quote_no = None
+        ist_date = parse_date_any(ws_glp.cell(r, 11).value)
+        lab_date = parse_date_any(ws_glp.cell(r, 12).value)
+        ti_code = _clean_ti_code(ws_glp.cell(r, 13).value)
+        lab_type = str(ws_glp.cell(r, 14).value or "").strip() or None
+        qty_val = ws_glp.cell(r, 15).value
+        qty_str = str(int(qty_val)) if isinstance(qty_val, float) and qty_val.is_integer() else (str(qty_val).strip() if qty_val is not None else None)
+        if qty_str == "-":
+            qty_str = None
+        anim_status = re.sub(r"\s+", " ", str(ws_glp.cell(r, 16).value or "")).strip() or None
+        if anim_status == "-":
+            anim_status = None
+        anim_date = parse_date_any(ws_glp.cell(r, 17).value)
+        plan_st = parse_date_any(ws_glp.cell(r, 18).value)
+        exp_st = parse_date_any(ws_glp.cell(r, 19).value)
+        exp_end = parse_date_any(ws_glp.cell(r, 20).value)
+        draft_dt = parse_date_any(ws_glp.cell(r, 21).value)
+        pay_status = re.sub(r"\s+", " ", str(ws_glp.cell(r, 22).value or "")).strip() or None
+        if pay_status == "-":
+            pay_status = None
+        final_dt = parse_date_any(ws_glp.cell(r, 23).value)
+        raw_status = re.sub(r"\s+", " ", str(ws_glp.cell(r, 25).value or "")).strip() or None
+        notes_parts = [
+            re.sub(r"\s+", " ", str(ws_glp.cell(r, c).value or "")).strip()
+            for c in (26, 27)
+            if ws_glp.cell(r, c).value and str(ws_glp.cell(r, c).value).strip() != "-"
+        ]
+        note_col = " | ".join(notes_parts) if notes_parts else None
+        if norm_key(raw_code) == "yurt disi":
+            note_col = f"Yurt dışı çalışması ({note_col})" if note_col else "Yurt dışı çalışması (Excel çalışma kodu: yurt dışı)"
+
+        fk = _wf_firm_cat(sponsor or billing)
+        sp_fallback = sponsor_lookup.get(fk, {})
+        ag_date = sp_fallback.get("agreement_date")
+        if (not person_mail_raw or person_mail_raw == "-") and (sp_fallback.get("person") or sp_fallback.get("email")):
+            person_mail_raw = f"{sp_fallback.get('person', '')} / {sp_fallback.get('email', '')}".strip(" /")
+
+        contacts: List[Dict[str, str]] = []
+        if person_mail_raw and person_mail_raw != "-":
+            emails = re.findall(r"[\w.+-]+@[\w-]+\.[\w.-]+", person_mail_raw)
+            name_part = person_mail_raw.split("/")[0].strip() if "/" in person_mail_raw else re.sub(r"[\w.+-]+@[\w-]+\.[\w.-]+", "", person_mail_raw).strip()
+            contacts.append({"name": name_part or (emails[0] if emails else person_mail_raw), "email": ", ".join(emails)})
+
+        stored_status = _map_status(raw_status, bool(lab_date or ist_date))
+        glp_parsed.append(
+            {
+                "serial_no": sira_no,
+                "glp_type": "GLP",
+                "study_code": study_code,
+                "test_laboratory": lab_type,
+                "requested_analysis": req_analysis,
+                "test_item_name": test_item,
+                "study_director_name": sd_name,
+                "billing_company": billing,
+                "sponsor_name": sponsor,
+                "contacts": contacts,
+                "sales_manager": sales_mgr,
+                "quote_no": quote_no,
+                "study_agreement_date": ag_date,
+                "test_item_code": ti_code,
+                "istanbul_arrival_date": ist_date,
+                "lab_arrival_date": lab_date,
+                "received_quantity": qty_str,
+                "animal_consumable_status": anim_status,
+                "animal_procurement_date": anim_date,
+                "planned_start": plan_st or exp_st,
+                "experiment_start_date": exp_st,
+                "experiment_end_date": exp_end,
+                "planned_end": exp_end,
+                "draft_report_date": draft_dt,
+                "payment_status": pay_status,
+                "final_report_date": final_dt,
+                "raw_status_text": raw_status,
+                "sample_note": note_col,
+                "stored_status": stored_status,
+                "sample_status": "Bekleniyor" if stored_status == "EXPECTED" else "Kabul edildi",
+                "template_code": infer_template_code(req_analysis) or DEFAULT_TEMPLATE_CODE,
+            }
+        )
+
+    # 4) NUMUNE İŞ AKIŞI (47 satır) -> Sira 4..50 (47 çalışma) birebir eşleştirme
+    sira_pool = sorted([row for row in glp_parsed if 4 <= row["serial_no"] <= 50], key=lambda x: x["serial_no"])
+    used_codes = set()
+    wf_by_code: Dict[str, List[str]] = {}
+    for wr in wf_rows:
+        matched = None
+        for cand in sira_pool:
+            if cand["study_code"] in used_codes:
+                continue
+            if wr["firm_cat"] in (_wf_firm_cat(cand["billing_company"]), _wf_firm_cat(cand["sponsor_name"])) and _wf_test_cat(cand["requested_analysis"]) == wr["test_cat"]:
+                matched = cand
+                break
+        if matched is None:
+            for cand in sira_pool:
+                if cand["study_code"] not in used_codes and wr["firm_cat"] in (_wf_firm_cat(cand["billing_company"]), _wf_firm_cat(cand["sponsor_name"])):
+                    matched = cand
+                    break
+        if matched is not None:
+            used_codes.add(matched["study_code"])
+            wf_by_code[matched["study_code"]] = wr["markers"]
+
+    # 5) Fiziksel Kimyasal non-GLP sekmesi (satır 7..11 -> 5 Non-GLP çalışması)
+    nglp_parsed: List[Dict[str, Any]] = []
+    if ws_nglp is not None:
+        for r in range(7, ws_nglp.max_row + 1):
+            raw_code = ws_nglp.cell(r, 14).value
+            if not raw_code or not str(raw_code).strip():
+                continue
+            sira_raw = ws_nglp.cell(r, 1).value
+            try:
+                sira_no = int(float(str(sira_raw).strip()))
+            except Exception:
+                sira_no = r - 6
+            study_code = re.sub(r"\s+", "", str(raw_code)).upper()
+            billing = re.sub(r"\s+", " ", str(ws_nglp.cell(r, 2).value or "")).strip() or None
+            sponsor = billing
+            person_mail_raw = str(ws_nglp.cell(r, 3).value or "").strip()
+            quote_no = re.sub(r"\s+", " ", str(ws_nglp.cell(r, 4).value or "")).strip() or None
+            sales_mgr = normalize_sales_manager(ws_nglp.cell(r, 5).value)
+            proj_name = re.sub(r"\s+", " ", str(ws_nglp.cell(r, 6).value or "")).strip()
+            anal_name = re.sub(r"\s+", " ", str(ws_nglp.cell(r, 8).value or "")).strip()
+            req_analysis = f"{proj_name} — {anal_name}".strip(" —") or "FİZİKSEL-KİMYASAL Monogram Testler"
+            lab_type = str(ws_nglp.cell(r, 9).value or "Edirne Lab").strip()
+            sd_name = normalize_study_director_name(ws_nglp.cell(r, 10).value) or "Burcu DİGER KULAKSIZ"
+            ag_date = parse_date_any(ws_nglp.cell(r, 11).value)
+            test_item = re.sub(r"\s+", " ", str(ws_nglp.cell(r, 12).value or "")).strip() or None
+            qty_val = ws_nglp.cell(r, 13).value
+            qty_str = str(qty_val).strip() if qty_val is not None else None
+            lab_date = parse_date_any(ws_nglp.cell(r, 15).value)
+            plan_st = parse_date_any(ws_nglp.cell(r, 16).value) or parse_date_any(ws_nglp.cell(r, 18).value)
+            exp_st = parse_date_any(ws_nglp.cell(r, 19).value) or parse_date_any(ws_nglp.cell(r, 17).value)
+            exp_end = parse_date_any(ws_nglp.cell(r, 21).value) or parse_date_any(ws_nglp.cell(r, 20).value)
+            draft_dt = parse_date_any(ws_nglp.cell(r, 24).value)
+            final_dt = parse_date_any(ws_nglp.cell(r, 24).value)
+            col17_str = str(ws_nglp.cell(r, 17).value or "").strip()
+            col23_str = str(ws_nglp.cell(r, 23).value or "").strip()
+            note_col = re.sub(r"\s+", " ", str(ws_nglp.cell(r, 25).value or "")).strip() or None
+            if "plan" in norm_key(col23_str) or "baslanmadi" in norm_key(col17_str):
+                stored_status = "PLANNED"
+                raw_status = "Planlanan/Planning"
+            else:
+                stored_status = "ONGOING"
+                raw_status = "Devem eden/On going"
+            contacts = []
+            if person_mail_raw:
+                emails = re.findall(r"[\w.+-]+@[\w-]+\.[\w.-]+", person_mail_raw)
+                name_part = re.sub(r"[\w.+-]+@[\w-]+\.[\w.-]+", "", person_mail_raw).strip()
+                contacts.append({"name": name_part or (emails[0] if emails else person_mail_raw), "email": ", ".join(emails)})
+            nglp_parsed.append(
+                {
+                    "serial_no": sira_no,
+                    "glp_type": "NON-GLP",
+                    "study_code": study_code,
+                    "test_laboratory": lab_type,
+                    "requested_analysis": req_analysis,
+                    "test_item_name": test_item,
+                    "study_director_name": sd_name,
+                    "billing_company": billing,
+                    "sponsor_name": sponsor,
+                    "contacts": contacts,
+                    "sales_manager": sales_mgr,
+                    "quote_no": quote_no,
+                    "study_agreement_date": ag_date,
+                    "test_item_code": None,
+                    "istanbul_arrival_date": lab_date,
+                    "lab_arrival_date": lab_date,
+                    "received_quantity": qty_str,
+                    "animal_consumable_status": None,
+                    "animal_procurement_date": None,
+                    "planned_start": plan_st or exp_st,
+                    "experiment_start_date": exp_st,
+                    "experiment_end_date": exp_end,
+                    "planned_end": exp_end,
+                    "draft_report_date": draft_dt,
+                    "payment_status": None,
+                    "final_report_date": final_dt,
+                    "raw_status_text": raw_status,
+                    "sample_note": note_col,
+                    "stored_status": stored_status,
+                    "sample_status": "Kabul edildi" if lab_date else "Bekleniyor",
+                    "template_code": "PHYS_CHEM_MONO",
+                }
+            )
+    wb.close()
+
+    all_parsed = glp_parsed + nglp_parsed
+    excel_codes = {r["study_code"] for r in all_parsed}
+
+    if prune_non_excel and len(all_parsed) >= 88:
+        for old_row in db.query(SampleRecord).all():
+            if old_row.study_code not in excel_codes:
+                db.delete(old_row)
+        db.flush()
+
+    created = updated = 0
+    for rec in all_parsed:
+        code = rec["study_code"]
+        markers = wf_by_code.get(code)
+        if markers is not None:
+            wf = _build_workflow_from_markers(
+                markers,
+                rec["study_director_name"],
+                rec["sales_manager"],
+                rec["study_agreement_date"],
+                rec["lab_arrival_date"] or rec["istanbul_arrival_date"],
+                rec["planned_start"],
+                rec["planned_end"],
+                rec["draft_report_date"],
+                rec["final_report_date"],
+            )
+        else:
+            wf = _build_default_workflow_for_status(
+                rec["stored_status"],
+                rec["study_director_name"],
+                rec["sales_manager"],
+                rec["study_agreement_date"],
+                rec["lab_arrival_date"] or rec["istanbul_arrival_date"],
+                rec["planned_start"],
+                rec["planned_end"],
+                rec["draft_report_date"],
+                rec["final_report_date"],
+                rec["payment_status"],
+            )
+
+        sample = db.query(SampleRecord).filter(SampleRecord.study_code == code).first()
+        if sample is None:
+            sample = SampleRecord(study_code=code)
+            db.add(sample)
+            created += 1
+        else:
+            updated += 1
+
+        for k, v in rec.items():
+            if k == "study_code":
+                continue
+            setattr(sample, k, v)
+        sample.workflow = wf
+
+        # Study tablosu senkronizasyonu
+        study = find_study(db, code)
+        sd_u = match_study_director(db, rec["study_director_name"], include_inactive=True)
+        if sd_u is None:
+            sd_u = db.query(User).filter(User.role == UserRole.STUDY_DIRECTOR, User.is_active == True).order_by(User.id).first()  # noqa: E712
+        tpl = TEMPLATES.get(resolve_template_code(rec["template_code"])) or TEMPLATES[DEFAULT_TEMPLATE_CODE]
+        st_status = (
+            StudyStatus.COMPLETED
+            if rec["stored_status"] == "COMPLETED"
+            else StudyStatus.IN_PROGRESS
+            if rec["stored_status"] == "ONGOING"
+            else StudyStatus.DRAFT
+        )
+        contact_txt = "; ".join(
+            f"{c.get('name', '')} <{c.get('email', '')}>".replace(" <>", "") for c in (rec["contacts"] or [])
+        ) or None
+        item_name = rec["test_item_name"] or "BELİRTİLMEDİ"
+        if study is None and sd_u is not None:
+            study = Study(
+                study_code=code,
+                title=f"{tpl.standard} {tpl.title} — {item_name} ({code})",
+                test_type=rec["requested_analysis"] or tpl.title,
+                template_code=tpl.code,
+                guideline=tpl.standard,
+                status=st_status,
+                study_director_id=sd_u.id,
+                sponsor_name=rec["sponsor_name"] or rec["billing_company"],
+                sponsor_contact=contact_txt,
+                test_item_name=item_name,
+                acclimatization_start_date=rec["planned_start"] or rec["experiment_start_date"],
+                target_start_date=rec["planned_start"] or rec["experiment_start_date"],
+                target_end_date=rec["planned_end"] or rec["experiment_end_date"],
+            )
+            db.add(study)
+        elif study is not None:
+            study.template_code = tpl.code
+            study.test_type = rec["requested_analysis"] or study.test_type or tpl.title
+            study.guideline = tpl.standard
+            study.status = st_status
+            if sd_u is not None:
+                study.study_director_id = sd_u.id
+            if rec["sponsor_name"] or rec["billing_company"]:
+                study.sponsor_name = rec["sponsor_name"] or rec["billing_company"]
+            if contact_txt:
+                study.sponsor_contact = contact_txt
+            if rec["test_item_name"]:
+                study.test_item_name = rec["test_item_name"]
+            if rec["planned_start"] or rec["experiment_start_date"]:
+                study.acclimatization_start_date = rec["planned_start"] or rec["experiment_start_date"]
+                study.target_start_date = rec["planned_start"] or rec["experiment_start_date"]
+            if rec["planned_end"] or rec["experiment_end_date"]:
+                study.target_end_date = rec["planned_end"] or rec["experiment_end_date"]
+
+    db.commit()
+
+    scheduled_count = 0
+    if auto_schedule:
+        sched_res = auto_schedule_excel_studies(db, user)
+        scheduled_count = sched_res["scheduled"]
+
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            entity_name="SampleRecord",
+            entity_id=0,
+            action="STUDY_STATUS_WORKBOOK_IMPORT",
+            new_values={
+                "glp_count": len(glp_parsed),
+                "non_glp_count": len(nglp_parsed),
+                "workflow_matched": len(wf_by_code),
+                "created": created,
+                "updated": updated,
+                "auto_scheduled": scheduled_count,
+            },
+            reason=(
+                f"{user.username}: Study Status Excel tam içe aktarma — {len(glp_parsed)} GLP + {len(nglp_parsed)} Non-GLP "
+                f"çalışma, {len(wf_by_code)} iş akışı eşleşti, {scheduled_count} çalışma otomatik takvimlendi."
+            ),
+        )
+    )
+    db.commit()
+    return {
+        "created": created,
+        "updated": updated,
+        "skipped": 0,
+        "errors": [],
+        "total_rows": len(all_parsed),
+        "glp_count": len(glp_parsed),
+        "non_glp_count": len(nglp_parsed),
+        "workflow_matched": len(wf_by_code),
+        "auto_scheduled": scheduled_count,
+    }
+
+
+def auto_schedule_excel_studies(db: Session, user: User) -> Dict[str, Any]:
+    """
+    FAZ 8.3 Adım 4:
+    - `Planlanan/Planning` (14 GLP + 2 Non-GLP)
+    - `Beklenen/Expected` (3 GLP: GLP2026-059, 057, 058 — `stored_status = 'EXPECTED'` korunur!)
+    - `Devem eden/On going` olup bitiş tarihi / takvimi olmayan (`GLP2026-030` vb.)
+    çalışmalar için takvim motorunu (`plan_sample`) çalıştırır.
+    Excel'de `Planlanan Çalışma Başlangıç Tarihi` doluysa o tarihi, boşsa çakışmasız kademeli (staggered) Gün 0 tarihini atar.
+    """
+    samples = (
+        db.query(SampleRecord)
+        .order_by(SampleRecord.serial_no.asc().nullslast(), SampleRecord.study_code.asc())
+        .all()
+    )
+    cursor_by_tpl: Dict[str, date] = {}
+    base_cursor = next_business_day(max(date.today() + timedelta(days=2), date(2026, 11, 9)))
+    results: List[Dict[str, Any]] = []
+
+    for s in samples:
+        st = (s.stored_status or "").upper()
+        needs_schedule = False
+        if st in ("PLANNED", "EXPECTED"):
+            needs_schedule = True
+        elif st == "ONGOING" and (s.planned_end is None or not _study_has_steps(db, find_study(db, s.study_code))):
+            needs_schedule = True
+        if not needs_schedule:
+            continue
+
+        tpl_code = resolve_template_code(s.template_code) or infer_template_code(s.requested_analysis) or DEFAULT_TEMPLATE_CODE
+        if s.planned_start is not None:
+            g0 = s.planned_start
+        else:
+            prev = cursor_by_tpl.get(tpl_code, base_cursor)
+            if st == "EXPECTED":
+                prev = max(prev, next_business_day(base_cursor + timedelta(days=10)))
+            g0 = next_business_day(prev)
+            cursor_by_tpl[tpl_code] = next_business_day(g0 + timedelta(days=2))
+
+        try:
+            plan = plan_sample(
+                db,
+                s,
+                user,
+                start_date=g0,
+                preserve_status=True,
+                allow_non_draft=(st == "ONGOING"),
+            )
+            results.append({"study_code": s.study_code, "ok": True, **plan})
+        except Exception as exc:
+            db.rollback()
+            results.append({"study_code": s.study_code, "ok": False, "error": str(exc)})
+
+    return {
+        "scheduled": sum(1 for r in results if r["ok"]),
+        "failed": sum(1 for r in results if not r["ok"]),
+        "results": results,
+    }

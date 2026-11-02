@@ -24,6 +24,7 @@ from app.config import settings  # noqa: E402
 from app.database import SessionLocal, engine  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import Conflict, Study, StudyStatus, StudyStep, User, UserRole  # noqa: E402
+from app.models.document import Document  # noqa: E402
 from app.seed import DEFAULT_PASSWORD, reset_schema, seed_personnel  # noqa: E402
 from app.services.scheduling_engine import schedule_new_study  # noqa: E402
 from app.utils.security import verify_password  # noqa: E402
@@ -760,6 +761,452 @@ def main():
                 and len(cal_put.json()["audit_logs"]) >= 1,
                 "PUT /api/v1/planning/calibration → veritabanını güncelledi ve AuditLog kaydı üretti",
             )
+
+            print("\n[12] FAZ 7.2: EXECUTIVE (Üst Yönetim) Rolü, Dinamik Rol & Ekran Yetki Matrisi (/users/roles) ve Salt Okunur Koruması")
+            roles_res = client.get("/api/v1/users/roles", headers=h_admin)
+            check(roles_res.status_code == 200, "GET /api/v1/users/roles → 200")
+            exec_role = next((r for r in roles_res.json() if r["role_code"] == "EXECUTIVE"), None)
+            check(
+                exec_role is not None
+                and exec_role["is_read_only"] is True
+                and sorted(exec_role["allowed_menus"]) == sorted(["dashboard", "samples", "planning", "personnel", "studies", "conflicts"]),
+                "EXECUTIVE rolü varsayılan olarak Salt Okunur ve sadece izleme ekranları (dashboard, samples, planning, personnel, studies, conflicts) açık",
+            )
+            exec_u = client.post(
+                "/api/v1/users",
+                headers=h_admin,
+                json={
+                    "username": "ozkan.bey",
+                    "full_name": "Özkan Bey (Üst Yönetim — GM / GMY)",
+                    "role": "EXECUTIVE",
+                    "password": DEFAULT_PASSWORD,
+                },
+            )
+            check(exec_u.status_code == 201 and exec_u.json()["is_read_only"] is True, "EXECUTIVE kullanıcısı (ozkan.bey) oluşturuldu")
+            h_exec = auth_headers(client, "ozkan.bey", DEFAULT_PASSWORD)
+            check(client.get("/api/v1/planning/summary", headers=h_exec).status_code == 200, "EXECUTIVE GET /summary (İzleme) → 200")
+            check(client.get("/api/v1/planning/calendar", headers=h_exec).status_code == 200, "EXECUTIVE GET /calendar (İzleme) → 200")
+            check(
+                client.post(
+                    "/api/v1/planning/schedule-study",
+                    headers=h_exec,
+                    json={"study_code": "T-EXEC-FAIL", "acclimatization_start_date": "2027-02-01"},
+                ).status_code == 403,
+                "EXECUTIVE POST /schedule-study → 403 (Salt Okunur İzleme Modu yazmayı engelledi)",
+            )
+            check(client.get("/api/v1/users", headers=h_exec).status_code == 403, "EXECUTIVE GET /users → 403")
+            new_role_res = client.post(
+                "/api/v1/users/roles",
+                headers=h_admin,
+                json={
+                    "role_code": "GMY_IZLEME",
+                    "role_label": "Genel Müdür Yardımcısı (İzleme)",
+                    "allowed_menus": ["dashboard", "studies"],
+                    "is_read_only": True,
+                },
+            )
+            check(new_role_res.status_code == 201 and new_role_res.json()["role_code"] == "GMY_IZLEME", "SYSADMIN POST /users/roles ile yeni özel rol oluşturdu")
+            upd_role_res = client.put(
+                "/api/v1/users/roles/GMY_IZLEME",
+                headers=h_admin,
+                json={"allowed_menus": ["dashboard", "planning", "studies"], "is_read_only": True},
+            )
+            check(upd_role_res.status_code == 200 and "planning" in upd_role_res.json()["allowed_menus"], "SYSADMIN PUT /users/roles/{code} ile ekran yetkilerini güncelledi")
+            check(client.put("/api/v1/users/roles/GMY_IZLEME", headers=h_tfm, json={"is_read_only": False}).status_code == 403, "TFM rol matrisini değiştiremez (Sadece SYSADMIN) → 403"
+            )
+
+
+            print("\n[13] FAZ 8.1: Test Kısıtlama Takvimi, Kafes + Dr. Anoop Esneklik %, 24-72s Cihaz Motoru, 5 Şablon, Numune & Çalışma Takip")
+            import io as _io
+            from docx import Document as _DocxReader
+
+            def sched(code, start, tpl="ISO_10993_23_IC", headers=None):
+                r = client.post("/api/v1/planning/schedule-study", headers=headers or h_tfm,
+                                json={"study_code": code, "acclimatization_start_date": start, "template_code": tpl})
+                assert r.status_code == 200, f"{code}: {r.status_code} {r.text}"
+                return r.json()
+
+            # 13a) Test kısıtlama takvimi ---------------------------------------------------------
+            rs_forbidden = client.post("/api/v1/restrictions", headers=h_qa, json={
+                "template_code": "ISO_10993_23_IC", "test_name": "X", "restricted_from": "2026-12-01",
+                "restricted_until": "2026-12-17", "reason": "test"})
+            check(rs_forbidden.status_code == 403, "QA (salt okunur) test kısıtlaması ekleyemez → 403")
+            bad_rng = client.post("/api/v1/restrictions", headers=h_tfm, json={
+                "template_code": "ISO_10993_23_IC", "test_name": "X", "restricted_from": "2026-12-17",
+                "restricted_until": "2026-12-01", "reason": "test"})
+            check(bad_rng.status_code == 422, "Bitiş tarihi başlangıçtan önce olan kısıtlama → 422")
+            rs = client.post("/api/v1/restrictions", headers=h_tfm, json={
+                "template_code": "ISO_10993_23_IC", "test_name": "İntrakütanöz Reaktivite Testi (ISO 10993-23)",
+                "restricted_from": "2026-12-01", "restricted_until": "2026-12-17",
+                "reason": "Tavşan tedarikçisi sevkiyat aksaklığı"})
+            check(rs.status_code == 201 and rs.json()["is_active"] is True, "POST /restrictions → kısıtlama kaydı oluşturuldu")
+            rs_id = rs.json()["id"]
+            check(client.get("/api/v1/restrictions", headers=h_exec).status_code == 200, "EXECUTIVE kısıtlamaları görüntüleyebilir (GET → 200)")
+            shifted = sched("T-BLK-1", "2026-12-07")
+            exp_notice = ("OTOMATİK TARİH PLANLAMASI: İntrakütanöz Reaktivite Testi (ISO 10993-23), 'Tavşan tedarikçisi sevkiyat aksaklığı' "
+                          "nedeniyle 17.12.2026 tarihine kadar kısıtlı olduğu için başlangıç tarihi otomatik olarak 18.12.2026 tarihine planlanmıştır.")
+            check(shifted["acclimatization_start_date"] == "2026-12-18", "Gün 0 (07.12) kısıtlı aralıkta → restricted_until + 1 = 18.12.2026'ya ötelendi")
+            check((shifted["auto_schedule_notice"] or {}).get("text") == exp_notice, "Otomatik tarih planlaması bilgisi tam metinle kaydedildi")
+            check(datetime.fromisoformat(shifted["steps"][0]["planned_start"]).date() == date(2026, 12, 18), "Takvimin G0 adımı yeni Gün 0'a taşındı")
+            blk_study = db.query(Study).filter(Study.study_code == "T-BLK-1").first()
+            db.refresh(blk_study)
+            check(exp_notice in (blk_study.description or ""), "Bilgi çalışma kaydına (description) yazıldı")
+            sat_case = client.post("/api/v1/restrictions", headers=h_tfm, json={
+                "template_code": "ALL", "test_name": "Tüm Testler", "restricted_from": "2027-02-01",
+                "restricted_until": "2027-02-05", "reason": "Tesis bakımı"})
+            sat_json = client.post("/api/v1/restrictions/preview-shift", headers=h_tfm,
+                                   json={"template_code": "ISO_10993_5_CYT", "start_date": "2027-02-03"}).json()
+            check(sat_json["shifted"] and sat_json["new_start_date"] == "2027-02-08",
+                  "ALL kısıtlaması + takma ad (ISO_10993_5_CYT): Cuma biten kısıtlama → hafta sonu atlanıp Pazartesi'ye öteleme")
+            client.delete(f"/api/v1/restrictions/{sat_case.json()['id']}", headers=h_tfm)
+            other_tpl = sched("T-BLK-CYT", "2026-12-07", tpl="ISO_10993_5_CYT")
+            check(other_tpl["acclimatization_start_date"] == "2026-12-07" and other_tpl["auto_schedule_notice"] is None,
+                  "Kısıtlama yalnızca ilgili test şablonunu etkiler (sitotoksisite ötelenmedi)")
+            check(other_tpl["template"]["code"] == "ISO_10993_5_CYTO", "ISO_10993_5_CYT takma adı kanonik şablona çözüldü")
+            check(client.delete(f"/api/v1/restrictions/{rs_id}", headers=h_tfm).status_code == 200, "DELETE /restrictions/{id} → kısıtlama silindi")
+            again = sched("T-BLK-1", "2026-12-07")
+            check(again["acclimatization_start_date"] == "2026-12-07" and again["auto_schedule_notice"] is None,
+                  "Kısıtlama silinince aynı çalışma talep edilen tarihe planlandı ve otomatik tarih notu temizlendi")
+
+            # 13b) Kafes kapasitesi (Fiziksel + Dr. Anoop esneklik %) -----------------------------
+            rooms = client.get("/api/v1/room-capacities", headers=h_tfm).json()["rooms"]
+            caps = {r["room_code"]: (r["physical_cages"], r["flexibility_pct"], r["planning_capacity"]) for r in rooms}
+            check(caps == {"RABBIT_ROOM": (100, 100.0, 200), "RAT_ROOM": (100, 40.0, 140),
+                           "GUINEA_PIG_ROOM": (100, 50.0, 150), "MOUSE_ROOM": (120, 50.0, 180)},
+                  "Oda kafes tablosu: Tavşan 100/%100→200, Rat 100/%40→140, Kobay 100/%50→150, Fare 120/%50→180")
+            upd_room = client.put("/api/v1/room-capacities/RAT_ROOM", headers=h_tfm, json={"physical_cages": 120, "flexibility_pct": 50})
+            check(upd_room.status_code == 200 and next(r for r in upd_room.json()["rooms"] if r["room_code"] == "RAT_ROOM")["planning_capacity"] == 180,
+                  "PUT /room-capacities: 120 × (1 + %50) = 180 Kafes")
+            client.put("/api/v1/room-capacities/RAT_ROOM", headers=h_tfm, json={"physical_cages": 100, "flexibility_pct": 40})
+            check(client.put("/api/v1/room-capacities/RABBIT_ROOM", headers=h_qa, json={"physical_cages": 5}).status_code == 403,
+                  "QA kafes kapasitesini değiştiremez → 403")
+            client.put("/api/v1/room-capacities/RABBIT_ROOM", headers=h_tfm, json={"physical_cages": 3, "flexibility_pct": 100})
+            c1 = sched("T-CAGE-1", "2028-03-06")
+            check(c1["capacity_info"]["cage"]["level"] == "OK" and c1["capacity_info"]["cage"]["required"] == 3,
+                  "Doluluk ≤ Fiziksel Kafes → OK (3 kafes)")
+            c2 = sched("T-CAGE-2", "2028-03-06")
+            check(c2["capacity_info"]["cage"]["level"] == "FLEX" and "Dr. Anoop" in c2["capacity_info"]["cage"]["message"]
+                  and not any(c["type"] == "ROOM_CAPACITY_EXCEEDED" for c in c2["conflicts"]),
+                  "Fiziksel < Doluluk ≤ Planlama Kapasitesi → yalnızca bilgi etiketi (çalışma engellenmedi)")
+            c3 = sched("T-CAGE-3", "2028-03-06")
+            cap_conf = next((c for c in c3["conflicts"] if c["type"] == "ROOM_CAPACITY_EXCEEDED"), None)
+            check(c3["capacity_info"]["cage"]["level"] == "EXCEEDED" and cap_conf is not None and cap_conf["severity"] == "CRITICAL",
+                  "Doluluk > Sistem Planlama Kapasitesi → kapasite uyarısı (ROOM_CAPACITY_EXCEEDED)")
+            res_actions = [r["action"] for r in cap_conf["resolutions"]]
+            check("SHIFT_TO_NEXT_AVAILABLE_CAPACITY_DATE" in res_actions, "Uyarıda 'İlk Boşalan Tarihe Kaydır' çözüm butonu var")
+            fixed = client.post(f"/api/v1/planning/conflicts/{cap_conf['id']}/apply-resolution", headers=h_tfm,
+                                json={"action": "SHIFT_TO_NEXT_AVAILABLE_CAPACITY_DATE"})
+            check(fixed.status_code == 200 and fixed.json()["acclimatization_start_date"] > "2028-03-06"
+                  and not any(c["type"] == "ROOM_CAPACITY_EXCEEDED" for c in fixed.json()["conflicts"]),
+                  "Çözüm uygulandı: Gün 0 ilk boşalan tarihe kaydırıldı ve kapasite uyarısı kalktı")
+            client.put("/api/v1/room-capacities/RABBIT_ROOM", headers=h_tfm, json={"physical_cages": 100, "flexibility_pct": 100})
+
+            # 13c) 24-72 saatlik uzun süreli cihazlar (CO2 inkübatör / etüv) --------------------
+            leq = {e["code"]: e["max_concurrent_studies"] for e in client.get("/api/v1/long-equipment", headers=h_tfm).json()}
+            check({"EQ-WB-001", "EQ-INC-001", "EQ-OVN-001"} <= set(leq), "Yalnızca 24-72s darboğaz cihazlar tanımlı: EQ-WB-001, EQ-INC-001, EQ-OVN-001")
+            client.put("/api/v1/long-equipment/EQ-INC-001", headers=h_tfm, json={"max_concurrent_studies": 1})
+            y1 = sched("T-CYT-1", "2028-06-05", tpl="ISO_10993_5_CYT")
+            check(y1["capacity_info"]["cage"] is None and all(e["level"] == "OK" for e in y1["capacity_info"]["equipment"]),
+                  "Sitotoksisite: 0 kafes, ilk çalışma CO2 inkübatör / etüv kapasitesinde")
+            y2 = sched("T-CYT-2", "2028-06-05", tpl="ISO_10993_5_CYT")
+            check(any("Uzun Süreli Cihaz Kapasite Aşımı" in c["title"] and "EQ-INC-001" in c["title"] for c in y2["conflicts"]),
+                  "2. sitotoksisite aynı 24s pencerede → EQ-INC-001 CO2 İnkübatör kapasite aşımı")
+            client.put("/api/v1/long-equipment/EQ-INC-001", headers=h_tfm, json={"max_concurrent_studies": 4})
+
+            # 13d) Yeni şablon: ISO 10993-6 İmplantasyon + .docx -----------------------------------
+            tpls = {t["code"]: t for t in client.get("/api/v1/planning/templates", headers=h_tfm).json()["templates"]}
+            check("ISO_10993_6_IMP" in tpls and len(tpls["ISO_10993_6_IMP"]["steps"]) == 10 and tpls["ISO_10993_6_IMP"]["cage_count"] == 3,
+                  "ISO_10993_6_IMP: 10 biyolojik adım, 3 tavşan kafesi")
+            check(tpls["ISO_10993_10_SENS"]["cage_count"] == 3 and tpls["ISO_10993_11_ACUTE"]["cage_count"] == 2
+                  and tpls["ISO_10993_5_CYTO"]["cage_count"] == 0 and tpls["ISO_10993_23_IC"]["cage_count"] == 3,
+                  "Kafes gereksinimleri: IC 3, IMP 3, SENS 3 (kobay), SYS 2 (kemirgen), CYT 0")
+            imp = sched("T-IMP-1", "2028-09-04", tpl="ISO_10993_6_IMP")
+            check([s["study_day"] for s in imp["steps"]] == [0, 4, 7, 8, 9, 10, 14, 21, 28, 35], "İmplantasyon takvimi G0,G4,G7,G8,G9,G10,G14,G21,G28,G35")
+            imp_doc = client.get(f"/api/v1/studies/{imp['study_id']}/export-study-plan", headers=h_tfm)
+            doc_txt = ""
+            if imp_doc.status_code == 200:
+                rd = _DocxReader(_io.BytesIO(imp_doc.content))
+                doc_txt = "\n".join(p.text for p in rd.paragraphs) + "\n".join(c.text for t in rd.tables for row in t.rows for c in row.cells)
+            check(imp_doc.status_code == 200 and "Subcutaneous Implantation Test" in doc_txt and "ANNEX A" in doc_txt and "ISO 10993-6" in doc_txt,
+                  "ISO 10993-6 için .docx Study Plan üretildi (başlık, standart ve Annex A uyarlandı)")
+
+            # 13e) Numune & Çalışma Takip ----------------------------------------------------------
+            from app.services.sample_service import seed_sample_tracking
+            seeded = seed_sample_tracking(db)
+            check(seeded["samples"] == 6 and seeded["users"] == 4, "Örnek veri tohumlandı: 6 numune/çalışma kaydı, 4 kullanıcı (Ayşe Özgür, Burcu DİGER KULAK, İlknur Toklu, TRM Kabul)")
+            check(seed_sample_tracking(db) == {"users": 0, "samples": 0}, "Tohumlama idempotent (ikinci çalıştırmada kayıt eklenmedi)")
+            h_sales = auth_headers(client, "ilknur.toklu", "NanoLab2026!")
+            h_trm = auth_headers(client, "trm_kabul", "NanoLab2026!")
+            lst = client.get("/api/v1/samples", headers=h_tfm)
+            check(lst.status_code == 200 and lst.json()["summary"]["total"] == 6, "GET /samples → 6 kayıt + özet şeridi")
+            summ = lst.json()["summary"]
+            check(all(k in summ for k in ("expected", "planned", "ongoing", "overdue", "by_study_director")), "Özet: Beklenen / Planlanan / Devam eden / Gecikmiş + ÇY bazında açık çalışmalar")
+            check([x["name"] for x in summ["by_study_director"][:4]] == ["Ezgi Nur AKIN", "Ayşe Özgür", "Burcu DİGER KULAK", "Atanmamış"],
+                  "Çalışma Yöneticisi bazında: Ezgi Nur AKIN, Ayşe Özgür, Burcu DİGER KULAK, Atanmamış")
+            check(client.get("/api/samples", headers=h_tfm).status_code == 200, "/api/samples kısa yolu da çalışıyor")
+            by_code = {i["study_code"]: i for i in lst.json()["items"]}
+            sid = {k: v["id"] for k, v in by_code.items()}
+            check(by_code["GLP2026-078"]["status"] == "EXPECTED" and by_code["GLP2026-072"]["status"] == "PLANNED"
+                  and by_code["GLP2026-031"]["status"] == "ONGOING", "Durumlar: 078 Beklenen, 072 Planlanan, 031 Devam eden")
+            check(by_code["GLP2026-026"]["is_overdue"] is True, "GLP2026-026: final rapor süresi geçti → Gecikmiş iş")
+            check(client.get("/api/v1/samples", headers=auth_headers(client, "invivo_1")).status_code == 403, "Teknisyen Numune Takip ekranına giremez → 403")
+            # Rol bazlı düzenleme
+            check(client.put(f"/api/v1/samples/{sid['GLP2026-072']}", headers=h_sales, json={"quote_no": "TKL-2026-114"}).status_code == 200,
+                  "Satış rolü satış bilgilerini (Teklif No) düzenleyebilir")
+            check(client.put(f"/api/v1/samples/{sid['GLP2026-072']}", headers=h_sales, json={"lot_no": "L-1"}).status_code == 403,
+                  "Satış rolü numune kabul (TRM) alanlarını düzenleyemez → 403")
+            check(client.put(f"/api/v1/samples/{sid['GLP2026-072']}", headers=h_trm, json={"quote_no": "X"}).status_code == 403,
+                  "TRM Kabul rolü satış alanlarını düzenleyemez → 403")
+            shared = client.put(f"/api/v1/samples/{sid['GLP2026-072']}", headers=h_trm,
+                                json={"lot_no": "LOT-PLLA-001", "storage_condition": "Oda sıcaklığı", "apply_to_related": True})
+            check(shared.status_code == 200 and sorted(shared.json()["propagated_to"]) == ["GLP2026-073", "GLP2026-076"],
+                  "TRM Kabul: 'Aynı numuneyi kullanan diğer çalışmalar' (076, 073) ortak güncellendi")
+            rel = client.get(f"/api/v1/samples/{sid['GLP2026-076']}", headers=h_tfm).json()
+            check(rel["lot_no"] == "LOT-PLLA-001" and {r["study_code"] for r in rel["related"]} == {"GLP2026-072", "GLP2026-073"},
+                  "Bağlantılı çalışmalar listesi (TI-2026-0016) ve ortak Lot doğrulandı")
+            check(client.put(f"/api/v1/samples/{sid['GLP2026-072']}", headers=h_exec, json={"quote_no": "Y"}).status_code == 403,
+                  "EXECUTIVE (GM/GMY) numune kaydını düzenleyemez → 403")
+            check(client.post(f"/api/v1/samples/{sid['GLP2026-072']}/plan", headers=h_exec, json={}).status_code == 403,
+                  "EXECUTIVE otomatik takvim oluşturamaz → 403")
+            check(client.get(f"/api/v1/samples/{sid['GLP2026-072']}", headers=h_exec).status_code == 200, "EXECUTIVE numune detayını görüntüleyebilir")
+            check(client.get("/api/v1/planning/summary", headers=h_sales).status_code == 200
+                  and client.post("/api/v1/planning/schedule-study", headers=h_sales, json={}).status_code == 403,
+                  "Satış rolü Dashboard özetini görebilir ancak çalışma takvimi oluşturamaz (403)")
+            # Otomatik takvim + tarihler
+            plan = client.post(f"/api/v1/samples/{sid['GLP2026-072']}/plan", headers=h_sd, json={})
+            check(plan.status_code == 200 and plan.json()["plan"]["study_id"] and plan.json()["sample"]["scheduled"] is True,
+                  "İş Akışı & Takvimi Planla: 072 için otomatik taslak çalışma + takvim oluştu")
+            s72 = plan.json()["sample"]
+            end72 = date.fromisoformat(s72["dates"]["end"])
+            check(s72["dates"]["draft_report"] == (end72 + timedelta(days=3)).isoformat()
+                  and s72["dates"]["final_report"] == (end72 + timedelta(days=7)).isoformat(),
+                  "Taslak rapor = bitiş + 3 gün, Final rapor = bitiş + 7 gün")
+            wf72 = {s["no"]: s for s in s72["workflow"]}
+            check(len(s72["workflow"]) == 11 and wf72[4]["done"] and wf72[5]["done"] and wf72[1]["done"],
+                  "11 adımlı iş akışı: sözleşme, numune kabulü ve taslak plan otomatik tamamlandı")
+            study72 = db.query(Study).filter(Study.study_code == "GLP2026-072").first()
+            db.refresh(study72)
+            check(study72.template_code == "ISO_10993_6_IMP" and study72.test_item_name == "MERKEN PLLA+HA", "Çalışma kaydı numune verileriyle oluştu (ISO_10993_6_IMP)")
+            dl = client.get(f"/api/v1/samples/{sid['GLP2026-072']}/study-plan-docx", headers=h_exec)
+            check(dl.status_code == 200 and dl.content[:2] == b"PK", "Satırdan Study Plan (.docx) indirildi (GM/GMY salt okunur dahil)")
+            dl_none = client.get(f"/api/v1/samples/{sid['GLP2026-078']}/study-plan-docx", headers=h_exec)
+            check(dl_none.status_code == 409, "Takvimi olmayan satırda salt okunur rol için açıklayıcı 409 döner")
+            # Onay imzaları
+            check(client.post(f"/api/v1/samples/{sid['GLP2026-072']}/workflow/6", headers=h_sd, json={"action": "sign", "approver": "KG"}).status_code == 403,
+                  "ÇY, KG onayını veremez → 403")
+            ap1 = client.post(f"/api/v1/samples/{sid['GLP2026-072']}/workflow/6", headers=h_sd, json={"action": "sign", "approver": "CY"})
+            ap2 = client.post(f"/api/v1/samples/{sid['GLP2026-072']}/workflow/6", headers=h_qa, json={"action": "sign", "approver": "KG"})
+            ap3 = client.post(f"/api/v1/samples/{sid['GLP2026-072']}/workflow/6", headers=h_tfm, json={"action": "sign", "approver": "TBY"})
+            st6 = next(s for s in ap3.json()["workflow"] if s["no"] == 6)
+            check(ap1.status_code == 200 and ap2.status_code == 200 and st6["done"] and all(a["signed"] and a["by"] and a["at"] for a in st6["approvals"]),
+                  "Plan onayı: ÇY · KG · TBY imzaları kişi adı ve tarihiyle kaydedildi → adım 6 tamamlandı")
+            check(client.post(f"/api/v1/samples/{sid['GLP2026-072']}/workflow/2", headers=h_sales, json={"action": "complete"}).status_code == 403,
+                  "Satış, Çalışma Yöneticisi adımını (Etik kurul) tamamlayamaz → 403")
+            check(client.post(f"/api/v1/samples/{sid['GLP2026-072']}/workflow/10", headers=h_sales, json={"action": "complete"}).status_code == 200,
+                  "Satış, 'Ödemenin tamamlanması' adımını tamamlayabilir")
+            # Tümünü otomatik takvimle
+            allp = client.post("/api/v1/samples/auto-schedule-all", headers=h_tfm)
+            ok_codes = sorted(r["study_code"] for r in allp.json()["results"] if r["ok"])
+            check(allp.status_code == 200 and ok_codes == ["GLP2026-073", "GLP2026-076"],
+                  "Tüm Planlananları Otomatik Takvimle: 076 (Sitotoksisite) ve 073 (Sensitizasyon) takvimlendi")
+            s76 = client.get(f"/api/v1/samples/{sid['GLP2026-076']}", headers=h_tfm).json()
+            check(s76["scheduled"] and s76["study_director_name"] == "Ayşe Özgür", "076 çalışması Ayşe Özgür'e atandı ve takvimlendi")
+            # Excel / CSV içe aktarma
+            from openpyxl import Workbook
+            wb = Workbook()
+            ws = wb.active
+            ws.append(["Rapor: Numune Listesi"])
+            ws.append(["GLP No", "Talep Edilen Analiz", "Test Maddesinin Adı", "Sponsor", "Teklif No", "Beklenen Geliş Tarihi", "Çalışma Yöneticisi"])
+            ws.append(["GLP2026-090", "Sitotoksisite Testi", "Örnek Test Ürünü", "ACME Medikal", "TKL-2026-200", "15.11.2026", "Burcu DİGER KULAK"])
+            ws.append(["GLP2026-091", "Sensitizasyon Testi", "Örnek Test Ürünü 2", "ACME Medikal", "TKL-2026-201", datetime(2026, 11, 20), None])
+            buf = _io.BytesIO()
+            wb.save(buf)
+            imp_x = client.post("/api/v1/samples/import-excel", headers=h_sales,
+                                files={"file": ("numuneler.xlsx", buf.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
+            check(imp_x.status_code == 200 and imp_x.json()["created"] == 2, "Excel (.xlsx) içe aktarma: başlık satırı otomatik bulundu, 2 kayıt oluştu")
+            csv_txt = "GLP No;Teklif No;Lot No\nGLP2026-090;TKL-2026-999;LOT-77\n"
+            imp_c = client.post("/api/v1/samples/import-excel", headers=h_tfm, files={"file": ("guncelle.csv", csv_txt.encode("utf-8"), "text/csv")})
+            check(imp_c.status_code == 200 and imp_c.json()["updated"] == 1, "CSV (;) içe aktarma: mevcut kayıt güncellendi")
+            s90 = client.get("/api/v1/samples", headers=h_tfm).json()
+            row90 = next(i for i in s90["items"] if i["study_code"] == "GLP2026-090")
+            check(row90["template_code"] == "ISO_10993_5_CYTO" and row90["quote_no"] == "TKL-2026-999" and row90["expected_arrival_date"] == "2026-11-15",
+                  "İçe aktarma: analiz adından şablon (sitotoksisite) çıkarıldı, tarih ve alanlar eşlendi")
+            check(client.post("/api/v1/samples/import-excel", headers=h_exec, files={"file": ("x.csv", b"GLP No\nGLP1", "text/csv")}).status_code == 403,
+                  "EXECUTIVE Excel içe aktaramaz → 403")
+            print("\n[14] FAZ 8.2: Şablona Özgü Study Plan (.docx) Bölüm 6–10 Metinleri ve Çekmeceden TIIS / CoA / FM.083 PDF Yükleme + Otomatik Doldurma")
+            import re as _re
+
+            def docx_text(study_id):
+                r = client.get(f"/api/v1/studies/{study_id}/export-study-plan", headers=h_tfm)
+                assert r.status_code == 200, f"docx {study_id}: {r.status_code}"
+                rd = _DocxReader(_io.BytesIO(r.content))
+                parts = [p.text for p in rd.paragraphs]
+                for t in rd.tables:
+                    for row in t.rows:
+                        seen = set()
+                        for c in row.cells:
+                            if id(c._tc) in seen:
+                                continue
+                            seen.add(id(c._tc))
+                            parts.append(c.text)
+                return "\n".join(parts)
+
+            doc_cases = [
+                ("T-DOC-IMP", "2029-02-05", "ISO_10993_6_IMP", "ISO 10993-6",
+                 ["Subcutaneous Implantation Test", "histopatholog", "implant sites", "Tests for Local Effects after Implantation"], ["New Zealand White Rabbits"][:0]),
+                ("T-DOC-CYT", "2029-03-05", "ISO_10993_5_CYT", "ISO 10993-5",
+                 ["L929", "CO2", "MTT", "Not Applicable for Live Animals", "In Vitro Cytotoxicity"], ["New Zealand", "Rabbit"]),
+                ("T-DOC-SENS", "2029-04-02", "ISO_10993_10_SENS", "ISO 10993-10",
+                 ["Magnusson & Kligman", "Induction", "Challenge", "Guinea Pig Room", "Albino"], ["New Zealand", "Rabbit"]),
+                ("T-DOC-SYS", "2029-05-07", "ISO_10993_11_SYS", "ISO 10993-11",
+                 ["intravenous", "intraperitoneal", "4, 24, 48 and 72", "Mouse / Rat Room", "Systemic Toxicity"], ["New Zealand", "Rabbit"]),
+            ]
+            for code, start, tpl_code, std, must, must_not in doc_cases:
+                rsp = sched(code, start, tpl=tpl_code)
+                txt = docx_text(rsp["study_id"])
+                low = txt.lower()
+                miss = [m for m in must if m.lower() not in low]
+                bad = [m for m in must_not if m.lower() in low]
+                check(not miss and not bad, f"{std} .docx: bölüm metinleri şablona göre dinamik (eksik={miss}, kalan={bad})")
+                check("intracutaneous" not in low and "ISO 10993-23" not in txt and std in txt,
+                      f"{std} .docx: İntrakütanöz / ISO 10993-23 metni kalmadı, standart adı güncellendi")
+                check(not _re.search(r"X{3,}", txt), f"{std} .docx: doldurulmamış 'XXX' yer tutucusu kalmadı")
+
+            # --- Çekmeceden belge yükleme + otomatik doldurma (OpenAI çağrısı mock) ---
+            import fitz as _fitz
+
+            def make_pdf(text):
+                pdf = _fitz.open()
+                pdf.new_page().insert_text((72, 72), text)
+                data = pdf.tobytes()
+                pdf.close()
+                return data
+
+            calls = {"n": 0}
+
+            def fake_drawer_llm(messages):
+                calls["n"] += 1
+                coa = calls["n"] % 2 == 0
+                return {
+                    "doc_category": "COA_CERTIFICATE" if coa else "TIIS_FORM",
+                    "doc_summary": "Analiz Sertifikası (CoA)" if coa else "Test Maddesi Bilgi Formu (TIIS)",
+                    "study_codes": [], "primary_study_code": None, "study_code_mappings": [],
+                    "test_type": None, "guideline": None,
+                    "sponsor_name": "MERKEN", "sponsor_contact": None,
+                    "test_item_name": "MERKEN PLLA+HA",
+                    "lot_batch_no": "LOT-2026-77",
+                    "manufacture_date": "2026-05-02",
+                    "expiry_date": "2029-05-01",
+                    "storage_conditions": "Oda Sicakligi (15-25 C)",
+                    "physical_state": None, "sterility": None,
+                    "extraction_polar": True if not coa else None,
+                    "extraction_polar_solvent": "%0.9 NaCl (Salin)" if not coa else None,
+                    "extraction_non_polar": True if not coa else None,
+                    "extraction_non_polar_solvent": "Susam Yagi" if not coa else None,
+                    "extraction_ratio": None, "extraction_conditions": None,
+                    "animal_species_strain": None, "animal_count": None, "animal_birth_date": None,
+                    "acclimatization_start_date": None, "requested_start_period": None, "study_director": None,
+                    "warnings": [],
+                }
+
+            dp._llm_call = fake_drawer_llm
+            pdfs = [("TIIS_MERKEN.pdf", make_pdf("TIIS Lot LOT-2026-77 Polar Non-Polar"), "application/pdf"),
+                    ("CoA_MERKEN.pdf", make_pdf("Certificate of Analysis Lot LOT-2026-77 Expiry 2029-05-01"), "application/pdf")]
+            check(client.post(f"/api/v1/samples/{sid['GLP2026-078']}/documents", headers=h_exec,
+                              files=[("files", p) for p in pdfs]).status_code == 403,
+                  "EXECUTIVE (salt okunur) çekmeceden belge yükleyemez → 403")
+            check(client.post(f"/api/v1/samples/{sid['GLP2026-078']}/documents", headers=auth_headers(client, "invivo_1"),
+                              files=[("files", pdfs[0])]).status_code == 403, "Teknisyen belge yükleyemez → 403")
+            up78 = client.post(f"/api/v1/samples/{sid['GLP2026-078']}/documents", headers=h_trm, files=[("files", p) for p in pdfs])
+            j78 = up78.json()
+            check(up78.status_code == 200 and j78["ok_count"] == 2 and j78["failed_count"] == 0,
+                  "TRM Kabul çekmeceden 2 PDF (TIIS + CoA) yükledi → Vision OCR ile okundu")
+            s78 = j78["sample"]
+            check(s78["lot_no"] == "LOT-2026-77" and s78["expiry_date"] == "2029-05-01" and s78["manufacture_date"] == "2026-05-02"
+                  and s78["storage_condition"] == "Oda Sicakligi (15-25 C)",
+                  "Lot / SKT / Üretim Tarihi / Saklama Koşulu PDF'ten SampleRecord'a yazıldı")
+            check(s78["extraction_polar_solvent"] == "%0.9 NaCl (Salin)" and s78["extraction_non_polar_solvent"] == "Susam Yagi"
+                  and s78["extraction_polar"] is True and s78["extraction_non_polar"] is True,
+                  "Polar / Apolar ekstraksiyon çözücüleri PDF'ten okunup kaydedildi")
+            check(s78["sponsor_name"] == "MERKEN" and s78["test_item_name"] == "MERKEN PLLA+HA",
+                  "Sponsor ve Test Maddesi Adı doldu ('(Numune bekleniyor)' yer tutucusu değiştirildi)")
+            check(db.query(Document).filter(Document.dossier_key == "GLP2026-078").count() == 2,
+                  "Belgeler çalışmanın klasörüne (dossier_key = study_code) kaydedildi")
+            check(len(client.get(f"/api/v1/samples/{sid['GLP2026-078']}/documents", headers=h_tfm).json()["documents"]) == 2,
+                  "GET /samples/{id}/documents klasördeki belgeleri listeledi")
+            bad_up = client.post(f"/api/v1/samples/{sid['GLP2026-078']}/documents", headers=h_trm,
+                                 files=[("files", ("virus.exe", b"MZ", "application/octet-stream"))])
+            check(bad_up.status_code == 200 and bad_up.json()["failed_count"] == 1, "Desteklenmeyen dosya türü satır bazında hata döner (diğer dosyalar etkilenmez)")
+
+            # Planlama: belgelerden dolan alanlar yeni çalışma kaydına aktarılır
+            pl78 = client.post(f"/api/v1/samples/{sid['GLP2026-078']}/plan", headers=h_tfm, json={})
+            study78 = db.query(Study).filter(Study.study_code == "GLP2026-078").first()
+            db.refresh(study78)
+            check(pl78.status_code == 200 and study78.test_item_batch == "LOT-2026-77" and study78.extraction_polar is True
+                  and study78.extraction_non_polar_solvent == "Susam Yagi",
+                  "Belgelerden dolan Lot ve çözücü bilgileri planlamada Study kaydına aktarıldı")
+
+            # Study zaten varken: farklı alanlar bildirilir, boşlar dolar, Study.dossier_metadata güncellenir, ortak numuneye yayılır
+            up72 = client.post(f"/api/v1/samples/{sid['GLP2026-072']}/documents", headers=h_trm, files=[("files", p) for p in pdfs])
+            j72 = up72.json()
+            check(up72.status_code == 200 and any(d["field"] == "lot_no" and d["current"] == "LOT-PLLA-001" for d in j72["differences"]),
+                  "Kayıtta dolu olan Lot, belgedekinden farklıysa ezilmeden 'fark' olarak bildirildi")
+            check(j72["sample"]["lot_no"] == "LOT-PLLA-001" and j72["sample"]["expiry_date"] == "2029-05-01",
+                  "Dolu alan korundu, boş SKT belgeden dolduruldu")
+            study72 = db.query(Study).filter(Study.study_code == "GLP2026-072").first()
+            db.refresh(study72)
+            check(study72.expiry_date == "2029-05-01" and study72.extraction_polar is True
+                  and (study72.dossier_metadata or {}).get("document_autofill", {}).get("fields", {}).get("expiry_date"),
+                  "Bağlı Study kaydı (alanlar + dossier_metadata.document_autofill) güncellendi")
+            check(sorted(j72["propagated_to"]) == ["GLP2026-073", "GLP2026-076"],
+                  "Aynı TI kodunu paylaşan 076 ve 073 çalışmalarının boş alanlarına yayıldı")
+            ow72 = client.post(f"/api/v1/samples/{sid['GLP2026-072']}/documents?overwrite=true", headers=h_trm, files=[("files", pdfs[0])])
+            check(ow72.status_code == 200 and ow72.json()["sample"]["lot_no"] == "LOT-2026-77", "overwrite=true ile Lot belgedeki değerle güncellendi")
+            db.refresh(study72)
+            check(study72.test_item_batch == "LOT-2026-77", "Study.test_item_batch de eşitlendi")
+            check("LOT-2026-77" in docx_text(study72.id), "Study Plan .docx belgesi yüklenen belgedeki Lot ile dolduruldu")
+
+            print("\n[15] FAZ 8.3: Study Status last version (2).xlsx Tam İçe Aktarım (88 GLP + 5 Non-GLP + 47 İş Akışı), 12 Şablon TAT/Hayvan Akıbeti ve Otomatik Takvimleme")
+            from app.services.templates import TEMPLATES as _TPLS
+            check(len(_TPLS) >= 12 and {"ISO_10993_11_PYRO", "ISO_10993_4_HEMO", "ISO_10993_11_SUBACUTE", "ISO_10993_11_SUBCHRONIC",
+                                        "ISO_10993_6_IMP_13W", "ISO_10993_6_IMP_26W", "PHYS_CHEM_MONO"}.issubset(set(_TPLS.keys())),
+                  "IN VIVO TEST SÜRELERİ & TEKRAR KULLANIM: 12 şablon eksiksiz tanımlı")
+            check(_TPLS["ISO_10993_23_IC"].tat_without_quarantine_days == 26 and _TPLS["ISO_10993_23_IC"].tat_with_quarantine_days == 33
+                  and _TPLS["ISO_10993_10_SENS"].max_animals == 30 and _TPLS["ISO_10993_6_IMP_26W"].tat_with_quarantine_days == 202,
+                  "TAT (karantinalı/karantinasız) ve maksimum hayvan sayıları Excel ile birebir uyumlu")
+            rc_res = client.get("/api/v1/room-capacities", headers=h_tfm).json()
+            check(rc_res.get("available_animals") == {"Guinea pig": 152, "Rabbit": 98, "Mouse": 20, "Rat": 19},
+                  "Tesiste mevcut hayvan stok bilgisi (Guinea pig: 152, Rabbit: 98, Mouse: 20, Rat: 19) doğrulandı")
+            xlsx_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "Study Status last version (2).xlsx"))
+            with open(xlsx_path, "rb") as _xf:
+                xlsx_bytes = _xf.read()
+            imp83 = client.post("/api/v1/samples/import-excel", headers=h_tfm,
+                                files={"file": ("Study Status last version (2).xlsx", xlsx_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
+            j83 = imp83.json()
+            check(imp83.status_code == 200 and j83["glp_count"] == 88 and j83["non_glp_count"] == 5 and j83["total_rows"] == 93 and j83["workflow_matched"] == 47,
+                  "Study Status last version (2).xlsx: 88 GLP + 5 Non-GLP = 93 çalışma ve 47 numune iş akışı içe aktarıldı")
+            s_all = client.get("/api/v1/samples", headers=h_tfm).json()
+            check(len(s_all["items"]) == 93 and s_all["summary"]["total"] == 93, "Numune & Çalışma Takip listesi 93 çalışmanın tamamını döndürdü")
+            glp_items = [i for i in s_all["items"] if i.get("glp_type") == "GLP"]
+            nglp_items = [i for i in s_all["items"] if i.get("glp_type") == "NON-GLP"]
+            from collections import Counter as _Cnt
+            glp_cnt = _Cnt(i["status"] for i in glp_items)
+            nglp_cnt = _Cnt(i["status"] for i in nglp_items)
+            check(glp_cnt["EXPECTED"] == 3 and glp_cnt["PLANNED"] == 14 and glp_cnt["ONGOING"] == 30 and glp_cnt["COMPLETED"] == 41,
+                  f"88 GLP durum dağılımı birebir: 3 Beklenen, 14 Planlanan, 30 Devam Eden, 41 Biten ({dict(glp_cnt)})")
+            check(nglp_cnt["PLANNED"] == 2 and nglp_cnt["ONGOING"] == 3,
+                  f"5 Non-GLP durum dağılımı birebir: 2 Planlanan, 3 Devam Eden ({dict(nglp_cnt)})")
+            yb = db.query(User).filter(User.username == "yigit.babaoglu").first()
+            yk = db.query(User).filter(User.username.in_(["yigit", "admin"])).first()
+            check(yb is not None and yb.is_active is False and yk is not None and yk.is_active is True,
+                  "Eski ÇY Yiğit Babaoğlu pasif (is_active=False) olarak korundu, aktif SYSADMIN hesabına dokunulmadı")
+            s030 = next(i for i in glp_items if i["study_code"] == "GLP2026-030")
+            s059 = next(i for i in glp_items if i["study_code"] == "GLP2026-059")
+            check(s030["scheduled"] and s030["dates"]["end"] and s059["scheduled"] and s059["status"] == "EXPECTED",
+                  "GLP2026-030 (6 ay implantasyon) ve GLP2026-059 (Beklenen) otomatik takvimlendi")
+            dl059 = client.get(f"/api/v1/samples/{s059['id']}/study-plan-docx", headers=h_exec)
+            check(dl059.status_code == 200 and dl059.content[:2] == b"PK",
+                  "Beklenen/Planlanan/Devam Eden tüm satırlarda Study Plan İndir (.docx) sorunsuz çalışıyor")
         finally:
             dp._llm_call = original_llm
     finally:

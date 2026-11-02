@@ -1,5 +1,16 @@
 from fastapi import APIRouter
-from app.api.v1.endpoints import auth, documents, health, personnel, studies, equipment, users
+from app.api.v1.endpoints import (
+    auth,
+    capacity,
+    documents,
+    equipment,
+    health,
+    personnel,
+    restrictions,
+    samples,
+    studies,
+    users,
+)
 
 api_router = APIRouter()
 
@@ -10,3 +21,6 @@ api_router.include_router(personnel.router)
 api_router.include_router(studies.router)
 api_router.include_router(equipment.router)
 api_router.include_router(documents.router)
+api_router.include_router(restrictions.router)
+api_router.include_router(capacity.router)
+api_router.include_router(samples.router)

@@ -43,11 +43,19 @@ export default function Login() {
 
   return (
     <div className="min-h-screen bg-slate-900 flex flex-col justify-center items-center p-4 text-slate-900">
-      <div className="w-full max-w-3xl grid grid-cols-1 md:grid-cols-2 bg-white rounded-xl shadow-2xl overflow-hidden border border-slate-800">
+      <div className="w-full max-w-3xl grid grid-cols-1 md:grid-cols-2 bg-white rounded-lg shadow-2xl overflow-hidden border border-slate-800">
         {/* Sol Kurumsal Panel */}
-        <div className="bg-gradient-to-br from-slate-900 via-slate-800 to-blue-950 text-white p-10 flex flex-col justify-center">
-          <div className="bg-blue-600/90 w-12 h-12 rounded-xl flex items-center justify-center shadow-lg mb-6">
-            <ShieldCheck className="w-7 h-7 text-white" />
+        <div className="bg-slate-900 text-white p-10 flex flex-col justify-center">
+          <div className="bg-white rounded-lg px-5 py-3 shadow-xs ring-1 ring-white/20 mb-8 self-start">
+            <img
+              src="/nanolab-logo.png"
+              alt="NanoLab Laboratuvarlar Grubu"
+              className="h-14 w-auto object-contain select-none"
+              draggable={false}
+            />
+          </div>
+          <div className="inline-flex items-center gap-1.5 self-start text-[11px] font-semibold uppercase tracking-wider text-blue-200 bg-blue-500/15 border border-blue-400/30 rounded-full px-2.5 py-1 mb-3">
+            <ShieldCheck className="w-3.5 h-3.5" /> GLP · Edirne Test Tesisi
           </div>
           <h1 className="text-3xl font-bold tracking-tight leading-snug text-white">
             Nanolab GLP Planlama Sistemi
@@ -124,7 +132,7 @@ export default function Login() {
               <button
                 type="submit"
                 disabled={submitting || !username.trim() || !password}
-                className="w-full flex items-center justify-center gap-2 bg-blue-700 hover:bg-blue-800 disabled:bg-blue-400 text-white text-sm font-semibold rounded-md py-2.5 shadow-sm transition"
+                className="w-full flex items-center justify-center gap-2 bg-slate-900 hover:bg-slate-800 disabled:bg-blue-400 text-white text-sm font-semibold rounded-md py-2.5 shadow-xs transition"
               >
                 {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <LogIn className="w-4 h-4" />}
                 {submitting ? 'Giriş Yapılıyor…' : 'Giriş Yap'}

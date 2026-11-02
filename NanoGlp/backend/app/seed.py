@@ -57,7 +57,45 @@ def seed_default_equipment(db: Session) -> Equipment:
         if changed:
             db.commit()
             db.refresh(eq)
+    seed_long_duration_equipment(db)
     return eq
+
+
+# FAZ 8.1: Yalnızca 24-72+ saatlik uzun süreli darboğaz cihazları kapasite denetimine alınır
+# (15 dakikalık kısa cihazlar dahil değildir). Eşzamanlı çalışma kapasiteleri Ayarlar ekranından düzenlenebilir.
+LONG_DURATION_EQUIPMENT = (
+    ("EQ-INC-001", "CO2 İnkübatörü", "Hücre Kültürü / İnkübasyon (24-72 saat)", 4,
+     "24-72 saatlik hücre maruziyeti; eşzamanlı çalışma kapasitesi Ayarlar'dan düzenlenebilir."),
+    ("EQ-OVN-001", "Etüv / İnkübatör", "Ekstraksiyon / İnkübasyon (24-72 saat)", 3,
+     "24-72 saatlik 37 °C ekstraksiyon/inkübasyon; eşzamanlı çalışma kapasitesi Ayarlar'dan düzenlenebilir."),
+)
+
+
+def seed_long_duration_equipment(db: Session) -> None:
+    """EQ-INC-001 (CO2 İnkübatörü) ve EQ-OVN-001 (Etüv/İnkübatör) kayıtlarını (yoksa) oluşturur."""
+    existing = {e.code: e for e in db.query(Equipment).filter(Equipment.code.in_([c[0] for c in LONG_DURATION_EQUIPMENT])).all()}
+    changed = False
+    for code, name, category, cap, notes in LONG_DURATION_EQUIPMENT:
+        row = existing.get(code)
+        if row is None:
+            db.add(
+                Equipment(
+                    name=name, code=code, category=category, status=EquipmentStatus.AVAILABLE,
+                    polar_capacity=1, non_polar_capacity=1, max_concurrent_studies=cap, notes=notes,
+                )
+            )
+            changed = True
+        elif row.max_concurrent_studies is None:
+            row.max_concurrent_studies = cap
+            changed = True
+    wb = db.query(Equipment).filter(Equipment.code == "EQ-WB-001").first()
+    if wb is not None and wb.max_concurrent_studies is None:
+        wb.max_concurrent_studies = (wb.polar_capacity or 3) + (wb.non_polar_capacity or 1)
+        changed = True
+    if changed:
+        db.commit()
+    from app.models.room_capacity import ensure_default_room_capacities
+    ensure_default_room_capacities(db)
 
 
 def reset_schema() -> None:

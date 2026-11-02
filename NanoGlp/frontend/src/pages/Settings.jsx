@@ -13,6 +13,8 @@ import {
 } from 'lucide-react';
 import { getCalibration, updateCalibration, extractError } from '../services/api';
 import { useAuth } from '../state/AuthContext';
+import RestrictionManager from '../components/RestrictionManager';
+import CapacitySettings from '../components/CapacitySettings';
 import { fmtDateTime, ROLE_SHORT, ROLE_LABEL } from '../utils/format';
 
 const MIN_REASON = 3;
@@ -199,9 +201,9 @@ export default function Settings() {
       )}
 
       {/* Oturum Açmış Yönetici + Gerekçe (JWT Doğrulamalı GLP Denetim İzi) */}
-      <section className="bg-white border border-slate-200 rounded-lg shadow-sm p-5">
+      <section className="bg-white border border-slate-200 rounded-lg shadow-xs p-5">
         <div className="flex items-center gap-2 mb-3">
-          <UserCheck className="w-4 h-4 text-blue-700" />
+          <UserCheck className="w-4 h-4 text-slate-500" />
           <h3 className="text-sm font-semibold text-slate-800">Elektronik İmza ve Değişiklik Gerekçesi (JWT & GLP AuditLog)</h3>
           <span
             className={`ml-auto text-[11px] font-medium px-2 py-0.5 rounded ${
@@ -239,10 +241,10 @@ export default function Settings() {
 
       <div className="grid grid-cols-1 xl:grid-cols-[1.6fr_1fr] gap-6 items-start">
         {/* 1) Görev Süreleri, Saatleri ve Biyolojik Toleranslar */}
-        <section className="bg-white border border-slate-200 rounded-lg shadow-sm overflow-hidden">
+        <section className="bg-white border border-slate-200 rounded-lg shadow-xs overflow-hidden">
           <div className="px-5 py-4 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-2">
-              <Timer className="w-4 h-4 text-blue-700" />
+              <Timer className="w-4 h-4 text-slate-500" />
               <div>
                 <h3 className="text-sm font-semibold text-slate-800">
                   Şablon Görev Süreleri ve Biyolojik Toleranslar
@@ -273,7 +275,7 @@ export default function Settings() {
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full text-xs">
-                <thead className="bg-slate-50 text-slate-600 border-b border-slate-200">
+                <thead className="text-xs uppercase tracking-wider bg-slate-50 text-slate-500 border-b border-slate-200">
                   <tr>
                     <th className="text-left px-4 py-2.5 font-semibold">Gün / Adım</th>
                     <th className="text-left px-3 py-2.5 font-semibold">Kategori</th>
@@ -349,7 +351,7 @@ export default function Settings() {
                             disabled={!canEdit || !isDirty || savingId === st.id}
                             onClick={() => handleSaveStep(st)}
                             title={!canEdit ? 'Önce değişiklik gerekçesi girin' : 'Veritabanına kaydet'}
-                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded text-xs font-semibold bg-blue-700 text-white hover:bg-blue-800 disabled:bg-slate-200 disabled:text-slate-400"
+                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded text-xs font-semibold bg-slate-900 text-white hover:bg-blue-800 disabled:bg-slate-200 disabled:text-slate-400"
                           >
                             {savingId === st.id ? (
                               <Loader2 className="w-3 h-3 animate-spin" />
@@ -369,9 +371,9 @@ export default function Settings() {
         </section>
 
         {/* 2) Çalkalamalı Su Banyosu 1 (EQ-WB-001) Polar / Apolar Kapasiteleri */}
-        <section className="bg-white border border-slate-200 rounded-lg shadow-sm p-5 space-y-4">
+        <section className="bg-white border border-slate-200 rounded-lg shadow-xs p-5 space-y-4">
           <div className="flex items-start gap-2.5">
-            <Boxes className="w-4 h-4 text-blue-700 mt-0.5 shrink-0" />
+            <Boxes className="w-4 h-4 text-slate-500 mt-0.5 shrink-0" />
             <div>
               <h3 className="text-sm font-semibold text-slate-800">
                 Çalkalamalı Su Banyosu 1 (EQ-WB-001) Kapasite Kalibrasyonu
@@ -437,7 +439,7 @@ export default function Settings() {
                   (Number(polarCap) === (waterBath?.polar_capacity ?? 3) &&
                     Number(apolarCap) === (waterBath?.non_polar_capacity ?? 1))
                 }
-                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-md text-xs font-semibold bg-blue-700 text-white hover:bg-blue-800 disabled:bg-slate-200 disabled:text-slate-400"
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-md text-xs font-semibold bg-slate-900 text-white hover:bg-blue-800 disabled:bg-slate-200 disabled:text-slate-400"
               >
                 {savingEq ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
                 Kapasiteleri Veritabanına Kaydet
@@ -447,10 +449,16 @@ export default function Settings() {
         </section>
       </div>
 
-      {/* 3) Gerçek Veritabanı AuditLog Geçmişi */}
-      <section className="bg-white border border-slate-200 rounded-lg shadow-sm">
+      {/* 3) FAZ 8.1 — Test Kısıtlama ve Uygunluk Takvimi */}
+      <RestrictionManager canEdit={Boolean(canWriteManagement && !isReadOnly)} />
+
+      {/* 4) FAZ 8.1 — Hayvan Odaları Kafes Kapasitesi (Dr. Anoop esneklik %) ve 24-72s darboğaz cihazlar */}
+      <CapacitySettings canEdit={Boolean(canWriteManagement && !isReadOnly)} />
+
+      {/* 5) Gerçek Veritabanı AuditLog Geçmişi */}
+      <section className="bg-white border border-slate-200 rounded-lg shadow-xs">
         <div className="px-5 py-4 border-b border-slate-200 flex items-center gap-2">
-          <History className="w-4 h-4 text-blue-700" />
+          <History className="w-4 h-4 text-slate-500" />
           <h3 className="text-sm font-semibold text-slate-800">
             Sistem Kalibrasyonu Değişiklik Geçmişi (Veritabanı AuditLog)
           </h3>

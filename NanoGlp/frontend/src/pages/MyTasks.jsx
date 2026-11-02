@@ -119,7 +119,7 @@ export default function MyTasks() {
 
       {/* Özet Kartları */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-        <div className="bg-white border border-slate-200 rounded-lg p-5 shadow-sm flex items-start justify-between">
+        <div className="bg-white border border-slate-200 rounded-lg p-5 shadow-xs flex items-start justify-between">
           <div>
             <p className="text-xs font-medium text-slate-500 uppercase tracking-wider">
               Seçilen Gün Görevleri ({targetDate})
@@ -129,13 +129,13 @@ export default function MyTasks() {
               Toplam {allAssignedTasks.length} atanmış çalışma adımı
             </p>
           </div>
-          <div className="p-2.5 rounded-lg bg-blue-50 text-blue-700">
+          <div className="text-slate-400">
             <ClipboardList className="w-5 h-5" />
           </div>
         </div>
 
         <div
-          className={`bg-white border rounded-lg p-5 shadow-sm ${
+          className={`bg-white border rounded-lg p-5 shadow-xs ${
             workload.exceeds_limit ? 'border-red-500 bg-red-50/40' : 'border-slate-200'
           }`}
         >
@@ -147,7 +147,7 @@ export default function MyTasks() {
                 <span className="text-xs font-normal text-slate-500">/ {fmtMinutes(limit)}</span>
               </p>
             </div>
-            <div className={`p-2.5 rounded-lg ${workload.exceeds_limit ? 'bg-red-100 text-red-700' : 'bg-slate-100 text-slate-700'}`}>
+            <div className={workload.exceeds_limit ? 'text-red-600' : 'text-slate-400'}>
               <Clock className="w-5 h-5" />
             </div>
           </div>
@@ -164,13 +164,13 @@ export default function MyTasks() {
           )}
         </div>
 
-        <div className="bg-white border border-slate-200 rounded-lg p-5 shadow-sm flex items-start justify-between">
+        <div className="bg-white border border-slate-200 rounded-lg p-5 shadow-xs flex items-start justify-between">
           <div>
             <p className="text-xs font-medium text-slate-500 uppercase tracking-wider">Biyolojik Kilitli Adımlar</p>
             <p className="text-2xl font-bold text-blue-800 mt-1">{lockedCount}</p>
             <p className="text-xs text-slate-500 mt-1">Tolerans dışına çıkılamaz, saat kaydırılamaz</p>
           </div>
-          <div className="p-2.5 rounded-lg bg-indigo-50 text-indigo-700">
+          <div className="text-slate-400">
             <Lock className="w-5 h-5" />
           </div>
         </div>
@@ -180,7 +180,7 @@ export default function MyTasks() {
       {scheduledDates.length > 0 && (
         <div className="bg-white border border-slate-200 rounded-lg px-4 py-3 flex flex-wrap items-center gap-2 text-xs">
           <span className="text-slate-500 font-medium flex items-center gap-1.5 mr-1">
-            <Calendar className="w-3.5 h-3.5 text-blue-700" />
+            <Calendar className="w-3.5 h-3.5 text-slate-500" />
             Görev bulunan tarihler:
           </span>
           {scheduledDates.map((d) => (
@@ -190,7 +190,7 @@ export default function MyTasks() {
               onClick={() => setTargetDate(d)}
               className={`px-2.5 py-1 rounded font-mono transition ${
                 d === targetDate
-                  ? 'bg-blue-700 text-white font-semibold'
+                  ? 'bg-slate-900 text-white font-semibold'
                   : 'bg-slate-100 hover:bg-slate-200 text-slate-700'
               }`}
             >
@@ -201,10 +201,10 @@ export default function MyTasks() {
       )}
 
       {/* Seçilen Günün Görevleri */}
-      <section className="bg-white border border-slate-200 rounded-lg shadow-sm">
+      <section className="bg-white border border-slate-200 rounded-lg shadow-xs">
         <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <ClipboardList className="w-4 h-4 text-blue-700" />
+            <ClipboardList className="w-4 h-4 text-slate-500" />
             <h3 className="text-sm font-semibold text-slate-800">
               {targetDate === todayISO() ? 'Bugünkü Görev Programım' : `${targetDate} Tarihli Görev Programım`}
             </h3>
@@ -267,7 +267,7 @@ export default function MyTasks() {
                           type="button"
                           disabled={busy}
                           onClick={() => handleStatusChange(task.id, 'IN_PROGRESS')}
-                          className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-md bg-blue-700 hover:bg-blue-800 text-white disabled:opacity-50"
+                          className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-md bg-slate-900 hover:bg-slate-800 text-white disabled:opacity-50"
                         >
                           <Play className="w-3.5 h-3.5" /> Başlat
                         </button>
@@ -292,10 +292,10 @@ export default function MyTasks() {
       </section>
 
       {/* Atanmış Tüm Çalışma Adımları */}
-      <section className="bg-white border border-slate-200 rounded-lg shadow-sm">
+      <section className="bg-white border border-slate-200 rounded-lg shadow-xs">
         <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <FlaskConical className="w-4 h-4 text-blue-700" />
+            <FlaskConical className="w-4 h-4 text-slate-500" />
             <h3 className="text-sm font-semibold text-slate-800">Atandığım Tüm Çalışma Adımları (Takvim Özeti)</h3>
           </div>
           <span className="text-xs text-slate-500">{allAssignedTasks.length} adım</span>
@@ -308,14 +308,14 @@ export default function MyTasks() {
         ) : (
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
-              <thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-500">
+              <thead className="bg-slate-50 text-xs uppercase tracking-wider text-slate-500">
                 <tr>
-                  <th className="text-left px-5 py-3 font-medium">Tarih / Saat</th>
-                  <th className="text-left px-5 py-3 font-medium">Çalışma</th>
-                  <th className="text-left px-5 py-3 font-medium">Gün / Adım</th>
-                  <th className="text-left px-5 py-3 font-medium">Süre & Kilit</th>
-                  <th className="text-left px-5 py-3 font-medium">Durum</th>
-                  {!isReadOnly && <th className="text-right px-5 py-3 font-medium">İşlem</th>}
+                  <th className="text-left px-5 py-3 font-semibold">Tarih / Saat</th>
+                  <th className="text-left px-5 py-3 font-semibold">Çalışma</th>
+                  <th className="text-left px-5 py-3 font-semibold">Gün / Adım</th>
+                  <th className="text-left px-5 py-3 font-semibold">Süre & Kilit</th>
+                  <th className="text-left px-5 py-3 font-semibold">Durum</th>
+                  {!isReadOnly && <th className="text-right px-5 py-3 font-semibold">İşlem</th>}
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">

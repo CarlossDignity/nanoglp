@@ -14,7 +14,6 @@ import {
   Eye,
   ChevronDown,
   ChevronRight,
-  RefreshCw,
   Hash,
   Layers,
   FlaskConical,
@@ -32,7 +31,6 @@ import {
   getDossiers,
   getDossier,
   reparseDocument,
-  reparseAllDocuments,
   deleteDocument,
   extractError,
 } from '../services/api';
@@ -128,23 +126,25 @@ export default function Upload() {
   const [dragging, setDragging] = useState(false);
   const [rejected, setRejected] = useState([]);
   const [loadingHistory, setLoadingHistory] = useState(true);
-  const [reparsingAll, setReparsingAll] = useState(false);
   const [reparsingIds, setReparsingIds] = useState({});
   const [historyError, setHistoryError] = useState(null);
   const [openTech, setOpenTech] = useState({});
+  // FAZ 7.1: Detaylı belge verileri ve kaynak PDF listesi varsayılan olarak kapalı akordeon içinde
+  const [showDossierDetails, setShowDossierDetails] = useState(false);
   const dragDepth = useRef(0);
   const inputRef = useRef(null);
 
   const patch = (key, p) => setItems((prev) => prev.map((it) => (it.key === key ? { ...it, ...p } : it)));
 
-  const loadAll = useCallback(async (targetKey = activeDossierKey) => {
+  const loadAll = useCallback(async (targetKey) => {
+    const resolvedKey = typeof targetKey === 'string' && targetKey ? targetKey : activeDossierKey;
     setLoadingHistory(true);
     setHistoryError(null);
     try {
       const [pkgsRes, docsRes, dossierRes] = await Promise.all([
         getDossiers(),
-        getDocuments({ limit: 100, dossier_key: targetKey }),
-        getDossier(targetKey),
+        getDocuments({ limit: 100, dossier_key: resolvedKey }),
+        getDossier(resolvedKey),
       ]);
       const serverPkgs = pkgsRes.data?.dossiers || [];
       setDossierPackages((prev) => {
@@ -266,37 +266,6 @@ export default function Upload() {
     }
   };
 
-  const handleReparseAll = async () => {
-    if (!canUpload) return;
-    setReparsingAll(true);
-    setHistoryError(null);
-    try {
-      const res = await reparseAllDocuments({ only_unparsed_vision: false });
-      const { documents: updatedDocs, dossier: updatedDossier } = res.data;
-      setItems(
-        (updatedDocs || []).map((doc) => ({
-          key: `doc-${doc.id}`,
-          name: doc.original_filename,
-          size: doc.size_bytes,
-          status: doc.status,
-          progress: 100,
-          doc,
-          error: doc.error_message,
-        }))
-      );
-      if (updatedDossier) {
-        setDossier(updatedDossier);
-        setSelectedStudyCode(
-          (curr) => curr || updatedDossier.default_study_code || updatedDossier.study_codes?.[0] || ''
-        );
-      }
-    } catch (err) {
-      setHistoryError(extractError(err, 'Toplu Vision OCR analizi sırasında hata oluştu.'));
-    } finally {
-      setReparsingAll(false);
-    }
-  };
-
   const handleDeleteDoc = async (doc) => {
     if (!canUpload || !doc?.id) return;
     if (!window.confirm(`"${doc.original_filename}" belgesini çalışma dosyasından kaldırmak istiyor musunuz?`)) return;
@@ -410,40 +379,82 @@ export default function Upload() {
     dossier &&
     (dossier.study_codes?.length > 0 || Object.values(f).some((item) => item && item.value !== null));
 
+  const docCount = dossier?.total_documents ?? items.length;
+  const studyCodeCount = dossier?.study_codes?.length ?? 0;
+  const glpWarningCount =
+    (dossier?.sd_resolution?.requires_handover ? 1 : 0) +
+    (dossier?.cross_checks?.filter((c) => c.status !== 'MATCH').length || 0);
+
+  // Sıradaki boş GLP çalışma kodunu hesapla (örn. GLP2026-024/026/031/034 -> GLP2026-035)
+  const nextSuggestedGlpCode = (() => {
+    const codes = [
+      ...(dossier?.study_codes || []),
+      ...dossierPackages.flatMap((p) => (p.dossier_label || '').match(/\d{3}/g) || []),
+    ];
+    let maxSeq = 34;
+    codes.forEach((raw) => {
+      const m = String(raw).match(/(?:GLP\d{4}-)?(\d{2,4})$/i);
+      if (m) {
+        const n = parseInt(m[1], 10);
+        if (!Number.isNaN(n) && n < 900 && n > maxSeq) maxSeq = n;
+      }
+    });
+    return `GLP2026-${String(maxSeq + 1).padStart(3, '0')}`;
+  })();
+
   return (
-    <div className="space-y-6">
-      <div className="flex flex-wrap items-end justify-between gap-4">
+    <div className="space-y-6" {...dropHandlers}>
+      {/* Gizli dosya seçici: hem üst bardaki buton hem de sürükle-bırak alanı tarafından tetiklenir */}
+      <input
+        ref={inputRef}
+        type="file"
+        multiple
+        disabled={!canUpload}
+        accept=".pdf,.xlsx,.png,.jpg,.jpeg,.txt,.csv"
+        className="hidden"
+        onChange={(e) => {
+          handleFiles(e.target.files);
+          e.target.value = '';
+        }}
+      />
+
+      {/* FAZ 7.1 — Üst Başlık ve Doğrudan "+ Yeni Müşteri Belgeleri Yükle (PDF Seç / Sürükle-Bırak)" Alanı */}
+      <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
           <h2 className="text-xl font-semibold text-slate-900">
             Belge Yükleme ve Çoklu Belge Dosya Birleştirme (Vision OCR)
           </h2>
           <p className="text-sm text-slate-500">
             Sözleşme, TIIS, CoA, Hayvan Menşei Sertifikası ve FM.083 belgelerini yükleyin; GPT-4o Vision tüm sayfaları,
-            tabloları ve işaretli kutucukları (<span className="font-mono">[X]</span>) okuyarak tek bir Çalışma
-            Dosyasında birleştirir.
+            tabloları ve işaretli kutucukları (<span className="font-mono">[X]</span>) okuyarak aktif müşteri klasöründe
+            birleştirir.
           </p>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2">
-          {canUpload && items.length > 0 && (
-            <button
-              type="button"
-              disabled={reparsingAll || busyCount > 0}
-              onClick={handleReparseAll}
-              className="inline-flex items-center gap-1.5 text-xs font-semibold text-blue-700 border border-blue-300 bg-blue-50 hover:bg-blue-100 disabled:opacity-50 rounded-md px-3 py-2 transition"
-            >
-              {reparsingAll ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ScanEye className="w-3.5 h-3.5" />}
-              {reparsingAll ? 'Tüm Belgeler Vision ile Okunuyor…' : 'Tüm Belgeleri Vision ile Yeniden Analiz Et'}
-            </button>
-          )}
+        {canUpload && (
           <button
             type="button"
-            onClick={loadAll}
-            className="flex items-center gap-1.5 text-xs font-medium text-slate-600 border border-slate-300 bg-white rounded-md px-3 py-2 hover:bg-slate-50"
+            disabled={busyCount > 0}
+            onClick={() => inputRef.current?.click()}
+            className={`inline-flex items-center gap-2 text-xs font-medium rounded px-3.5 py-2 border transition ${
+              dragging
+                ? 'border-slate-900 bg-slate-100 text-slate-900'
+                : 'border-slate-900 bg-slate-900 hover:bg-slate-800 text-white'
+            }`}
           >
-            <RefreshCw className={`w-3.5 h-3.5 ${loadingHistory ? 'animate-spin' : ''}`} /> Yenile
+            {busyCount > 0 ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin" />
+                <span>{busyCount} Belge Vision OCR ile Analiz Ediliyor…</span>
+              </>
+            ) : (
+              <>
+                <UploadCloud className="w-4 h-4" />
+                <span>+ Yeni Müşteri Belgeleri Yükle (PDF Seç / Sürükle-Bırak)</span>
+              </>
+            )}
           </button>
-        </div>
+        )}
       </div>
 
       {isReadOnly && (
@@ -456,27 +467,42 @@ export default function Upload() {
         </div>
       )}
 
-      {/* FAZ 6.2 — ÇALIŞMA PAKETİ (DOSSIER) İZOLASYONU SEÇİCİSİ */}
-      <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-sm space-y-3">
+      {rejected.length > 0 && (
+        <div className="rounded-md border border-red-200 bg-red-50 px-4 py-3 text-xs text-red-800 flex items-start gap-2">
+          <AlertTriangle className="w-4 h-4 shrink-0 mt-px" />
+          <ul className="flex-1 space-y-0.5">
+            {rejected.map((r) => (
+              <li key={r}>{r}</li>
+            ))}
+          </ul>
+          <button onClick={() => setRejected([])} aria-label="Kapat" className="text-red-600 hover:text-red-800">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
+      {historyError && (
+        <div className="p-3 rounded-md bg-red-50 border border-red-200 text-sm text-red-700">{historyError}</div>
+      )}
+
+      {/* FAZ 7.1 — MÜŞTERİ / BAŞVURU KLASÖRÜ SEÇİMİ */}
+      <div className="bg-white border border-slate-200 rounded-lg p-4 shadow-xs space-y-3">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-2.5">
-            <div className="p-2 rounded-lg bg-indigo-50 text-indigo-700 border border-indigo-200">
-              <FolderKanban className="w-5 h-5" />
-            </div>
+            <FolderKanban className="w-4 h-4 text-slate-500" />
             <div>
-              <p className="text-xs font-bold uppercase tracking-wider text-slate-700">
-                Aktif Çalışma Paketi (Dossier) İzolasyonu
+              <p className="text-xs font-bold uppercase tracking-wider text-slate-800">
+                MÜŞTERİ / BAŞVURU KLASÖRÜ SEÇİMİ
               </p>
               <p className="text-xs text-slate-500">
-                Farklı firmaların ve çalışmaların PDF belgelerinin birbirine karışmaması için aktif çalışma paketini seçin
-                veya yeni paket oluşturun.
+                Her firmanın başvuru belgeleri kendi klasöründe ayrı tutulur; seçtiğiniz klasördeki PDF'ler otomatik birleştirilir.
               </p>
             </div>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
             <select
-              aria-label="Aktif Çalışma Paketi Seç"
+              aria-label="Müşteri / Başvuru Klasörü Seç"
               value={activeDossierKey}
               onChange={(e) => {
                 const key = e.target.value;
@@ -501,7 +527,7 @@ export default function Upload() {
                 className="inline-flex items-center gap-1.5 text-xs font-semibold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 rounded-lg px-3 py-2 transition"
               >
                 <Plus className="w-3.5 h-3.5" />
-                <span>Yeni Paket Oluştur</span>
+                <span>Yeni Müşteri Klasörü Aç</span>
               </button>
             )}
           </div>
@@ -514,7 +540,7 @@ export default function Upload() {
           >
             <div>
               <label className="block text-[11px] font-semibold text-slate-700 mb-1">
-                Yeni Paket Kodu (Örn: DOSSIER-MEDTECH-2026) *
+                Yeni Müşteri Klasörü Kodu (Örn: DOSSIER-MEDTECH-2026) *
               </label>
               <input
                 type="text"
@@ -527,7 +553,7 @@ export default function Upload() {
             </div>
             <div>
               <label className="block text-[11px] font-semibold text-slate-700 mb-1">
-                Paket Açıklaması / Sponsor Adı
+                Firma / Başvuru Klasörü Açıklaması
               </label>
               <input
                 type="text"
@@ -540,9 +566,9 @@ export default function Upload() {
             <div className="flex items-center gap-2">
               <button
                 type="submit"
-                className="bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold rounded-md px-4 py-2"
+                className="bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold rounded-md px-4 py-2"
               >
-                Paketi Oluştur ve Seç
+                Klasörü Aç ve Seç
               </button>
               <button
                 type="button"
@@ -560,20 +586,32 @@ export default function Upload() {
       {/* BİRLEŞTİRİLMİŞ ÇALIŞMA DOSYASI ÖZETİ (MASTER STUDY PROFILE)           */}
       {/* ===================================================================== */}
       {hasAnyDossierData && (
-        <section className="bg-white border-2 border-blue-600 rounded-xl shadow-md overflow-hidden">
-          <div className="bg-gradient-to-r from-slate-900 via-blue-950 to-slate-900 text-white px-6 py-4 flex flex-wrap items-center justify-between gap-4">
-            <div className="flex items-center gap-3">
-              <div className="p-2 rounded-lg bg-blue-600/90 text-white">
-                <Layers className="w-5 h-5" />
-              </div>
-              <div>
-                <h3 className="text-base font-bold tracking-wide">
-                  Birleştirilmiş Çalışma Dosyası Özeti (Master Study Profile)
-                </h3>
-                <p className="text-xs text-blue-200">
-                  {dossier.total_documents} belgeden otomatik birleştirildi · Her verinin altında kaynak PDF rozeti
-                  gösterilmektedir
-                </p>
+        <section className="bg-white border border-slate-200 rounded-lg shadow-xs overflow-hidden">
+          <div className="border-b border-slate-200 bg-slate-50/70 text-slate-900 px-6 py-4 flex flex-wrap items-center justify-between gap-4">
+            <div className="space-y-1.5">
+              <h3 className="text-sm font-semibold text-slate-900">
+                Birleştirilmiş Çalışma Dosyası Özeti (Master Study Profile)
+              </h3>
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-white border border-slate-200 text-slate-700 font-medium">
+                  {docCount} PDF Okundu
+                </span>
+                <span className="text-slate-300">•</span>
+                <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-white border border-slate-200 text-slate-700 font-medium">
+                  {studyCodeCount} Çalışma Kodu Tespit Edildi
+                </span>
+                <span className="text-slate-300">•</span>
+                <span
+                  className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full font-semibold border ${
+                    glpWarningCount > 0
+                      ? 'bg-amber-50 border-amber-300 text-amber-800'
+                      : 'bg-emerald-50 border-emerald-300 text-emerald-800'
+                  }`}
+                >
+                  {glpWarningCount > 0
+                    ? `${glpWarningCount} GLP Denetim Uyarısı`
+                    : '0 GLP Denetim Uyarısı'}
+                </span>
               </div>
             </div>
 
@@ -581,7 +619,7 @@ export default function Upload() {
               <button
                 type="button"
                 onClick={goToPlanningFromDossier}
-                className="inline-flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-bold rounded-lg px-5 py-2.5 shadow transition"
+                className="inline-flex items-center gap-2 bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium rounded px-3.5 py-2 transition"
               >
                 <CalendarPlus className="w-4 h-4" />
                 Bu Verilerle Çalışma ve Plan Oluştur
@@ -590,19 +628,50 @@ export default function Upload() {
           </div>
 
           <div className="p-6 space-y-5">
-            {/* Çoklu Çalışma Kodu Seçici */}
-            <div className="rounded-lg border border-blue-200 bg-blue-50/60 p-4 flex flex-wrap items-center justify-between gap-4">
-              <div className="space-y-1">
-                <p className="text-xs font-bold text-blue-950 uppercase tracking-wider">
-                  Planlanacak Çalışma Kodu Seçimi
-                </p>
-                <p className="text-xs text-slate-600">
-                  {dossier.study_codes?.length > 1
-                    ? `Sözleşme / dosya içinde ${dossier.study_codes.length} farklı çalışma kodu tespit edildi. Planlamak istediğiniz kodu seçin:`
-                    : dossier.study_codes?.length === 1
-                    ? 'Dosyada tespit edilen çalışma kodu:'
-                    : 'Belgelerde henüz çalışma kodu tespit edilmedi (Planlama ekranında elle girebilirsiniz).'}
-                </p>
+            {/* 1) HER ZAMAN AÇIK: Çoklu Çalışma Kodu Seçici + Manuel Düzenleme / Otomatik Sıradaki Kodu Ata */}
+            <div className="rounded-lg border border-blue-200 bg-blue-50/60 p-4 space-y-3">
+              <div className="flex flex-wrap items-start justify-between gap-4">
+                <div className="space-y-1">
+                  <p className="text-xs font-bold text-blue-950 uppercase tracking-wider">
+                    PLANLANACAK ÇALIŞMA KODU SEÇİMİ
+                  </p>
+                  <p className="text-xs text-slate-600">
+                    {dossier.study_codes?.length > 1
+                      ? `Sözleşme / dosya içinde ${dossier.study_codes.length} farklı çalışma kodu tespit edildi. Planlamak istediğiniz kodu seçin veya sağdan özelleştirin:`
+                      : dossier.study_codes?.length === 1
+                      ? 'Dosyada tespit edilen çalışma kodu:'
+                      : 'Belgelerde henüz resmi çalışma kodu tespit edilmedi; aşağıdan elle girebilir veya sıradaki GLP kodunu atayabilirsiniz.'}
+                  </p>
+                </div>
+
+                {/* Çalışma Kodunu Düzenle / Otomatik Sıradaki Kodu Ata */}
+                {canUpload && (
+                  <div className="flex flex-wrap items-center gap-2 bg-white/90 border border-blue-200 rounded-lg px-2.5 py-1.5 shadow-xs">
+                    <label
+                      htmlFor="custom-study-code-input"
+                      className="text-[11px] font-semibold text-slate-600 whitespace-nowrap"
+                    >
+                      Aktif Kod:
+                    </label>
+                    <input
+                      id="custom-study-code-input"
+                      type="text"
+                      value={selectedStudyCode}
+                      onChange={(e) => setSelectedStudyCode(e.target.value.toUpperCase())}
+                      placeholder="GLP2026-XXX"
+                      className="w-32 border border-slate-300 rounded px-2 py-1 text-xs font-mono font-bold text-blue-900 bg-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setSelectedStudyCode(nextSuggestedGlpCode)}
+                      title={`Sıradaki boş GLP çalışma kodunu (${nextSuggestedGlpCode}) otomatik ata`}
+                      className="inline-flex items-center gap-1 text-[11px] font-semibold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 rounded px-2.5 py-1 transition whitespace-nowrap"
+                    >
+                      <Sparkles className="w-3 h-3" />
+                      <span>Otomatik Sıradaki Kodu Ata ({nextSuggestedGlpCode})</span>
+                    </button>
+                  </div>
+                )}
               </div>
 
               {dossier.study_codes?.length > 0 && (
@@ -617,7 +686,7 @@ export default function Upload() {
                         onClick={() => setSelectedStudyCode(code)}
                         className={`px-3 py-1.5 rounded-md font-mono text-xs font-bold border transition flex items-center gap-1.5 ${
                           active
-                            ? 'bg-blue-700 text-white border-blue-700 shadow-sm'
+                            ? 'bg-slate-900 text-white border-blue-700 shadow-xs'
                             : 'bg-white text-slate-700 border-slate-300 hover:border-blue-400'
                         }`}
                       >
@@ -638,7 +707,7 @@ export default function Upload() {
               )}
             </div>
 
-            {/* FAZ 6.2: Çalışma Direktörü (SD) Eşleştirme ve Devir Kutusu */}
+            {/* 2) HER ZAMAN AÇIK: Çalışma Direktörü (SD) Eşleştirme ve Devir Kutusu */}
             {dossier.sd_resolution && (
               <div
                 className={`rounded-lg border px-4 py-3.5 text-xs flex flex-wrap items-center justify-between gap-4 ${
@@ -683,7 +752,7 @@ export default function Upload() {
               </div>
             )}
 
-            {/* Çift Kaynak Kontrolü: Hayvan Menşei Sertifikası <-> FM.083 */}
+            {/* 3) HER ZAMAN AÇIK: GLP Çapraz Kontroller (Hayvan Menşei <-> FM.083 & TIIS <-> Sözleşme) */}
             {dossier.cross_checks?.length > 0 && (
               <div className="space-y-2">
                 {dossier.cross_checks.map((cc) => {
@@ -717,363 +786,333 @@ export default function Upload() {
               </div>
             )}
 
-            {/* Grup 1: Sponsor ve Çalışma Protokol Bilgileri */}
-            <div className="space-y-2">
-              <h4 className="text-xs font-bold uppercase tracking-wider text-slate-500 flex items-center gap-1.5">
-                <Building2 className="w-3.5 h-3.5 text-blue-700" />
-                1. Sponsor, Sözleşme ve Çalışma Bilgileri
-              </h4>
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-                <MergedFieldCard item={f.sponsor_name} />
-                <MergedFieldCard item={f.sponsor_contact} />
-                <MergedFieldCard item={f.test_type} />
-                <MergedFieldCard item={f.guideline} />
-                <MergedFieldCard item={f.study_director} />
-                <MergedFieldCard item={f.requested_start_period} />
-              </div>
+            {/* FAZ 7.1 — AKORDEON BUTONU (Varsayılan Kapalı) */}
+            <div className="pt-1 border-t border-slate-200">
+              <button
+                type="button"
+                onClick={() => setShowDossierDetails((v) => !v)}
+                className="w-full flex items-center justify-between px-4 py-3 rounded-lg bg-slate-100 hover:bg-slate-200/80 border border-slate-300 text-xs font-bold text-slate-800 transition"
+              >
+                <span className="flex items-center gap-2">
+                  <FileText className="w-4 h-4 text-slate-500" />
+                  <span>
+                    Birleştirilen Belge Verilerini ve Kaynak PDF Detaylarını {showDossierDetails ? 'Gizle' : 'Göster'} ({docCount} Belge){' '}
+                    {showDossierDetails ? '▴' : '▾'}
+                  </span>
+                </span>
+                <span className="text-[11px] font-medium text-blue-700">
+                  {showDossierDetails ? 'Daraltmak için tıklayın' : 'Sponsor, TIIS/CoA, Hayvan & 15 PDF listesini aç'}
+                </span>
+              </button>
             </div>
 
-            {/* Grup 2: Test Maddesi (TIIS) ve Analiz Sertifikası (CoA) & Ekstraksiyon */}
-            <div className="space-y-2">
-              <h4 className="text-xs font-bold uppercase tracking-wider text-slate-500 flex items-center gap-1.5">
-                <FlaskConical className="w-3.5 h-3.5 text-blue-700" />
-                2. Test Maddesi (TIIS / CoA) ve Ekstraksiyon Parametreleri
-              </h4>
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
-                <MergedFieldCard item={f.test_item_name} />
-                <MergedFieldCard item={f.lot_batch_no} />
-                <MergedFieldCard item={f.manufacture_date} />
-                <MergedFieldCard item={f.expiry_date} />
-                <MergedFieldCard item={f.storage_conditions} />
-                <MergedFieldCard item={f.physical_state} />
-                <MergedFieldCard item={f.sterility} />
-                <MergedFieldCard
-                  item={f.extraction_polar}
-                  extraText={f.extraction_polar_solvent?.value}
-                />
-                <MergedFieldCard
-                  item={f.extraction_non_polar}
-                  extraText={f.extraction_non_polar_solvent?.value}
-                />
-                <MergedFieldCard item={f.extraction_polar_solvent} />
-                <MergedFieldCard item={f.extraction_non_polar_solvent} />
-                <MergedFieldCard item={f.extraction_ratio} />
-                <MergedFieldCard item={f.extraction_conditions} />
-              </div>
-            </div>
+            {showDossierDetails && (
+              <div className="space-y-6 pt-3">
+                {/* Grup 1: Sponsor ve Çalışma Protokol Bilgileri */}
+                <div className="space-y-2">
+                  <h4 className="text-xs font-bold uppercase tracking-wider text-slate-500 flex items-center gap-1.5">
+                    <Building2 className="w-3.5 h-3.5 text-slate-500" />
+                    1. Sponsor, Sözleşme ve Çalışma Bilgileri
+                  </h4>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                    <MergedFieldCard item={f.sponsor_name} />
+                    <MergedFieldCard item={f.sponsor_contact} />
+                    <MergedFieldCard item={f.test_type} />
+                    <MergedFieldCard item={f.guideline} />
+                    <MergedFieldCard item={f.study_director} />
+                    <MergedFieldCard item={f.requested_start_period} />
+                  </div>
+                </div>
 
-            {/* Grup 3: Hayvan Menşei ve FM.083 Aklimatizasyon */}
-            <div className="space-y-2">
-              <h4 className="text-xs font-bold uppercase tracking-wider text-slate-500 flex items-center gap-1.5">
-                <ShieldCheck className="w-3.5 h-3.5 text-blue-700" />
-                3. Test Sistemi (Hayvan Menşei & FM.083 Aklimatizasyon)
-              </h4>
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
-                <MergedFieldCard item={f.animal_species_strain} />
-                <MergedFieldCard item={f.animal_count} />
-                <MergedFieldCard item={f.animal_birth_date} />
-                <MergedFieldCard item={f.acclimatization_start_date} />
+                {/* Grup 2: Test Maddesi (TIIS) ve Analiz Sertifikası (CoA) & Ekstraksiyon */}
+                <div className="space-y-2">
+                  <h4 className="text-xs font-bold uppercase tracking-wider text-slate-500 flex items-center gap-1.5">
+                    <FlaskConical className="w-3.5 h-3.5 text-slate-500" />
+                    2. Test Maddesi (TIIS / CoA) ve Ekstraksiyon Parametreleri
+                  </h4>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                    <MergedFieldCard item={f.test_item_name} />
+                    <MergedFieldCard item={f.lot_batch_no} />
+                    <MergedFieldCard item={f.manufacture_date} />
+                    <MergedFieldCard item={f.expiry_date} />
+                    <MergedFieldCard item={f.storage_conditions} />
+                    <MergedFieldCard item={f.physical_state} />
+                    <MergedFieldCard item={f.sterility} />
+                    <MergedFieldCard
+                      item={f.extraction_polar}
+                      extraText={f.extraction_polar_solvent?.value}
+                    />
+                    <MergedFieldCard
+                      item={f.extraction_non_polar}
+                      extraText={f.extraction_non_polar_solvent?.value}
+                    />
+                    <MergedFieldCard item={f.extraction_polar_solvent} />
+                    <MergedFieldCard item={f.extraction_non_polar_solvent} />
+                    <MergedFieldCard item={f.extraction_ratio} />
+                    <MergedFieldCard item={f.extraction_conditions} />
+                  </div>
+                </div>
+
+                {/* Grup 3: Hayvan Menşei ve FM.083 Aklimatizasyon */}
+                <div className="space-y-2">
+                  <h4 className="text-xs font-bold uppercase tracking-wider text-slate-500 flex items-center gap-1.5">
+                    <ShieldCheck className="w-3.5 h-3.5 text-slate-500" />
+                    3. Test Sistemi (Hayvan Menşei & FM.083 Aklimatizasyon)
+                  </h4>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                    <MergedFieldCard item={f.animal_species_strain} />
+                    <MergedFieldCard item={f.animal_count} />
+                    <MergedFieldCard item={f.animal_birth_date} />
+                    <MergedFieldCard item={f.acclimatization_start_date} />
+                  </div>
+                </div>
+
+                {/* Tekil Belge Kartları */}
+                <div className="space-y-3 pt-3 border-t border-slate-200">
+                  <div className="flex items-center justify-between">
+                    <h4 className="text-xs font-bold uppercase tracking-wider text-slate-600">
+                      Yüklenen Dosya Belgeleri ({items.length})
+                    </h4>
+                  </div>
+
+                  {items.map((it) => {
+                    const doc = it.doc;
+                    const d = doc?.extracted_data;
+                    const populated = d?.populated_fields || [];
+                    const cat = doc?.doc_category || d?.doc_category || 'OTHER';
+                    const catLabel = doc?.doc_category_label || d?.doc_category_label || 'GLP Belgesi';
+                    const isReparsing = Boolean(doc?.id && reparsingIds[doc.id]);
+                    const effectiveStatus = isReparsing
+                      ? 'ANALYZING'
+                      : it.status === 'FAILED'
+                      ? 'FAILED'
+                      : populated.length > 0 || cat === 'OTHER'
+                      ? 'PARSED'
+                      : it.status;
+                    const S = STATUS[effectiveStatus] || STATUS.PARSED;
+                    const FileIcon = extOf(it.name) === 'pdf' ? FileText : FileSpreadsheet;
+                    const techOpen = openTech[it.key];
+
+                    return (
+                      <article
+                        key={it.key}
+                        className={`bg-white border rounded-lg shadow-xs overflow-hidden ${
+                          effectiveStatus === 'FAILED' ? 'border-red-300' : 'border-slate-200'
+                        }`}
+                      >
+                        <div className="px-5 py-3.5 flex flex-wrap items-center gap-3 border-b border-slate-100 bg-slate-50/50">
+                          <div
+                            className={`shrink-0 ${
+                              'text-slate-500'
+                            }`}
+                          >
+                            <FileIcon className="w-4 h-4" />
+                          </div>
+
+                          <div className="min-w-0 flex-1 space-y-1">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <p className="text-sm font-semibold text-slate-900 truncate" title={it.name}>
+                                {it.name}
+                              </p>
+                              {d && (
+                                <span
+                                  className={`text-[11px] font-semibold px-2.5 py-0.5 rounded border ${
+                                    CATEGORY_STYLE[cat] || CATEGORY_STYLE.OTHER
+                                  }`}
+                                >
+                                  Belge Türü: {catLabel}
+                                </span>
+                              )}
+                            </div>
+
+                            <p className="text-xs text-slate-600">
+                              {d?.doc_summary ? <span>{d.doc_summary}</span> : <span>{fmtSize(it.size)}</span>}
+                              {populated.length > 0 && (
+                                <span className="text-emerald-700 font-medium">
+                                  {' · '}Çıkarılan Alanlar ({populated.length}):{' '}
+                                  {populated.map((pf) => pf.label).join(', ')}
+                                </span>
+                              )}
+                            </p>
+                          </div>
+
+                          <div className="flex items-center gap-2">
+                            <span
+                              className={`inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded border ${S.cls}`}
+                            >
+                              <S.Icon className={`w-3 h-3 ${S.spin ? 'animate-spin' : ''}`} />
+                              {S.label}
+                            </span>
+
+                            {canUpload && doc?.id && (
+                              <button
+                                type="button"
+                                disabled={isReparsing}
+                                onClick={() => handleReparseSingle(doc)}
+                                title="Bu PDF'i PyMuPDF + GPT-4o Vision ile yeniden analiz et"
+                                className="inline-flex items-center gap-1 text-xs font-medium text-blue-700 hover:text-blue-900 border border-blue-200 bg-blue-50/70 hover:bg-blue-100 rounded px-2.5 py-1 disabled:opacity-40 transition"
+                              >
+                                <ScanEye className="w-3.5 h-3.5" />
+                                <span>Yeniden Analiz Et</span>
+                              </button>
+                            )}
+
+                            {canUpload && doc?.id && (
+                              <button
+                                type="button"
+                                onClick={() => handleDeleteDoc(doc)}
+                                title="Belgeyi dosyadan kaldır"
+                                className="p-1.5 rounded text-slate-400 hover:text-red-700 hover:bg-red-50 transition"
+                              >
+                                <Trash2 className="w-4 h-4" />
+                              </button>
+                            )}
+                          </div>
+                        </div>
+
+                        {(it.status === 'UPLOADING' || it.status === 'ANALYZING' || isReparsing) && (
+                          <div className="px-5 py-3 bg-blue-50/40">
+                            <div className="h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                              <div
+                                className="h-full bg-blue-600 animate-pulse transition-all"
+                                style={{ width: `${it.status === 'UPLOADING' ? it.progress : 100}%` }}
+                              />
+                            </div>
+                            <p className="mt-1.5 text-[11px] text-blue-800 font-medium">
+                              {it.status === 'UPLOADING'
+                                ? `Sunucuya yükleniyor %${it.progress}`
+                                : 'Sayfalar PNG görüntüsüne çevrildi · GPT-4o Vision kutucukları ve tabloları okuyor…'}
+                            </p>
+                          </div>
+                        )}
+
+                        {effectiveStatus === 'FAILED' && (
+                          <div className="px-5 py-3 text-xs text-red-800 bg-red-50 flex items-start gap-2">
+                            <XCircle className="w-4 h-4 shrink-0 mt-px" />
+                            <span>{it.error || 'Belge ayrıştırılamadı.'}</span>
+                          </div>
+                        )}
+
+                        {d && (
+                          <div className="px-5 py-4 space-y-3">
+                            {populated.length > 0 ? (
+                              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
+                                {populated.map((pf) => (
+                                  <div
+                                    key={pf.key}
+                                    className="rounded-md border border-slate-200 bg-white px-3 py-2"
+                                  >
+                                    <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+                                      {pf.label}
+                                    </p>
+                                    <p
+                                      className={`mt-0.5 text-xs font-semibold text-slate-900 break-words ${
+                                        pf.key.includes('code') || pf.key === 'lot_batch_no' ? 'font-mono' : ''
+                                      }`}
+                                    >
+                                      {pf.display}
+                                    </p>
+                                  </div>
+                                ))}
+                              </div>
+                            ) : (
+                              <p className="text-xs text-slate-500 italic">
+                                Bu belge ({catLabel}) yardımcı/referans niteliğindedir.
+                              </p>
+                            )}
+
+                            <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+                              <button
+                                type="button"
+                                onClick={() => setOpenTech((s) => ({ ...s, [it.key]: !techOpen }))}
+                                className="text-[11px] text-slate-500 hover:text-slate-700 inline-flex items-center gap-1"
+                              >
+                                {techOpen ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+                                Teknik & Denetim İzi Detayı ({fmtSize(it.size)} · {doc?.extraction_method || '—'})
+                              </button>
+                            </div>
+
+                            {techOpen && doc && (
+                              <dl className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-1 text-[11px] text-slate-600 bg-slate-50 border border-slate-200 rounded-md px-3 py-2">
+                                <div>
+                                  <dt className="inline text-slate-400">Belge No: </dt>
+                                  <dd className="inline font-mono">#{doc.id}</dd>
+                                </div>
+                                <div>
+                                  <dt className="inline text-slate-400">AI Modeli: </dt>
+                                  <dd className="inline font-mono">{doc.ai_model}</dd>
+                                </div>
+                                <div>
+                                  <dt className="inline text-slate-400">Okuma Yöntemi: </dt>
+                                  <dd className="inline font-mono">
+                                    {doc.extraction_method}
+                                    {d.page_count ? ` · ${d.page_count} sayfa` : ''}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt className="inline text-slate-400">Yüklenme Zamanı: </dt>
+                                  <dd className="inline">{fmtDateTime(doc.uploaded_at + 'Z')}</dd>
+                                </div>
+                                <div className="sm:col-span-2 flex items-start gap-1">
+                                  <Hash className="w-3 h-3 mt-0.5 text-slate-400" />
+                                  <span>
+                                    <span className="text-slate-400">SHA-256: </span>
+                                    <span className="font-mono break-all">{doc.sha256}</span>
+                                  </span>
+                                </div>
+                              </dl>
+                            )}
+                          </div>
+                        )}
+                      </article>
+                    );
+                  })}
+                </div>
               </div>
-            </div>
+            )}
           </div>
         </section>
       )}
 
-      {/* Drag & Drop Yükleme Alanı */}
-      <div
-        {...dropHandlers}
-        role="button"
-        tabIndex={canUpload ? 0 : -1}
-        aria-disabled={!canUpload}
-        onClick={() => {
-          if (canUpload) inputRef.current?.click();
-        }}
-        onKeyDown={(e) => {
-          if (canUpload && (e.key === 'Enter' || e.key === ' ')) {
-            e.preventDefault();
-            inputRef.current?.click();
-          }
-        }}
-        className={`relative rounded-lg border-2 border-dashed px-6 py-8 text-center transition focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-600 ${
-          !canUpload
-            ? 'border-slate-200 bg-slate-100 cursor-not-allowed opacity-70'
-            : dragging
-            ? 'border-blue-600 bg-blue-50 scale-[1.01] cursor-pointer'
-            : 'border-slate-300 bg-white hover:border-blue-400 hover:bg-slate-50 cursor-pointer'
-        }`}
-      >
-        <input
-          ref={inputRef}
-          type="file"
-          multiple
-          disabled={!canUpload}
-          accept=".pdf,.xlsx,.png,.jpg,.jpeg,.txt,.csv"
-          className="hidden"
-          onChange={(e) => {
-            handleFiles(e.target.files);
-            e.target.value = '';
-          }}
-        />
+      {/* Yeni açılmış ve henüz belgesi olmayan klasörler için Yükleme Kartı */}
+      {!hasAnyDossierData && !loadingHistory && (
         <div
-          className={`mx-auto w-12 h-12 rounded-full flex items-center justify-center mb-2.5 ${
-            dragging ? 'bg-blue-600 text-white' : 'bg-blue-50 text-blue-700'
+          role="button"
+          tabIndex={canUpload ? 0 : -1}
+          aria-disabled={!canUpload}
+          onClick={() => {
+            if (canUpload) inputRef.current?.click();
+          }}
+          onKeyDown={(e) => {
+            if (canUpload && (e.key === 'Enter' || e.key === ' ')) {
+              e.preventDefault();
+              inputRef.current?.click();
+            }
+          }}
+          className={`relative rounded-lg border border-dashed px-6 py-10 text-center transition focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-600 ${
+            !canUpload
+              ? 'border-slate-200 bg-slate-100 cursor-not-allowed opacity-70'
+              : dragging
+              ? 'border-slate-900 bg-slate-50 cursor-pointer'
+              : 'border-slate-300 bg-white hover:border-slate-500 hover:bg-slate-50 cursor-pointer'
           }`}
         >
-          <UploadCloud className="w-6 h-6" />
-        </div>
-        <p className="text-sm font-semibold text-slate-800">
-          {!canUpload
-            ? 'Belge yükleme yetkiniz yok'
-            : dragging
-            ? 'Bırakın, Vision OCR analizi başlasın'
-            : 'Çalışma dosyası belgelerini (taranmış PDF / IMG_*.pdf / Excel) buraya sürükleyip bırakın'}
-        </p>
-        <p className="text-xs text-slate-500 mt-1">
-          veya <span className="text-blue-700 font-medium underline">bilgisayardan çoklu seçin</span> · PDF, XLSX, PNG,
-          JPG · en fazla {MAX_MB} MB
-        </p>
-        {busyCount > 0 && (
-          <p className="mt-2.5 text-xs font-medium text-blue-700 inline-flex items-center gap-1.5">
-            <Loader2 className="w-3.5 h-3.5 animate-spin" /> {busyCount} belge GPT-4o Vision ile okunuyor…
+          <div className="mx-auto mb-2 flex justify-center text-slate-400">
+            <UploadCloud className="w-5 h-5" />
+          </div>
+          <p className="text-sm font-semibold text-slate-800">
+            {!canUpload
+              ? 'Belge yükleme yetkiniz yok'
+              : dragging
+              ? 'Bırakın, Vision OCR analizi başlasın'
+              : 'Bu müşteri klasörüne henüz belge yüklenmedi — PDF belgelerini buraya sürükleyin veya tıklayıp seçin'}
           </p>
-        )}
-      </div>
-
-      {rejected.length > 0 && (
-        <div className="rounded-md border border-red-200 bg-red-50 px-4 py-3 text-xs text-red-800 flex items-start gap-2">
-          <AlertTriangle className="w-4 h-4 shrink-0 mt-px" />
-          <ul className="flex-1 space-y-0.5">
-            {rejected.map((r) => (
-              <li key={r}>{r}</li>
-            ))}
-          </ul>
-          <button onClick={() => setRejected([])} aria-label="Kapat" className="text-red-600 hover:text-red-800">
-            <X className="w-4 h-4" />
-          </button>
+          <p className="text-xs text-slate-500 mt-1">
+            PDF, XLSX, PNG, JPG · en fazla {MAX_MB} MB · seçilen belgeler otomatik olarak{' '}
+            <span className="font-mono font-semibold text-slate-700">{activeDossierKey}</span> klasörüne yüklenir ve analiz edilir.
+          </p>
         </div>
       )}
-
-      {historyError && (
-        <div className="p-3 rounded-md bg-red-50 border border-red-200 text-sm text-red-700">{historyError}</div>
-      )}
-
-      {/* Tekil Belge Kartları */}
-      <section className="space-y-3">
-        <div className="flex items-center justify-between">
-          <h3 className="text-sm font-semibold text-slate-800">
-            Yüklenen Dosya Belgeleri ({items.length})
-          </h3>
-        </div>
-
-        {items.length === 0 && !loadingHistory && (
-          <p className="p-10 bg-white border border-slate-200 rounded-lg text-center text-sm text-slate-400">
-            Henüz belge yüklenmedi.
-          </p>
-        )}
-
-        {items.map((it) => {
-          const doc = it.doc;
-          const d = doc?.extracted_data;
-          const populated = d?.populated_fields || [];
-          const cat = doc?.doc_category || d?.doc_category || 'OTHER';
-          const catLabel = doc?.doc_category_label || d?.doc_category_label || 'GLP Belgesi';
-          const isReparsing = Boolean(doc?.id && reparsingIds[doc.id]);
-          const effectiveStatus = isReparsing
-            ? 'ANALYZING'
-            : it.status === 'FAILED'
-            ? 'FAILED'
-            : populated.length > 0 || cat === 'OTHER'
-            ? 'PARSED'
-            : it.status;
-          const S = STATUS[effectiveStatus] || STATUS.PARSED;
-          const FileIcon = extOf(it.name) === 'pdf' ? FileText : FileSpreadsheet;
-          const techOpen = openTech[it.key];
-
-          return (
-            <article
-              key={it.key}
-              className={`bg-white border rounded-lg shadow-sm overflow-hidden ${
-                effectiveStatus === 'FAILED' ? 'border-red-300' : 'border-slate-200'
-              }`}
-            >
-              {/* Üst Başlık: Dosya Adı + Belge Türü Rozeti + Çıkarılan Alanlar Özeti */}
-              <div className="px-5 py-3.5 flex flex-wrap items-center gap-3 border-b border-slate-100 bg-slate-50/50">
-                <div
-                  className={`p-2 rounded-md shrink-0 ${
-                    extOf(it.name) === 'pdf' ? 'bg-red-50 text-red-700' : 'bg-green-50 text-green-700'
-                  }`}
-                >
-                  <FileIcon className="w-5 h-5" />
-                </div>
-
-                <div className="min-w-0 flex-1 space-y-1">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <p className="text-sm font-semibold text-slate-900 truncate" title={it.name}>
-                      {it.name}
-                    </p>
-                    {d && (
-                      <span
-                        className={`text-[11px] font-semibold px-2.5 py-0.5 rounded border ${
-                          CATEGORY_STYLE[cat] || CATEGORY_STYLE.OTHER
-                        }`}
-                      >
-                        Belge Türü: {catLabel}
-                      </span>
-                    )}
-                  </div>
-
-                  <p className="text-xs text-slate-600">
-                    {d?.doc_summary ? (
-                      <span>{d.doc_summary}</span>
-                    ) : (
-                      <span>{fmtSize(it.size)}</span>
-                    )}
-                    {populated.length > 0 && (
-                      <span className="text-emerald-700 font-medium">
-                        {' · '}Çıkarılan Alanlar ({populated.length}):{' '}
-                        {populated.map((pf) => pf.label).join(', ')}
-                      </span>
-                    )}
-                  </p>
-                </div>
-
-                <div className="flex items-center gap-2">
-                  <span
-                    className={`inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded border ${S.cls}`}
-                  >
-                    <S.Icon className={`w-3 h-3 ${S.spin ? 'animate-spin' : ''}`} />
-                    {S.label}
-                  </span>
-
-                  {canUpload && doc?.id && (
-                    <button
-                      type="button"
-                      disabled={isReparsing || reparsingAll}
-                      onClick={() => handleReparseSingle(doc)}
-                      title="Bu PDF'i PyMuPDF + GPT-4o Vision ile yeniden analiz et"
-                      className="inline-flex items-center gap-1 text-xs font-medium text-blue-700 hover:text-blue-900 border border-blue-200 bg-blue-50/70 hover:bg-blue-100 rounded px-2.5 py-1 disabled:opacity-40 transition"
-                    >
-                      <ScanEye className="w-3.5 h-3.5" />
-                      <span>Yeniden Analiz Et</span>
-                    </button>
-                  )}
-
-                  {canUpload && doc?.id && (
-                    <button
-                      type="button"
-                      onClick={() => handleDeleteDoc(doc)}
-                      title="Belgeyi dosyadan kaldır"
-                      className="p-1.5 rounded text-slate-400 hover:text-red-700 hover:bg-red-50 transition"
-                    >
-                      <Trash2 className="w-4 h-4" />
-                    </button>
-                  )}
-                </div>
-              </div>
-
-              {/* İşleniyor çubuğu */}
-              {(it.status === 'UPLOADING' || it.status === 'ANALYZING' || isReparsing) && (
-                <div className="px-5 py-3 bg-blue-50/40">
-                  <div className="h-1.5 bg-slate-100 rounded-full overflow-hidden">
-                    <div
-                      className="h-full bg-blue-600 animate-pulse transition-all"
-                      style={{ width: `${it.status === 'UPLOADING' ? it.progress : 100}%` }}
-                    />
-                  </div>
-                  <p className="mt-1.5 text-[11px] text-blue-800 font-medium">
-                    {it.status === 'UPLOADING'
-                      ? `Sunucuya yükleniyor %${it.progress}`
-                      : 'Sayfalar PNG görüntüsüne çevrildi · GPT-4o Vision kutucukları ve tabloları okuyor…'}
-                  </p>
-                </div>
-              )}
-
-              {/* Hata */}
-              {effectiveStatus === 'FAILED' && (
-                <div className="px-5 py-3 text-xs text-red-800 bg-red-50 flex items-start gap-2">
-                  <XCircle className="w-4 h-4 shrink-0 mt-px" />
-                  <span>{it.error || 'Belge ayrıştırılamadı.'}</span>
-                </div>
-              )}
-
-              {/* Sadece bu belgede bulunan anlamlı alanlar */}
-              {d && (
-                <div className="px-5 py-4 space-y-3">
-                  {populated.length > 0 ? (
-                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
-                      {populated.map((pf) => (
-                        <div
-                          key={pf.key}
-                          className="rounded-md border border-slate-200 bg-white px-3 py-2"
-                        >
-                          <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">
-                            {pf.label}
-                          </p>
-                          <p
-                            className={`mt-0.5 text-xs font-semibold text-slate-900 break-words ${
-                              pf.key.includes('code') || pf.key === 'lot_batch_no' ? 'font-mono' : ''
-                            }`}
-                          >
-                            {pf.display}
-                          </p>
-                        </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <p className="text-xs text-slate-500 italic">
-                      Bu belge ({catLabel}) yardımcı/referans niteliğindedir.
-                      {doc?.extraction_method !== 'PDF_VISION' &&
-                        ' Taranmış görüntü içeriğini okumak için sağ üstteki "Yeniden Analiz Et" butonuna tıklayın.'}
-                    </p>
-                  )}
-
-                  <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
-                    <button
-                      type="button"
-                      onClick={() => setOpenTech((s) => ({ ...s, [it.key]: !techOpen }))}
-                      className="text-[11px] text-slate-500 hover:text-slate-700 inline-flex items-center gap-1"
-                    >
-                      {techOpen ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
-                      Teknik & Denetim İzi Detayı ({fmtSize(it.size)} · {doc?.extraction_method || '—'})
-                    </button>
-                  </div>
-
-                  {techOpen && doc && (
-                    <dl className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-1 text-[11px] text-slate-600 bg-slate-50 border border-slate-200 rounded-md px-3 py-2">
-                      <div>
-                        <dt className="inline text-slate-400">Belge No: </dt>
-                        <dd className="inline font-mono">#{doc.id}</dd>
-                      </div>
-                      <div>
-                        <dt className="inline text-slate-400">AI Modeli: </dt>
-                        <dd className="inline font-mono">{doc.ai_model}</dd>
-                      </div>
-                      <div>
-                        <dt className="inline text-slate-400">Okuma Yöntemi: </dt>
-                        <dd className="inline font-mono">
-                          {doc.extraction_method}
-                          {d.page_count ? ` · ${d.page_count} sayfa` : ''}
-                        </dd>
-                      </div>
-                      <div>
-                        <dt className="inline text-slate-400">Yüklenme Zamanı: </dt>
-                        <dd className="inline">{fmtDateTime(doc.uploaded_at + 'Z')}</dd>
-                      </div>
-                      <div className="sm:col-span-2 flex items-start gap-1">
-                        <Hash className="w-3 h-3 mt-0.5 text-slate-400" />
-                        <span>
-                          <span className="text-slate-400">SHA-256: </span>
-                          <span className="font-mono break-all">{doc.sha256}</span>
-                        </span>
-                      </div>
-                    </dl>
-                  )}
-                </div>
-              )}
-            </article>
-          );
-        })}
-      </section>
     </div>
   );
 }

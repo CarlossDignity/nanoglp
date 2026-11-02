@@ -15,6 +15,17 @@ export const fmtDate = (iso) =>
 export const fmtTime = (iso) =>
   new Date(iso).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' });
 
+const WEEKDAY_ABBR_TR = ['Paz', 'Pzt', 'Sal', 'Çar', 'Per', 'Cum', 'Cmt'];
+
+/** "08.08.2026 Cmt" biçiminde tarih + kısa gün adı */
+export const fmtDateWeekday = (iso) => {
+  if (!iso) return '—';
+  const d = new Date(iso.length === 10 ? `${iso}T00:00:00` : iso);
+  const dd = String(d.getDate()).padStart(2, '0');
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  return `${dd}.${mm}.${d.getFullYear()} ${WEEKDAY_ABBR_TR[d.getDay()]}`;
+};
+
 export const fmtMinutes = (m) => {
   const h = Math.floor(m / 60);
   const r = m % 60;
@@ -41,6 +52,9 @@ export const conflictTypeLabel = {
 
 export const ROLE_LABEL = {
   SYSADMIN: 'Sistem Yöneticisi (SYSADMIN)',
+  EXECUTIVE: 'Üst Yönetim (GM / GMY)',
+  SALES: 'Satış',
+  TRM_KABUL: 'TRM Kabul',
   TFM: 'Test Tesisi Yöneticisi',
   STUDY_DIRECTOR: 'Çalışma Yöneticisi',
   PLANNING_COORDINATOR: 'Planlama Koordinatörü',
@@ -52,6 +66,9 @@ export const ROLE_LABEL = {
 
 export const ROLE_SHORT = {
   SYSADMIN: 'SYSADMIN',
+  EXECUTIVE: 'GM / GMY',
+  SALES: 'Satış',
+  TRM_KABUL: 'TRM Kabul',
   TFM: 'TFM',
   STUDY_DIRECTOR: 'SD',
   PLANNING_COORDINATOR: 'PK',

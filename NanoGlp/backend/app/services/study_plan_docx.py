@@ -190,6 +190,270 @@ def _insert_operational_schedule_table(doc: DocxDocument, anchor_table, steps: L
     anchor_table._tbl.addnext(caption_p._p)
 
 
+# ---------------------------------------------------------------------------
+# FAZ 8.2 — ISO 10993-23 dışı şablonlar için Bölüm 1, 5–11, istatistik, veri derleme ve rapor metinleri
+# ---------------------------------------------------------------------------
+def _set_paragraph_text(p, text: str) -> None:
+    """Paragrafın ilk run biçimini koruyarak tüm metni `text` ile değiştirir."""
+    runs = p.runs
+    if not runs:
+        p.add_run(text)
+        return
+    runs[0].text = text
+    for r in runs[1:]:
+        r.text = ""
+
+
+def _set_cell_text(cell, text: str) -> None:
+    paras = cell.paragraphs
+    if not paras:
+        return
+    _set_paragraph_text(paras[0], text)
+    for extra in paras[1:]:
+        extra._p.getparent().remove(extra._p)
+
+
+def _apply_tokens(text: str, ctx: Dict[str, str]) -> str:
+    for k, v in ctx.items():
+        text = text.replace("{" + k + "}", str(v))
+    return text
+
+
+def _grid_table(doc: DocxDocument, headers: List[str], rows: List[List[str]]):
+    tbl = doc.add_table(rows=1, cols=len(headers))
+    tbl._tbl.tblPr.append(
+        parse_xml(
+            f'<w:tblBorders {nsdecls("w")}>'
+            '<w:top w:val="single" w:sz="4" w:space="0" w:color="64748B"/>'
+            '<w:left w:val="single" w:sz="4" w:space="0" w:color="64748B"/>'
+            '<w:bottom w:val="single" w:sz="4" w:space="0" w:color="64748B"/>'
+            '<w:right w:val="single" w:sz="4" w:space="0" w:color="64748B"/>'
+            '<w:insideH w:val="single" w:sz="4" w:space="0" w:color="CBD5E1"/>'
+            '<w:insideV w:val="single" w:sz="4" w:space="0" w:color="CBD5E1"/>'
+            "</w:tblBorders>"
+        )
+    )
+    for i, h in enumerate(headers):
+        run = tbl.rows[0].cells[i].paragraphs[0].add_run(h)
+        run.bold = True
+        run.font.name = "Arial"
+        run.font.size = Pt(9)
+    for row in rows:
+        cells = tbl.add_row().cells
+        for i, val in enumerate(row):
+            run = cells[i].paragraphs[0].add_run(str(val))
+            run.font.name = "Arial"
+            run.font.size = Pt(8.5)
+    return tbl
+
+
+def _doc_blocks(doc: DocxDocument):
+    """Gövde öğelerini (paragraf / tablo) H1-H2 bağlamıyla birlikte sırayla döner."""
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    h1 = h2 = ""
+    blocks = []
+    for child in doc.element.body.iterchildren():
+        tag = child.tag.split("}")[1]
+        if tag == "p":
+            p = Paragraph(child, doc)
+            style = p.style.name if p.style is not None else ""
+            txt = p.text.strip()
+            if style == "Heading 1":
+                h1, h2 = txt, ""
+            elif style == "Heading 2":
+                h2 = txt
+            blocks.append(("p", p, h1, h2, style, txt))
+        elif tag == "tbl":
+            blocks.append(("t", Table(child, doc), h1, h2, "", ""))
+    return blocks
+
+
+def _adapt_for_template(db: Session, doc: DocxDocument, study: Study, test_item_name: str) -> None:
+    """
+    FAZ 8.1 + 8.2 — ISO 10993-23 dışındaki şablonlar (ISO 10993-6 İmplantasyon, -5 Sitotoksisite, -10 Sensitizasyon,
+    -11 Akut Sistemik) için kapak/onay başlığı, standart adı ve ilgili tüm bölümlerin (Objective, Materials & Methods,
+    Test System, Animal Welfare, HADYEK, Experimental Design, Observations, Pathology, Statistics, Data Compilation,
+    Report, References) metinlerini şablon koduna göre dinamik olarak değiştirir; Annex A ekler.
+    """
+    from app.models.room_capacity import ensure_default_room_capacities
+    from app.services.study_plan_content import TEMPLATE_CONTENT
+    from app.services.templates import TEMPLATES, resolve_template_code
+
+    tpl = TEMPLATES.get(resolve_template_code(study.template_code))
+    if tpl is None or tpl.code == "ISO_10993_23_IC":
+        return
+    content = TEMPLATE_CONTENT.get(tpl.code, {})
+    title_en = tpl.docx_title_en or tpl.title
+    species_en = tpl.docx_species_en or tpl.species_label
+
+    polar = f"polar ({study.extraction_polar_solvent})" if study.extraction_polar_solvent else "polar (0.9% NaCl)"
+    non_polar = (
+        f"non-polar ({study.extraction_non_polar_solvent})"
+        if study.extraction_non_polar_solvent
+        else "non-polar (Cottonseed oil)"
+    )
+    ctx = {
+        "TEST_ITEM": test_item_name,
+        "TITLE": title_en,
+        "STANDARD": tpl.standard,
+        "POLAR": polar,
+        "NONPOLAR": non_polar,
+        "RATIO": study.extraction_ratio or "3.0 g/10 mL (0.2 g/mL)",
+        "TEMP": "37 ± 1",
+        "HOURS": "72 ± 2",
+        "N_ANIMALS": tpl.cage_count or "N/A",
+        "CAGES": tpl.cage_count,
+    }
+    sections = content.get("sections", {})
+    handled_ctx = set()
+    blocks = _doc_blocks(doc)
+
+    # 1) Bölüm bazlı içerik değişimi (orijinal H1/H2 bağlamına göre)
+    for kind, obj, h1, h2, style, txt in blocks:
+        H1 = h1.upper()
+        try:
+            if kind == "p":
+                if style == "Heading 2":
+                    sec = sections.get(h2)
+                    if sec and sec[0]:
+                        _set_paragraph_text(obj, sec[0])
+                    continue
+                if style == "Heading 1" or not txt:
+                    continue
+
+                if H1.startswith("STUDY OBJECTIVE") and content.get("objective") and ("objective", 1) not in handled_ctx:
+                    _set_paragraph_text(obj, _apply_tokens(content["objective"], ctx))
+                    handled_ctx.add(("objective", 1))
+                elif H1.startswith("REFERENCES") and "ISO 10993-23:2021" in txt and content.get("reference"):
+                    _set_paragraph_text(obj, content["reference"])
+                elif H1.startswith("ANIMAL WELFARE") and content.get("welfare"):
+                    n = sum(1 for k in handled_ctx if k[0] == "welfare")
+                    if n < len(content["welfare"]):
+                        _set_paragraph_text(obj, content["welfare"][n])
+                        handled_ctx.add(("welfare", n))
+                elif H1.startswith("HADYEK") and content.get("hadyek") and ("hadyek", 1) not in handled_ctx:
+                    _set_paragraph_text(obj, content["hadyek"])
+                    handled_ctx.add(("hadyek", 1))
+                elif H1.startswith("STATISTICAL") and content.get("statistics") and ("stat", 1) not in handled_ctx:
+                    _set_paragraph_text(obj, _apply_tokens(content["statistics"], ctx))
+                    handled_ctx.add(("stat", 1))
+                elif H1.startswith("DATA COMPILATION") and content.get("data_compilation") and ("data", 1) not in handled_ctx:
+                    _set_paragraph_text(obj, _apply_tokens(content["data_compilation"], ctx))
+                    handled_ctx.add(("data", 1))
+                elif H1.startswith("REPORT") and not H1.startswith("REPORTING"):
+                    new_line = (content.get("report_lines") or {}).get(txt)
+                    if new_line:
+                        _set_paragraph_text(obj, new_line)
+                elif txt.startswith("Grading System for") and content.get("grading"):
+                    _set_paragraph_text(obj, content["grading"]["title"])
+                elif h2 in sections and sections[h2][1] and (h1, h2) not in handled_ctx:
+                    _set_paragraph_text(obj, _apply_tokens(sections[h2][1], ctx))
+                    handled_ctx.add((h1, h2))
+            else:
+                first = obj.rows[0].cells[0].text.strip() if obj.rows else ""
+                if first == "Species" and content.get("test_system"):
+                    _fill_label_table(obj, content["test_system"], ctx)
+                elif first == "Location" and content.get("housing") is not None:
+                    _fill_label_table(obj, content["housing"], ctx)
+                elif first == "Intracutaneous Reaction" and content.get("grading"):
+                    g = content["grading"]
+                    new_tbl = _grid_table(doc, g["headers"], g["rows"])
+                    obj._tbl.addprevious(new_tbl._tbl)
+                    foot = doc.add_paragraph()
+                    fr = foot.add_run(g["footnote"])
+                    fr.italic = True
+                    fr.font.name = "Arial"
+                    fr.font.size = Pt(8.5)
+                    new_tbl._tbl.addnext(foot._p)
+                    obj._tbl.getparent().remove(obj._tbl)
+                elif H1.startswith("EXPERIMENTAL DESIGN") and first == "":
+                    # Enjeksiyon bölgeleri şekil tablosu (Figure-1: ISO 10993-23) bu şablonlarda geçerli değil
+                    obj._tbl.getparent().remove(obj._tbl)
+        except Exception:
+            continue
+
+    # 2) Genel metin değişimleri (başlık, standart adı, kılavuz başlığı)
+    part_phrase = content.get("part_phrase")
+    for p in doc.paragraphs:
+        txt = p.text
+        if "Intracutaneous Reactivity Test of" in txt:
+            _replace_text_in_paragraph(p, "Intracutaneous Reactivity Test of", f"{title_en} of")
+            _replace_text_in_paragraph(p, "Extract in New Zealand White Rabbits", f"in {species_en}")
+        if part_phrase and "Part 23 Tests for Irritation" in p.text:
+            _replace_text_in_paragraph(p, "Part 23 Tests for Irritation", part_phrase, count=-1)
+        if "ISO 10993-23" in p.text:
+            _replace_text_in_paragraph(p, "ISO 10993-23", tpl.standard, count=-1)
+
+    # 3) Annex A — şablona özgü test tasarımı özeti
+    room_txt = "None (in vitro study — no animal room required)"
+    if tpl.animal_room:
+        room = next((r for r in ensure_default_room_capacities(db) if r.room_code == tpl.animal_room), None)
+        room_txt = (
+            f"{room.room_label} ({tpl.animal_room}) — {tpl.cage_count} cage(s); physical capacity "
+            f"{room.physical_cages}, system planning capacity {room.planning_capacity}"
+            if room is not None
+            else f"{tpl.animal_room} — {tpl.cage_count} cage(s)"
+        )
+    eq_txt = "; ".join(
+        f"{code} (Day {day}, {hhmm}, {hours} h)" for code, day, hhmm, hours in tpl.equipment_windows
+    ) or (", ".join(tpl.equipment_codes) if tpl.equipment_codes else "N/A")
+    last_day = max((ts.day for ts in tpl.steps), default=0)
+
+    head = doc.add_paragraph()
+    hr = head.add_run(f"ANNEX A — TEMPLATE-SPECIFIC TEST DESIGN ({tpl.standard})")
+    hr.bold = True
+    hr.font.name = "Arial"
+    hr.font.size = Pt(10.5)
+    annex = _grid_table(
+        doc,
+        ["Item", "Value"],
+        [
+            ["Test", f"{title_en} — {tpl.standard}"],
+            ["Test item", test_item_name],
+            ["Test system", species_en],
+            [
+                "Animal number & cohorts",
+                f"{tpl.animal_count} per cohort × {tpl.cohorts} cohort(s) (max {tpl.max_animals} animals)"
+                if tpl.max_animals > 0
+                else "0 (In vitro / Analytical)",
+            ],
+            ["Animal room / cages", room_txt],
+            [
+                "Standard durations & TAT",
+                f"Quarantine {tpl.quarantine_days}d · Acclimatization {tpl.acclimatization_days}d · "
+                f"Experiment {tpl.experiment_days}d · QA Audit {tpl.qa_audit_days}d · Report {tpl.report_days}d "
+                f"(TAT: {tpl.tat_without_quarantine_days}d / {tpl.tat_with_quarantine_days}d with quarantine)",
+            ],
+            ["Fate of animals / Reuse policy", tpl.animal_fate_en or tpl.animal_fate_tr or "N/A"],
+            ["Planned duration", f"Day 0 – Day {last_day} ({len(tpl.steps)} operational steps; see schedule above)"],
+            ["24-72 h bottleneck equipment", eq_txt],
+        ],
+    )
+    note = doc.add_paragraph()
+    nr = note.add_run(
+        f"NOTE: Sections 1 and 5–11 of this draft were generated automatically for {tpl.standard} from the Nanolab master "
+        f"Study Plan template and the template-specific GLP text library. The Study Director must review and confirm all "
+        f"sections (group sizes, doses, observation periods) before approval."
+    )
+    nr.italic = True
+    nr.font.name = "Arial"
+    nr.font.size = Pt(8.5)
+
+
+def _fill_label_table(table, mapping: Dict[str, str], ctx: Dict[str, str]) -> None:
+    """Etiket | : | değer biçimli tablolarda etiketi eşleşen satırların değer hücresini değiştirir."""
+    for row in table.rows:
+        cells = row.cells
+        label = cells[0].text.strip()
+        for key, val in mapping.items():
+            if label == key or (key.endswith(":") and label.startswith(key)):
+                target = cells[2] if len(cells) >= 3 and cells[2]._tc is not cells[0]._tc else cells[0]
+                _set_cell_text(target, _apply_tokens(val, ctx))
+                break
+
+
 def generate_study_plan_docx(db: Session, study: Study) -> bytes:
     """
     Verilen Study kaydı için `nanolab_ic_study_plan_template.docx` şablonunu kullanarak
@@ -207,6 +471,10 @@ def generate_study_plan_docx(db: Session, study: Study) -> bytes:
         .order_by(User.id.asc())
         .all()
     )
+    # FAZ 8.2: Çalışmanın kendi klasörüne (dossier_key = study_code) yüklenmiş TIIS/CoA/FM.083 belgeleri varsa yalnızca onları kullan
+    own_docs = [d for d in all_docs if (d.dossier_key or '') == (study.study_code or '')]
+    if own_docs:
+        all_docs = own_docs
     tfm_user = (
         db.query(User)
         .filter(User.role == UserRole.TFM, User.is_active == True)  # noqa: E712
@@ -243,7 +511,7 @@ def generate_study_plan_docx(db: Session, study: Study) -> bytes:
 
     raw_item_name = (
         study.test_item_name
-        if study.test_item_name and "BELİRTİLMEDİ" not in study.test_item_name and "Merken Aqua" not in study.test_item_name
+        if study.test_item_name and "BELİRTİLMEDİ" not in study.test_item_name
         else None
     )
     test_item_name = _val(raw_item_name, dossier_fields.get("test_item_name") or "Hyaluronik Asit HA 30 mg/ml")
@@ -491,6 +759,12 @@ def generate_study_plan_docx(db: Session, study: Study) -> bytes:
                             _replace_x_tokens_in_paragraph(p, ["+90 (284) 226 02 18"])
                         elif ptxt.startswith("Email:"):
                             _replace_x_tokens_in_paragraph(p, ["glp@nanolab.com.tr"])
+
+    # FAZ 8.1: ISO 10993-23 dışı şablonlar için başlık / standart / Annex A uyarlaması
+    try:
+        _adapt_for_template(db, doc, study, test_item_name)
+    except Exception:
+        pass
 
     buf = io.BytesIO()
     doc.save(buf)

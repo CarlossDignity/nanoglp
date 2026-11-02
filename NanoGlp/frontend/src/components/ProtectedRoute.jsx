@@ -3,8 +3,21 @@ import { Navigate, useLocation } from 'react-router-dom';
 import { Loader2 } from 'lucide-react';
 import { useAuth } from '../state/AuthContext';
 
-export default function ProtectedRoute({ allowedRoles, children }) {
-  const { isAuthenticated, authChecking, role } = useAuth();
+const MENU_KEY_TO_PATH = {
+  dashboard: '/',
+  samples: '/samples',
+  upload: '/upload',
+  planning: '/planning',
+  personnel: '/personnel',
+  studies: '/studies',
+  conflicts: '/conflicts',
+  my_tasks: '/my-tasks',
+  users: '/users',
+  settings: '/settings',
+};
+
+export default function ProtectedRoute({ allowedRoles, menuKey, children }) {
+  const { isAuthenticated, authChecking, role, allowedMenus } = useAuth();
   const location = useLocation();
 
   if (authChecking) {
@@ -20,9 +33,14 @@ export default function ProtectedRoute({ allowedRoles, children }) {
     return <Navigate to="/login" state={{ from: location }} replace />;
   }
 
-  if (allowedRoles && !allowedRoles.includes(role)) {
-    const fallbackPath = role === 'TECHNICIAN' ? '/my-tasks' : '/';
-    return <Navigate to={fallbackPath} replace />;
+  const firstAllowedPath = MENU_KEY_TO_PATH[allowedMenus?.[0]] || (role === 'TECHNICIAN' ? '/my-tasks' : '/');
+
+  if (menuKey && Array.isArray(allowedMenus) && !allowedMenus.includes(menuKey)) {
+    return <Navigate to={firstAllowedPath} replace />;
+  }
+
+  if (allowedRoles && !allowedRoles.includes(role) && !(menuKey && allowedMenus?.includes(menuKey))) {
+    return <Navigate to={firstAllowedPath} replace />;
   }
 
   return children;

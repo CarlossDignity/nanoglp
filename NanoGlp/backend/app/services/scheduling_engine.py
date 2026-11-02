@@ -26,6 +26,15 @@ from app.models.equipment import Equipment
 from app.models.audit_log import AuditLog
 from app.seed import seed_default_equipment
 from app.services.templates import DEFAULT_TEMPLATE_CODE, TemplateStep, get_template
+from app.services.capacity_service import (
+    apply_restriction_shift,
+    build_capacity_report,
+    evaluate_capacity_conflicts,
+    find_first_free_g0,
+    get_auto_schedule_notice,
+    is_capacity_conflict,
+    persist_auto_schedule_notice,
+)
 
 MAX_DAILY_WORKLOAD_MINUTES = 540  # 9 Saat = 540 Dakika (Yasal & GLP Üst Sınırı)
 WORKDAY_START = time(8, 0)
@@ -522,6 +531,26 @@ def build_conflict_resolutions(
         )
         return resolutions
 
+    # c0) FAZ 8.1: Kafes kapasitesi / 24-72s uzun süreli cihaz kapasitesi aşımı → ilk boşalan tarihe yönlendir
+    if study and is_capacity_conflict(conflict):
+        base_day0 = study.acclimatization_start_date or study.target_start_date or date.today()
+        tpl_for_study = get_template(getattr(study, 'template_code', None) or DEFAULT_TEMPLATE_CODE, db=db)
+        free_g0 = find_first_free_g0(db, study, tpl_for_study, base_day0, study.extraction_start_offset_days or 0)
+        if free_g0:
+            resolutions.append(
+                {
+                    'action': 'SHIFT_TO_NEXT_AVAILABLE_CAPACITY_DATE',
+                    'label': f"İlk Boşalan Tarihe Kaydır ({date.fromisoformat(free_g0):%d.%m.%Y})",
+                    'style': 'blue',
+                    'next_available_date': free_g0,
+                    'description': (
+                        f"Gün 0'ı kafes / cihaz kapasitesinin uygun olduğu ilk iş günü olan "
+                        f"{date.fromisoformat(free_g0):%d.%m.%Y} tarihine kaydırarak yeniden planlar."
+                    ),
+                }
+            )
+        return resolutions
+
     # c) Cihaz Kapasite Aşımı (EQUIPMENT_OVERLAP)
     if conflict.conflict_type == ConflictType.EQUIPMENT_OVERLAP and study:
         water_bath = seed_default_equipment(db)
@@ -743,6 +772,13 @@ def evaluate_study_conflicts(
                         [step.id],
                     )
 
+    # 6e) FAZ 8.1: Kafes kapasitesi (Fiziksel + Dr. Anoop esneklik) ve 24-72s uzun süreli cihaz (CO2 inkübatör / etüv) kapasitesi
+    try:
+        for cap_conflict, cap_step_ids in evaluate_capacity_conflicts(db, study, steps, template):
+            record(cap_conflict, cap_step_ids)
+    except Exception:
+        pass
+
     db.flush()
 
     # 6d) KURAL 1: kişi-gün bazında 9 saat kontrolü (tüm çalışmalar dahil)
@@ -853,6 +889,7 @@ def schedule_new_study(
     template_code: str = DEFAULT_TEMPLATE_CODE,
     extraction_start_offset_days: Optional[int] = None,
     align_extraction_to_friday: bool = False,
+    apply_restrictions: bool = True,
 ) -> Dict[str, Any]:
     """
     Seçilen şablonun adımlarını Gün 0 = acclimatization_start_date olacak şekilde dizer ve çakışmaları tespit eder.
@@ -877,6 +914,13 @@ def schedule_new_study(
     resolved_template_code = template_code or getattr(study, "template_code", None) or DEFAULT_TEMPLATE_CODE
     template = get_template(resolved_template_code, db=db)
     study.template_code = template.code
+    # FAZ 8.1: Test Kısıtlama Takvimi — Gün 0 kısıtlı aralıktaysa restricted_until + 1 (ilk iş günü) tarihine otomatik ötele
+    requested_g0 = acclimatization_start_date
+    if apply_restrictions:
+        shift = apply_restriction_shift(db, template.code, acclimatization_start_date)
+    else:
+        shift = {'g0': acclimatization_start_date, 'shifted': False, 'notice': None, 'restrictions': []}
+    acclimatization_start_date = shift['g0']
     now = datetime.utcnow()
     water_bath = seed_default_equipment(db)
 
@@ -892,6 +936,12 @@ def schedule_new_study(
 
     # 1) Bu taslağın eski planını kapat
     superseded_count, removed_steps = _supersede_previous_plan(db, study, now)
+    # _supersede_previous_plan içindeki db.expire_all() bekleyen değişiklikleri attığı için Gün 0, ekstraksiyon ofseti ve
+    # FAZ 8.1 otomatik tarih notunu burada (expire sonrası) yeniden yazıyoruz.
+    study.template_code = template.code
+    study.extraction_start_offset_days = offset_days
+    study.acclimatization_start_date = acclimatization_start_date
+    persist_auto_schedule_notice(study, shift)
 
     # 2) Kıyas kümesi: onaylı + yürütülen + diğer taslaklar (hepsi salt-okunur)
     others = db.query(Study).filter(Study.id != study.id, Study.status.in_(COMPARED_STUDY_STATUSES)).all()
@@ -1025,6 +1075,8 @@ def schedule_new_study(
         new_values={
             "template": template.code,
             "day0": acclimatization_start_date.isoformat(),
+            "requested_day0": requested_g0.isoformat(),
+            "auto_shifted": bool(shift.get('shifted')),
             "extraction_start_offset_days": offset_days,
             "steps": len(new_steps),
             "conflicts": len(findings),
@@ -1049,6 +1101,14 @@ def schedule_new_study(
         steps=step_objs,
         existing_steps=existing_steps,
     )
+
+
+def _safe_capacity_report(db: Session, study: Study, template: Any) -> Optional[Dict[str, Any]]:
+    """FAZ 8.1: Kafes + uzun süreli cihaz kapasite raporu; hata durumunda planlama yanıtını bozmaz."""
+    try:
+        return build_capacity_report(db, study, template)
+    except Exception:
+        return None
 
 
 def _format_schedule_response(
@@ -1089,6 +1149,8 @@ def _format_schedule_response(
         "target_end_date": study.target_end_date.isoformat() if study.target_end_date else None,
         "protocol_approved_at": study.protocol_approved_at.isoformat() if study.protocol_approved_at else None,
         "extraction_start_offset_days": study.extraction_start_offset_days or 0,
+        "auto_schedule_notice": get_auto_schedule_notice(study),
+        "capacity_info": _safe_capacity_report(db, study, template),
         "status": (
             "CONFLICTS_DETECTED"
             if critical_count > 0
@@ -1412,6 +1474,39 @@ def apply_conflict_resolution(
         res["resolution_applied"] = {
             "action": action,
             "message": f"Ekstraksiyon '{water_bath.name}' cihazının boşaldığı {next_date:%d.%m.%Y} gününe kaydırıldı.",
+        }
+        return res
+
+    elif action == "SHIFT_TO_NEXT_AVAILABLE_CAPACITY_DATE":
+        free_g0 = find_first_free_g0(db, study, template, base_day0, study.extraction_start_offset_days or 0)
+        if not free_g0:
+            raise ValueError("Önümüzdeki 240 gün içinde kafes / cihaz kapasitesi uygun bir başlangıç tarihi bulunamadı.")
+        new_g0 = date.fromisoformat(free_g0)
+        res = schedule_new_study(
+            db=db,
+            study_id=study.id,
+            acclimatization_start_date=new_g0,
+            template_code=template.code,
+            extraction_start_offset_days=study.extraction_start_offset_days or 0,
+        )
+        db.add(
+            AuditLog(
+                user_id=user.id,
+                entity_name="Study",
+                entity_id=study.id,
+                action="SHIFT_TO_NEXT_AVAILABLE_CAPACITY_DATE",
+                old_values={"day0": base_day0.isoformat()},
+                new_values={"study_code": study.study_code, "day0": new_g0.isoformat()},
+                reason=(
+                    f"{user.full_name} kafes / uzun süreli cihaz kapasitesi nedeniyle Gün 0'ı "
+                    f"{base_day0:%d.%m.%Y} → {new_g0:%d.%m.%Y} tarihine (ilk boşalan tarih) kaydırdı."
+                ),
+            )
+        )
+        db.commit()
+        res["resolution_applied"] = {
+            "action": action,
+            "message": f"Gün 0 kapasitenin uygun olduğu ilk iş günü olan {new_g0:%d.%m.%Y} tarihine kaydırıldı.",
         }
         return res
 

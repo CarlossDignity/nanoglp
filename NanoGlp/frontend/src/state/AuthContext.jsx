@@ -10,7 +10,21 @@ const AuthContext = createContext(null);
 
 export const USER_ADMIN_ROLES = ['SYSADMIN', 'TFM'];
 export const MANAGEMENT_WRITE_ROLES = ['SYSADMIN', 'TFM', 'STUDY_DIRECTOR', 'PLANNING_COORDINATOR', 'ADMIN'];
-export const MANAGEMENT_VIEW_ROLES = [...MANAGEMENT_WRITE_ROLES, 'QA'];
+export const MANAGEMENT_VIEW_ROLES = [...MANAGEMENT_WRITE_ROLES, 'QA', 'EXECUTIVE'];
+
+export const DEFAULT_ALLOWED_MENUS_BY_ROLE = {
+  EXECUTIVE: ['dashboard', 'samples', 'planning', 'personnel', 'studies', 'conflicts'],
+  SALES: ['samples'],
+  TRM_KABUL: ['samples'],
+  SYSADMIN: ['dashboard', 'samples', 'upload', 'planning', 'personnel', 'studies', 'conflicts', 'my_tasks', 'users', 'settings'],
+  ADMIN: ['dashboard', 'samples', 'upload', 'planning', 'personnel', 'studies', 'conflicts', 'my_tasks', 'users', 'settings'],
+  TFM: ['dashboard', 'samples', 'upload', 'planning', 'personnel', 'studies', 'conflicts', 'my_tasks', 'users', 'settings'],
+  STUDY_DIRECTOR: ['dashboard', 'samples', 'upload', 'planning', 'personnel', 'studies', 'conflicts', 'my_tasks', 'settings'],
+  PLANNING_COORDINATOR: ['dashboard', 'samples', 'upload', 'planning', 'personnel', 'studies', 'conflicts', 'my_tasks', 'settings'],
+  QA: ['dashboard', 'samples', 'upload', 'planning', 'personnel', 'studies', 'conflicts', 'settings'],
+  TECHNICIAN: ['my_tasks'],
+  ANALYST: ['my_tasks'],
+};
 
 function readStoredUser() {
   try {
@@ -39,6 +53,18 @@ export function AuthProvider({ children }) {
     window.addEventListener('nanolab:unauthorized', onUnauthorized);
     return () => window.removeEventListener('nanolab:unauthorized', onUnauthorized);
   }, [logout]);
+
+  const refreshUser = useCallback(async () => {
+    if (!token) return null;
+    try {
+      const res = await getMe();
+      setUser(res.data);
+      localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(res.data));
+      return res.data;
+    } catch {
+      return null;
+    }
+  }, [token]);
 
   useEffect(() => {
     if (!token) {
@@ -77,27 +103,44 @@ export function AuthProvider({ children }) {
   const value = useMemo(() => {
     const role = user?.role || null;
     const isAuthenticated = Boolean(token && user);
-    const isReadOnly = role === 'QA';
-    const isTechnician = role === 'TECHNICIAN';
-    const canWriteManagement = MANAGEMENT_WRITE_ROLES.includes(role);
-    const canViewManagement = MANAGEMENT_VIEW_ROLES.includes(role);
-    const canManageUsers = USER_ADMIN_ROLES.includes(role);
+    const allowedMenus =
+      Array.isArray(user?.allowed_menus) && user.allowed_menus.length > 0
+        ? user.allowed_menus
+        : DEFAULT_ALLOWED_MENUS_BY_ROLE[role] || ['dashboard'];
+    const isReadOnly =
+      user?.is_read_only !== undefined && user?.is_read_only !== null
+        ? Boolean(user.is_read_only)
+        : role === 'QA' || role === 'EXECUTIVE';
+    const isExecutive = role === 'EXECUTIVE';
+    const isSysAdmin = role === 'SYSADMIN' || role === 'ADMIN';
+    const isTechnician = role === 'TECHNICIAN' || (allowedMenus.length === 1 && allowedMenus[0] === 'my_tasks');
+    const hasManagementMenu = allowedMenus.some((m) =>
+      ['dashboard', 'upload', 'planning', 'personnel', 'studies', 'conflicts', 'settings'].includes(m)
+    );
+    const canWriteManagement = !isReadOnly && (MANAGEMENT_WRITE_ROLES.includes(role) || hasManagementMenu);
+    const canViewManagement = MANAGEMENT_VIEW_ROLES.includes(role) || hasManagementMenu;
+    const canManageUsers = USER_ADMIN_ROLES.includes(role) || allowedMenus.includes('users');
 
     return {
       token,
       user,
       role,
+      roleLabel: user?.role_label || role,
+      allowedMenus,
       isAuthenticated,
       authChecking,
       isReadOnly,
+      isExecutive,
+      isSysAdmin,
       isTechnician,
       canWriteManagement,
       canViewManagement,
       canManageUsers,
       login,
       logout,
+      refreshUser,
     };
-  }, [token, user, authChecking, login, logout]);
+  }, [token, user, authChecking, login, logout, refreshUser]);
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

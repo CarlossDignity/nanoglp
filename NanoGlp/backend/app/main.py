@@ -7,12 +7,15 @@ from app.database import engine, Base, SessionLocal
 import app.models  # Modellerin Base.metadata'ya kaydolması için import edilir
 from app.seed import seed_default_equipment
 from app.services.templates import ensure_default_calibrations
+from app.models.role_permission import ensure_default_role_permissions
 from app.api.v1.api import api_router
 from app.api.v1.planning import router as planning_router
+from app.api.v1.endpoints import samples as samples_endpoints
+from app.services.sample_service import seed_sample_tracking
 
 
 def _ensure_sqlite_columns() -> None:
-    """Mevcut SQLite tablolarına FAZ 6.1–6.4'te eklenen yeni sütunları veri silmeden ekler ve varsayılanları tamamlar."""
+    """Mevcut SQLite tablolarına FAZ 6.1–7.2'de eklenen yeni sütunları veri silmeden ekler ve varsayılanları tamamlar."""
     try:
         insp = inspect(engine)
         with engine.begin() as conn:
@@ -44,6 +47,8 @@ def _ensure_sqlite_columns() -> None:
         try:
             seed_default_equipment(db)
             ensure_default_calibrations(db)
+            ensure_default_role_permissions(db)
+            seed_sample_tracking(db)
         finally:
             db.close()
     except Exception:
@@ -77,6 +82,8 @@ app.add_middleware(
 # API Router dahil et
 app.include_router(api_router, prefix=settings.API_V1_STR)
 app.include_router(planning_router, prefix=settings.API_V1_STR)
+# FAZ 8.1: /api/samples/... kısa yolu (Numune & Çalışma Takip; /api/v1/samples ile aynı uç noktalar)
+app.include_router(samples_endpoints.router, prefix="/api", include_in_schema=False)
 
 
 @app.get("/")

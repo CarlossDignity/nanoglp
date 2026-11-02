@@ -8,7 +8,7 @@ import {
   ChevronLeft,
   Calendar as CalendarIcon,
   BarChart3,
-  Table2,
+  Table2, Eye,
 } from 'lucide-react';
 import { getDailyWorkload, getWeeklyWorkload, createPersonnel, extractError } from '../services/api';
 import { useAuth } from '../state/AuthContext';
@@ -48,7 +48,7 @@ function fmtWeekRangeTR(mondayIso) {
 }
 
 export default function Personnel({ onChanged }) {
-  const { isReadOnly } = useAuth();
+  const { isReadOnly, isExecutive, role } = useAuth();
   const [date, setDate] = useState(todayISO());
   const [viewTab, setViewTab] = useState('daily'); // 'daily' | 'weekly'
   const [autoFocused, setAutoFocused] = useState(false);
@@ -147,13 +147,13 @@ export default function Personnel({ onChanged }) {
 
         <div className="flex flex-wrap items-center gap-2">
           {/* Görünüm Sekmesi: Günlük Barlar / Haftalık Matris */}
-          <div className="inline-flex rounded-lg border border-slate-300 bg-white p-1 shadow-sm">
+          <div className="inline-flex rounded-lg border border-slate-300 bg-white p-1 shadow-xs">
             <button
               type="button"
               onClick={() => setViewTab('daily')}
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold transition ${
                 viewTab === 'daily'
-                  ? 'bg-blue-700 text-white shadow-sm'
+                  ? 'bg-slate-900 text-white shadow-xs'
                   : 'text-slate-600 hover:bg-slate-100'
               }`}
             >
@@ -165,7 +165,7 @@ export default function Personnel({ onChanged }) {
               onClick={() => setViewTab('weekly')}
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold transition ${
                 viewTab === 'weekly'
-                  ? 'bg-blue-700 text-white shadow-sm'
+                  ? 'bg-slate-900 text-white shadow-xs'
                   : 'text-slate-600 hover:bg-slate-100'
               }`}
             >
@@ -181,10 +181,16 @@ export default function Personnel({ onChanged }) {
             className="border border-slate-300 rounded-md px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-600"
           />
 
+          {isReadOnly && (
+            <span className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-indigo-50 border border-indigo-200 text-xs font-semibold text-indigo-900">
+              <Eye className="w-3.5 h-3.5 text-indigo-700" />
+              <span>{isExecutive || role !== 'QA' ? 'Üst Yönetim İzleme Görünümü (Salt Okunur)' : 'QA Salt Okunur Modu'}</span>
+            </span>
+          )}
           {!isReadOnly && (
             <button
               onClick={() => setShowModal(true)}
-              className="flex items-center gap-2 bg-blue-700 hover:bg-blue-800 text-white text-sm font-medium rounded-md px-4 py-2"
+              className="flex items-center gap-2 bg-slate-900 hover:bg-slate-800 text-white text-sm font-medium rounded-md px-4 py-2"
             >
               <UserPlus className="w-4 h-4" /> Personel Ekle
             </button>
@@ -194,10 +200,10 @@ export default function Personnel({ onChanged }) {
 
       {/* FAZ 6.3: Görev Olan Aktif Tarihler Kısayol Çubuğu */}
       {activeDates.length > 0 && (
-        <div className="bg-white border border-slate-200 rounded-xl p-3.5 shadow-sm space-y-2">
+        <div className="bg-white border border-slate-200 rounded-lg p-3.5 shadow-xs space-y-2">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <span className="text-xs font-bold text-slate-700 flex items-center gap-1.5">
-              <CalendarIcon className="w-3.5 h-3.5 text-blue-700" />
+              <CalendarIcon className="w-3.5 h-3.5 text-slate-500" />
               Görevli Günler (Hızlı Geçiş):
             </span>
             <button
@@ -222,7 +228,7 @@ export default function Personnel({ onChanged }) {
                   onClick={() => setDate(dt)}
                   className={`text-xs font-medium px-3 py-1 rounded-full border transition ${
                     isSelected
-                      ? 'bg-blue-700 text-white border-blue-700 shadow-sm'
+                      ? 'bg-slate-900 text-white border-blue-700 shadow-xs'
                       : 'bg-blue-50/60 text-blue-900 border-blue-200 hover:bg-blue-100'
                   }`}
                 >
@@ -237,7 +243,7 @@ export default function Personnel({ onChanged }) {
       {error && <div className="p-3 rounded-md bg-red-50 border border-red-200 text-sm text-red-700">{error}</div>}
 
       {overCount > 0 && (
-        <div className="flex items-center gap-3 rounded-lg border-2 border-red-600 bg-red-50 px-4 py-3">
+        <div className="flex items-center gap-3 rounded-lg border border-red-300 bg-red-50 px-4 py-3">
           <AlertTriangle className="w-5 h-5 text-red-700" />
           <p className="text-sm text-red-900">
             <strong>{overCount} personel</strong> bu tarihte 9 saatlik sınırı aşıyor. Görevler otomatik kaydırılmaz —
@@ -250,7 +256,7 @@ export default function Personnel({ onChanged }) {
           SEKME 1: GÜNLÜK İŞ YÜKÜ BARLARI
          ===================================================================== */}
       {viewTab === 'daily' && (
-        <div className="bg-white border border-slate-200 rounded-lg shadow-sm divide-y divide-slate-100">
+        <div className="bg-white border border-slate-200 rounded-lg shadow-xs divide-y divide-slate-100">
           {loading && !data && <p className="p-8 text-center text-sm text-slate-400">Yükleniyor…</p>}
           {!loading && people.length === 0 && (
             <p className="p-8 text-center text-sm text-slate-400">Kayıtlı aktif personel yok.</p>
@@ -354,7 +360,7 @@ export default function Personnel({ onChanged }) {
           SEKME 2: HAFTALIK İŞ YÜKÜ MATRİSİ (PAZARTESİ - PAZAR)
          ===================================================================== */}
       {viewTab === 'weekly' && weeklyData && (
-        <div className="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+        <div className="bg-white border border-slate-200 rounded-lg shadow-xs overflow-hidden">
           <div className="p-4 border-b border-slate-200 space-y-3">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
@@ -396,7 +402,7 @@ export default function Personnel({ onChanged }) {
                       onClick={() => setDate(wk)}
                       className={`text-[11px] font-medium px-2.5 py-1 rounded-full border transition ${
                         active
-                          ? 'bg-blue-700 text-white border-blue-700'
+                          ? 'bg-slate-900 text-white border-blue-700'
                           : 'bg-slate-50 text-slate-700 border-slate-300 hover:bg-blue-50'
                       }`}
                     >
@@ -410,7 +416,7 @@ export default function Personnel({ onChanged }) {
 
           <div className="overflow-x-auto">
             <table className="w-full text-xs">
-              <thead className="bg-slate-50 border-b border-slate-200 text-slate-600">
+              <thead className="text-xs uppercase tracking-wider bg-slate-50 border-b border-slate-200 text-slate-500">
                 <tr>
                   <th className="text-left px-4 py-3 font-semibold min-w-[200px]">Personel / Rol</th>
                   {weeklyData.days.map((dIso, idx) => (
@@ -538,7 +544,7 @@ export default function Personnel({ onChanged }) {
               <button
                 type="submit"
                 disabled={saving}
-                className="px-4 py-2 bg-blue-700 text-white rounded-md disabled:bg-blue-400"
+                className="px-4 py-2 bg-slate-900 text-white rounded-md disabled:bg-blue-400"
               >
                 {saving ? 'Kaydediliyor…' : 'Kaydet'}
               </button>
