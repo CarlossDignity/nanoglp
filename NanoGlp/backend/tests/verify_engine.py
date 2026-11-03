@@ -831,15 +831,19 @@ def main():
                 "template_code": "ISO_10993_23_IC", "test_name": "X", "restricted_from": "2026-12-01",
                 "restricted_until": "2026-12-17", "reason": "test"})
             check(rs_forbidden.status_code == 403, "QA (salt okunur) test kısıtlaması ekleyemez → 403")
-            bad_rng = client.post("/api/v1/restrictions", headers=h_tfm, json={
+            rs_tfm_forbidden = client.post("/api/v1/restrictions", headers=h_tfm, json={
+                "template_code": "ISO_10993_23_IC", "test_name": "X", "restricted_from": "2026-12-01",
+                "restricted_until": "2026-12-17", "reason": "test"})
+            check(rs_tfm_forbidden.status_code == 403, "TFM test kısıtlaması ekleyemez (Sadece SYSADMIN) → 403")
+            bad_rng = client.post("/api/v1/restrictions", headers=h_admin, json={
                 "template_code": "ISO_10993_23_IC", "test_name": "X", "restricted_from": "2026-12-17",
                 "restricted_until": "2026-12-01", "reason": "test"})
             check(bad_rng.status_code == 422, "Bitiş tarihi başlangıçtan önce olan kısıtlama → 422")
-            rs = client.post("/api/v1/restrictions", headers=h_tfm, json={
+            rs = client.post("/api/v1/restrictions", headers=h_admin, json={
                 "template_code": "ISO_10993_23_IC", "test_name": "İntrakütanöz Reaktivite Testi (ISO 10993-23)",
                 "restricted_from": "2026-12-01", "restricted_until": "2026-12-17",
                 "reason": "Tavşan tedarikçisi sevkiyat aksaklığı"})
-            check(rs.status_code == 201 and rs.json()["is_active"] is True, "POST /restrictions → kısıtlama kaydı oluşturuldu")
+            check(rs.status_code == 201 and rs.json()["is_active"] is True, "POST /restrictions (SYSADMIN) → kısıtlama kaydı oluşturuldu")
             rs_id = rs.json()["id"]
             check(client.get("/api/v1/restrictions", headers=h_exec).status_code == 200, "EXECUTIVE kısıtlamaları görüntüleyebilir (GET → 200)")
             shifted = sched("T-BLK-1", "2026-12-07")
@@ -851,19 +855,19 @@ def main():
             blk_study = db.query(Study).filter(Study.study_code == "T-BLK-1").first()
             db.refresh(blk_study)
             check(exp_notice in (blk_study.description or ""), "Bilgi çalışma kaydına (description) yazıldı")
-            sat_case = client.post("/api/v1/restrictions", headers=h_tfm, json={
+            sat_case = client.post("/api/v1/restrictions", headers=h_admin, json={
                 "template_code": "ALL", "test_name": "Tüm Testler", "restricted_from": "2027-02-01",
                 "restricted_until": "2027-02-05", "reason": "Tesis bakımı"})
             sat_json = client.post("/api/v1/restrictions/preview-shift", headers=h_tfm,
                                    json={"template_code": "ISO_10993_5_CYT", "start_date": "2027-02-03"}).json()
             check(sat_json["shifted"] and sat_json["new_start_date"] == "2027-02-08",
                   "ALL kısıtlaması + takma ad (ISO_10993_5_CYT): Cuma biten kısıtlama → hafta sonu atlanıp Pazartesi'ye öteleme")
-            client.delete(f"/api/v1/restrictions/{sat_case.json()['id']}", headers=h_tfm)
+            client.delete(f"/api/v1/restrictions/{sat_case.json()['id']}", headers=h_admin)
             other_tpl = sched("T-BLK-CYT", "2026-12-07", tpl="ISO_10993_5_CYT")
             check(other_tpl["acclimatization_start_date"] == "2026-12-07" and other_tpl["auto_schedule_notice"] is None,
                   "Kısıtlama yalnızca ilgili test şablonunu etkiler (sitotoksisite ötelenmedi)")
             check(other_tpl["template"]["code"] == "ISO_10993_5_CYTO", "ISO_10993_5_CYT takma adı kanonik şablona çözüldü")
-            check(client.delete(f"/api/v1/restrictions/{rs_id}", headers=h_tfm).status_code == 200, "DELETE /restrictions/{id} → kısıtlama silindi")
+            check(client.delete(f"/api/v1/restrictions/{rs_id}", headers=h_admin).status_code == 200, "DELETE /restrictions/{id} (SYSADMIN) → kısıtlama silindi")
             again = sched("T-BLK-1", "2026-12-07")
             check(again["acclimatization_start_date"] == "2026-12-07" and again["auto_schedule_notice"] is None,
                   "Kısıtlama silinince aynı çalışma talep edilen tarihe planlandı ve otomatik tarih notu temizlendi")
@@ -1207,6 +1211,194 @@ def main():
             dl059 = client.get(f"/api/v1/samples/{s059['id']}/study-plan-docx", headers=h_exec)
             check(dl059.status_code == 200 and dl059.content[:2] == b"PK",
                   "Beklenen/Planlanan/Devam Eden tüm satırlarda Study Plan İndir (.docx) sorunsuz çalışıyor")
+
+            print("\n[16] FAZ 8.4: yigit SYSADMIN Koruması, Test Kısıtlama SYSADMIN Yetkisi, Personel/ÇY Rol Filtresi, Dashboard Erişim Matrisi ve Hızlı Takvim Motoru")
+            me_admin = client.get("/api/v1/auth/me", headers=h_admin).json()
+            check(me_admin["role"] == "SYSADMIN" and me_admin["is_active"] is True and "dashboard" in me_admin["allowed_menus"],
+                  "/api/v1/auth/me → SYSADMIN rolü, aktif durumu ve allowed_menus senkronize")
+            self_demote = client.put(f"/api/v1/users/{me_admin['id']}", headers=h_admin, json={"role": "STUDY_DIRECTOR"})
+            check(self_demote.status_code == 400, "PUT /api/v1/users/{id}: aktif SYSADMIN kendi rolünü düşüremez → 400")
+            self_deact = client.put(f"/api/users/{me_admin['id']}", headers=h_admin, json={"is_active": False})
+            check(self_deact.status_code == 400, "PUT /api/users/{id}: aktif SYSADMIN kendi hesabını pasife alamaz → 400")
+            # Personel ve İş Yükü rol filtreleri
+            pers_list = client.get("/api/v1/personnel", headers=h_tfm).json()
+            forbidden_roles = {"SYSADMIN", "ADMIN", "EXECUTIVE", "SALES", "TRM_KABUL", "TRM_ACCEPTANCE"}
+            check(all(u["role"] not in forbidden_roles and u["username"] != "yigit" for u in pers_list),
+                  "GET /api/v1/personnel: SYSADMIN, EXECUTIVE, SALES ve TRM_KABUL hariç tutuldu")
+            wl_list = client.get("/api/v1/planning/workload?target_date=2026-10-12", headers=h_tfm).json()["personnel"]
+            wl_alias = client.get("/api/v1/planning/personnel-workload?target_date=2026-10-12", headers=h_tfm).json()["personnel"]
+            check(all(p["role"] not in forbidden_roles and p["personnel_id"] != me_admin["id"] for p in wl_list) and len(wl_list) == len(wl_alias),
+                  "GET /workload & /personnel-workload: yalnızca gerçek laboratuvar personeli listeleniyor")
+            # SYSADMIN / EXECUTIVE / SALES ÇY olarak atanamaz
+            bad_sd = client.post("/api/v1/planning/schedule-study", headers=h_tfm,
+                                 json={"study_code": "T-BAD-SD", "acclimatization_start_date": "2027-04-05", "study_director_id": me_admin["id"]})
+            check(bad_sd.status_code == 400, "SYSADMIN (yigit) Çalışma Yöneticisi (SD) olarak atanamaz → 400")
+            # Dashboard erişim matrisi: sadece SYSADMIN, EXECUTIVE ve TFM varsayılan olarak dashboard'a sahip
+            roles_84 = {r["role_code"]: r["allowed_menus"] for r in client.get("/api/v1/users/roles", headers=h_admin).json()}
+            check(all("dashboard" in roles_84[c] for c in ("SYSADMIN", "EXECUTIVE", "TFM"))
+                  and all("dashboard" not in roles_84[c] for c in ("STUDY_DIRECTOR", "PLANNING_COORDINATOR", "QA", "SALES", "TRM_KABUL", "TECHNICIAN")),
+                  "Varsayılan rol matrisi: 'dashboard' sadece SYSADMIN, EXECUTIVE ve TFM rollerinde açık")
+            # Master takvim performans ve yetim çalışma temizliği
+            import time as _t84
+            t0 = _t84.perf_counter()
+            cal84 = client.get("/api/v1/planning/calendar", headers=h_tfm)
+            dt_ms = (_t84.perf_counter() - t0) * 1000
+            cal_codes = {s["study_code"] for s in cal84.json()["studies"]}
+            check(cal84.status_code == 200 and dt_ms < 2500 and not any(c.startswith("NDMA") or c.startswith("GADOBUTROL") for c in cal_codes),
+                  f"GET /api/v1/planning/calendar {len(cal_codes)} çalışmayı {dt_ms:.0f} ms'de döndürdü ve bozuk Non-GLP kodları temizlendi")
+
+            print("\n[17] FAZ 9.2: Geçmiş Görevlerin Kapatılması (Referans: 03.11.2026), Çakışma Kategorizasyonu (CONFIRMED vs MISSING_INFO) ve Recompute Motoru")
+            from app.models.study_step import StepStatus
+            from app.models.sample import SampleRecord
+            rec92 = client.post("/api/v1/planning/recompute-conflicts", headers=h_tfm)
+            db.expire_all()
+            check(rec92.status_code == 200 and rec92.json().get("status") == "success",
+                  "POST /api/v1/planning/recompute-conflicts başarıyla çalıştı")
+            j92 = rec92.json()
+            check(j92["reference_date"] == "2026-11-03" and j92["completed_studies_count"] >= 41 and j92["total_completed_steps"] >= 163,
+                  f"Referans tarih 2026-11-03 baz alınarak biten çalışmalar ({j92['completed_studies_count']}) ve geçmiş adımlar ({j92['total_completed_steps']}) COMPLETED yapıldı")
+            # GLP2026-005 içindeki geçmiş adımlar (11.02.2026 ve 12.05.2026) COMPLETED olmalı; GLP2026-030/062'de < 03.11.2026 COMPLETED ve >= 03.11.2026 PENDING olmalı
+            st005 = db.query(Study).filter(Study.study_code == "GLP2026-005").first()
+            steps005 = db.query(StudyStep).filter(StudyStep.study_id == st005.id).order_by(StudyStep.step_order).all()
+            st030 = db.query(Study).filter(Study.study_code == "GLP2026-030").first()
+            steps030 = db.query(StudyStep).filter(StudyStep.study_id == st030.id).order_by(StudyStep.step_order).all()
+            past030 = [s for s in steps030 if s.planned_start.date() < date(2026, 11, 3)]
+            fut030 = [s for s in steps030 if s.planned_start.date() >= date(2026, 11, 3)]
+            check(all(s.status == StepStatus.COMPLETED for s in steps005)
+                  and len(past030) >= 2 and all(s.status == StepStatus.COMPLETED for s in past030)
+                  and len(fut030) >= 2 and all(s.status != StepStatus.COMPLETED for s in fut030),
+                  "GLP2026-005 (11.02.2026 & 12.05.2026) ve GLP2026-030: 03.11.2026 öncesi geçmiş adımlar COMPLETED, sonrası PENDING olarak korundu")
+            # Aktif görevler filtresi (active_only=true) yalnızca tamamlanmamış ve >= 2026-11-03 adımları döndürmeli
+            act_steps = client.get("/api/v1/planning/steps?biological_only=true&active_only=true", headers=h_tfm).json()
+            all_steps = client.get("/api/v1/planning/steps?biological_only=true&include_all=true&active_only=false", headers=h_tfm).json()
+            check(len(act_steps) > 0 and len(all_steps) > len(act_steps)
+                  and all(s["status"] != "COMPLETED" and s["planned_start"][:10] >= "2026-11-03" for s in act_steps),
+                  f"GET /api/v1/planning/steps?active_only=true yalnızca aktif/bekleyen (>= 03.11.2026) görevleri döndürdü ({len(act_steps)} aktif / {len(all_steps)} toplam)")
+            # Çakışma kategorizasyonu: CONFIRMED_CONFLICT vs MISSING_INFO
+            conf_all = client.get("/api/v1/planning/conflicts?unresolved_only=true", headers=h_tfm).json()
+            conf_real = client.get("/api/v1/planning/conflicts?unresolved_only=true&category=CONFIRMED_CONFLICT", headers=h_tfm).json()
+            conf_miss = client.get("/api/v1/planning/conflicts?unresolved_only=true&category=MISSING_INFO", headers=h_tfm).json()
+            check(len(conf_real) > 0 and len(conf_miss) > 0 and len(conf_real) + len(conf_miss) == len(conf_all),
+                  f"Açık çakışmalar 2 kategoriye ayrıldı: {len(conf_real)} Gerçek Çakışma + {len(conf_miss)} Eksik Bilgi Kaynaklı = {len(conf_all)} Toplam")
+            check(all(c["conflict_category"] == "CONFIRMED_CONFLICT" and len(c.get("missing_info_codes", [])) == 0 for c in conf_real),
+                  "Gerçek Çakışmalar (CONFIRMED_CONFLICT) eksiksiz tarih/atama içeren gerçek darboğazlardan oluşuyor")
+            check(all(c["conflict_category"] == "MISSING_INFO" and len(c.get("missing_info_badges", [])) >= 1 and len(c.get("missing_info_tags", [])) >= 1 for c in conf_miss),
+                  "Eksik Bilgi Sebebiyle Çakışmalar (MISSING_INFO) rozet (missing_info_badges) ve açıklama etiketleri içeriyor")
+            sum92 = client.get("/api/v1/planning/summary", headers=h_tfm).json()
+            check(sum92["confirmed_conflicts"] == len(conf_real) and sum92["missing_info_conflicts"] == len(conf_miss)
+                  and sum92["completed_tasks"] >= 163,
+                  "GET /api/v1/planning/summary: confirmed_conflicts, missing_info_conflicts ve completed_tasks sayıları birebir uyumlu")
+            # Eksik başlangıç tarihi olan bir çalışmaya (GLP2026-031) tarih girildiğinde 'Başlangıç Tarihi Eksik' rozetinin kalktığını doğrula
+            sr031 = db.query(SampleRecord).filter(SampleRecord.study_code == "GLP2026-031").first()
+            plan031 = client.post(f"/api/v1/samples/{sr031.id}/plan", headers=h_tfm, json={"start_date": "2026-12-08"})
+            check(plan031.status_code == 200, "POST /api/v1/samples/{id}/plan ile GLP2026-031 başlangıç tarihi teyit edildi")
+            client.post("/api/v1/planning/recompute-conflicts", headers=h_tfm)
+            conf_after_031 = client.get("/api/v1/planning/conflicts?unresolved_only=true", headers=h_tfm).json()
+            c031_list = [c for c in conf_after_031 if c.get("study_code") == "GLP2026-031" and not c.get("related_study_code")]
+            check(all("MISSING_START_DATE" not in c.get("missing_info_codes", []) for c in c031_list),
+                  "Başlangıç tarihi girilip Recompute çalıştırıldığında GLP2026-031 için 'MISSING_START_DATE' eksik bilgi rozeti kalktı")
+
+            print("\n[18] FAZ 9.3: Otomatik GLP Sayacı (GLP2026-083), Devam Eden (11 Sahada / 22 Rapor-QA), Hayvan/Sarf & Sözleşme ve Excel Dışa Aktarım")
+            nxt93 = client.get("/api/v1/samples/next-code", headers=h_tfm)
+            dos93 = client.get("/api/v1/documents/dossier", headers=h_tfm)
+            check(nxt93.status_code == 200 and nxt93.json()["next_glp_code"] == "GLP2026-083"
+                  and nxt93.json()["next_non_glp_code"] == "NGLP-2026-012"
+                  and dos93.json().get("next_glp_code") == "GLP2026-083",
+                  "Otomatik sıradaki çalışma kodu sayacı: GLP2026-083 (GLP) ve NGLP-2026-012 (Non-GLP)")
+            samp93 = client.get("/api/v1/samples", headers=h_tfm).json()
+            s93_sum = samp93["summary"]
+            s93_items = {it["study_code"]: it for it in samp93["items"]}
+            check(s93_sum["ongoing"] == 33 and s93_sum["ongoing_in_experiment"] == 11
+                  and s93_sum["ongoing_in_reporting"] == 22 and s93_sum["ongoing_overdue_draft"] == 17,
+                  f"Devam Eden (33) çalışma kırılımı: {s93_sum['ongoing_in_experiment']} Sahada Deneyde · {s93_sum['ongoing_in_reporting']} Rapor / QA Aşamasında · {s93_sum['ongoing_overdue_draft']} Taslak Raporu Geciken")
+            psum93 = client.get("/api/v1/planning/summary", headers=h_tfm).json()
+            check(psum93["ongoing_in_experiment"] == 11 and psum93["ongoing_in_reporting"] == 22 and psum93["ongoing_overdue_draft"] == 17,
+                  "GET /api/v1/planning/summary: 11 Sahada Deneyde · 22 Rapor / QA Aşamasında · 17 Taslak Raporu Geciken")
+            check(s93_sum["consumables_pending"] == 3 and s93_sum["quarantine_count"] == 10 and s93_sum["animal_reuse_count"] == 6,
+                  "Excel 16. Sütun dağılımı: 3 Sarf Malzeme Bekleniyor, 10 Karantina (+7g), 6 Tekrar Kullanım (Vet/HADYEK)")
+            check(all(s93_items[c]["animal_status_code"] == "CONSUMABLES_PENDING" and s93_items[c]["animal_status_badge"] == "⚠️ Sarf Malzeme Bekleniyor" for c in ("GLP2026-077", "GLP2026-078", "GLP2026-079")),
+                  "GLP2026-077, 078, 079 (DiSERA): '⚠️ Sarf Malzeme Bekleniyor' uyarı rozeti doğrulandı")
+            check(s93_items["GLP2026-072"]["requires_quarantine"] is True and s93_items["GLP2026-072"]["quarantine_days"] == 7
+                  and s93_items["GLP2026-072"]["animal_status_badge"] == "Karantina (+7g)",
+                  "GLP2026-072 (Mevcut Karantina): 'Karantina (+7g)' rozeti ve +7 gün TAT farkı doğrulandı")
+            check(s93_items["GLP2026-038"]["contract_commitment_date"] == "2026-11-10"
+                  and s93_items["GLP2026-029"]["contract_commitment_date"] == "2026-09-30"
+                  and s93_items["GLP2026-072"]["contract_commitment_date"] == "2026-12-26"
+                  and s93_items["GLP2026-072"]["is_contract_deadline_exceeded"] is True,
+                  "SPONSOR SÖZLŞ.-SPONSOR AGREEM. sekmesinden sözleşme/taahhüt tarihleri ve 'Sözleşme Termini Aşılıyor' uyarısı doğrulandı")
+            exp_xl = client.get("/api/v1/samples/export-excel", headers=h_tfm)
+            check(exp_xl.status_code == 200
+                  and "spreadsheetml.sheet" in exp_xl.headers.get("content-type", "")
+                  and len(exp_xl.content) > 10000,
+                  f"GET /api/v1/samples/export-excel başarıyla çalıştı ({len(exp_xl.content)} byte .xlsx)")
+            from openpyxl import load_workbook as _lwb93
+            wb93 = _lwb93(io.BytesIO(exp_xl.content), read_only=True)
+            ws93 = wb93.active
+            rows93 = list(ws93.iter_rows(values_only=True))
+            wb93.close()
+            check(len(rows93) == 94 and len(rows93[0]) == 23 and rows93[0][0] == "Sıra No" and rows93[0][22] == "11 Adımlı İş Akışı Özeti",
+                  f"İndirilen Excel (.xlsx) dosyası 1 başlık + 93 çalışma satırı ve 23 kurumsal sütun içeriyor")
+
+            print("\n[19] FAZ 10: Güvenlik Denetimi (Auth Audit, Brute-Force 429, Şifre Değiştirme, Dosya Güvenliği, WAL Modu & Security Headers)")
+            from sqlalchemy import text as _sql_text
+            from app.api.v1.endpoints.auth import reset_login_rate_limiter
+            from app.main import create_app
+
+            # 19a) Anonim erişim reddi
+            for anon_ep in ("/api/v1/samples", "/api/v1/planning/calendar", "/api/v1/studies/", "/api/v1/documents",
+                            "/api/v1/restrictions", "/api/v1/room-capacities", "/api/v1/long-equipment", "/api/v1/personnel/"):
+                check(client.get(anon_ep).status_code == 401, f"Token olmadan GET {anon_ep} → 401")
+
+            # 19b) Brute-Force Rate Limiting (5 başarısız deneme sonrası 6. denemede 429 + AuditLog)
+            reset_login_rate_limiter()
+            bf_ip = "198.51.100.77"
+            for _i in range(5):
+                client.post("/api/v1/auth/login", json={"username": "admin", "password": "BadPassword!"}, headers={"X-Forwarded-For": bf_ip})
+            bf_resp = client.post("/api/v1/auth/login", json={"username": "admin", "password": DEFAULT_PASSWORD}, headers={"X-Forwarded-For": bf_ip})
+            check(bf_resp.status_code == 429 and db.query(AuditLog).filter(AuditLog.action == "LOGIN_RATE_LIMIT_LOCKOUT").count() >= 1,
+                  "Brute-Force Koruması: 60 sn içinde >5 başarısız giriş → HTTP 429 Too Many Requests + AuditLog")
+            reset_login_rate_limiter()
+
+            # 19c) Şifre değiştirme (/api/v1/auth/change-password)
+            check(client.post("/api/v1/auth/change-password", headers=h_sd,
+                              json={"current_password": "Wrong", "new_password": "NewPassword2026!"}).status_code == 400,
+                  "POST /auth/change-password: hatalı mevcut şifre → 400")
+            check(client.post("/api/v1/auth/change-password", headers=h_sd,
+                              json={"current_password": DEFAULT_PASSWORD, "new_password": "short"}).status_code == 422,
+                  "POST /auth/change-password: <8 karakter şifre → 422")
+            cp_ok = client.post("/api/v1/auth/change-password", headers=h_sd,
+                                json={"current_password": DEFAULT_PASSWORD, "new_password": "EzgiSecure2026!"})
+            check(cp_ok.status_code == 200 and db.query(AuditLog).filter(AuditLog.action == "CHANGE_PASSWORD").count() >= 1,
+                  "POST /auth/change-password: şifre bcrypt ile güncellendi ve AuditLog'a yazıldı")
+            h_sd_new = auth_headers(client, "ezgi", "EzgiSecure2026!")
+            client.post("/api/v1/auth/change-password", headers=h_sd_new,
+                        json={"current_password": "EzgiSecure2026!", "new_password": DEFAULT_PASSWORD})
+
+            # 19d) Dosya yükleme güvenliği (Path Traversal, Magic Bytes, .sh/.php/.js reddi)
+            check(client.post("/api/v1/documents/upload", headers=h_tfm,
+                              files={"file": ("../../etc/passwd.txt", b"test", "text/plain")}).status_code == 400,
+                  "Path Traversal ('../../etc/passwd.txt') reddedildi → 400")
+            check(client.post("/api/v1/documents/upload", headers=h_tfm,
+                              files={"file": ("fake.pdf", b"MZ\x90\x00ExecutableDisguisedAsPdf", "application/pdf")}).status_code == 415,
+                  "Magic Bytes kontrolü: PDF uzantılı çalıştırılabilir (MZ) sahte dosya reddedildi → 415")
+            check(client.post("/api/v1/samples/import-excel", headers=h_tfm,
+                              files={"file": ("shell.php", b"<?php echo 1; ?>", "application/x-php")}).status_code == 415,
+                  "import-excel: çalıştırılabilir (.php) dosya reddedildi → 415")
+
+            # 19e) SQLite WAL Modu & HTTP Security Headers & Production Docs Kapatma
+            with engine.connect() as _conn:
+                wal_mode = str(_conn.execute(_sql_text("PRAGMA journal_mode;")).scalar()).lower()
+                fk_on = int(_conn.execute(_sql_text("PRAGMA foreign_keys;")).scalar())
+            check(wal_mode == "wal" and fk_on == 1, f"SQLite WAL modu ('{wal_mode}') ve foreign_keys ({fk_on}) aktif")
+            sec_h = client.get("/api/v1/health").headers
+            check(sec_h.get("X-Content-Type-Options") == "nosniff" and sec_h.get("X-Frame-Options") == "DENY"
+                  and sec_h.get("X-XSS-Protection") == "1; mode=block"
+                  and sec_h.get("Referrer-Policy") == "strict-origin-when-cross-origin",
+                  "HTTP Security Headers (nosniff, DENY, XSS-Protection, Referrer-Policy) doğrulandı")
+            prod_c = TestClient(create_app(is_production=True))
+            check(prod_c.get("/docs").status_code == 404 and prod_c.get("/redoc").status_code == 404
+                  and prod_c.get("/openapi.json").status_code == 404,
+                  "ENV=production modunda /docs, /redoc ve /openapi.json devre dışı (404)")
         finally:
             dp._llm_call = original_llm
     finally:

@@ -1,4 +1,5 @@
 import React, { useMemo, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import {
   ShieldAlert,
   Lock,
@@ -10,8 +11,12 @@ import {
   Wrench,
   Users,
   Clock,
+  FileUp,
+  ExternalLink,
+  Info,
 } from 'lucide-react';
 import { conflictTypeLabel, fmtDateWeekday } from '../utils/format';
+import { usePreferences } from '../state/PreferencesContext';
 
 /** Çakışma tipi + önem derecesine göre net kategori rozeti metni */
 const categoryLabel = (type, severity) => {
@@ -53,7 +58,10 @@ export default function ConflictAlert({
   onApplyResolution,
   isReadOnly = false,
   steps = [],
+  showNavigationLinks = false,
 }) {
+  const navigate = useNavigate();
+  const { t, lang, formatStatusBadge } = usePreferences();
   const [busyKey, setBusyKey] = useState(null);
   const stepMap = useMemo(() => new Map((steps || []).map((s) => [s.id, s])), [steps]);
 
@@ -77,26 +85,27 @@ export default function ConflictAlert({
     <div
       role="alert"
       className={`rounded-lg border bg-white shadow-xs overflow-hidden ${
-        hasCritical ? 'border-red-200' : 'border-amber-200'
+        hasCritical ? 'border-red-300 dark:border-red-900' : 'border-amber-300 dark:border-amber-800'
       }`}
     >
       {/* Başlık şeridi */}
       <div
         className={`px-5 py-3.5 flex flex-wrap items-center justify-between gap-3 border-b ${
-          hasCritical ? 'bg-red-50/70 border-red-100' : 'bg-amber-50/70 border-amber-100'
+          hasCritical
+            ? 'nl-conflict-banner bg-[#fef2f2] border-[#fecaca]'
+            : 'bg-amber-50 border-amber-200'
         }`}
       >
         <div className="flex items-center gap-3">
-          <span className={hasCritical ? 'text-red-600' : 'text-amber-600'}>
+          <span className={hasCritical ? 'text-red-700 dark:text-red-300' : 'text-amber-600'}>
             {hasCritical ? <ShieldAlert className="w-4 h-4" /> : <AlertTriangle className="w-4 h-4" />}
           </span>
           <div>
-            <p className={`text-sm font-semibold tracking-tight ${hasCritical ? 'text-red-900' : 'text-amber-900'}`}>
-              {title ||
-                (hasCritical ? 'GLP kritik çakışması tespit edildi' : 'GLP hafta sonu / mesai uyarısı — karar destek seçenekleri')}
+            <p className={`text-sm font-semibold tracking-tight ${hasCritical ? 'nl-conflict-title text-[#991b1b]' : 'text-amber-900'}`}>
+              {title ? t(title) : hasCritical ? t('GLP kritik çakışması tespit edildi') : t('GLP hafta sonu / mesai uyarısı — karar destek seçenekleri')}
             </p>
-            <p className="text-xs text-slate-500">
-              Takvim kendiliğinden kaydırılmadı; kararınızı aşağıdaki tek tık çözüm seçenekleriyle uygulayın.
+            <p className={`text-xs ${hasCritical ? 'nl-conflict-subtitle text-[#7f1d1d]' : 'text-amber-800'}`}>
+              {t('Takvim kendiliğinden kaydırılmadı; kararınızı aşağıdaki tek tık çözüm seçenekleriyle uygulayın.')}
             </p>
           </div>
         </div>
@@ -104,13 +113,13 @@ export default function ConflictAlert({
           {criticalCount > 0 && (
             <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded border border-red-200 bg-white text-red-800">
               <span className="w-1.5 h-1.5 rounded-full bg-red-500" />
-              <span className="font-mono">{criticalCount}</span> CRITICAL
+              <span className="font-mono">{criticalCount}</span> {formatStatusBadge('CRITICAL')}
             </span>
           )}
           {warningCount > 0 && (
             <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded border border-amber-200 bg-white text-amber-800">
               <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
-              <span className="font-mono">{warningCount}</span> WARNING
+              <span className="font-mono">{warningCount}</span> {formatStatusBadge('WARNING')}
             </span>
           )}
         </div>
@@ -121,6 +130,9 @@ export default function ConflictAlert({
         {conflicts.map((c) => {
           const type = c.type || c.conflict_type;
           const isWarn = c.severity === 'WARNING';
+          const isMissingInfo = c.conflict_category === 'MISSING_INFO';
+          const missingBadges = c.missing_info_badges || [];
+          const missingTags = c.missing_info_tags || [];
           const Icon = iconFor(type, c.severity);
           const resolutions = c.resolutions || [];
           const stepIds = c.step_ids && c.step_ids.length ? c.step_ids : c.step_id ? [c.step_id] : [];
@@ -131,16 +143,26 @@ export default function ConflictAlert({
             <li
               key={c.id}
               className={`bg-white rounded-lg border shadow-xs p-4 flex gap-3 border-l-2 ${
-                isWarn ? 'border-slate-200 border-l-amber-400' : 'border-slate-200 border-l-red-500'
+                isMissingInfo
+                  ? 'border-slate-200 border-l-amber-500'
+                  : isWarn
+                    ? 'border-slate-200 border-l-amber-400'
+                    : 'border-slate-200 border-l-red-500'
               }`}
             >
-              <span className={`shrink-0 mt-0.5 ${isWarn ? 'text-amber-600' : 'text-red-600'}`}>
+              <span className={`shrink-0 mt-0.5 ${isMissingInfo || isWarn ? 'text-amber-600' : 'text-red-600'}`}>
                 <Icon className="w-4 h-4" />
               </span>
 
               <div className="flex-1 min-w-0 space-y-2.5">
                 {/* Rozetler */}
                 <div className="flex flex-wrap items-center gap-1.5">
+                  {c.study_code && (
+                    <span className="inline-flex items-center gap-1 font-mono text-[11px] font-bold px-2 py-0.5 rounded bg-slate-900 text-white">
+                      {c.study_code}
+                      {c.related_study_code ? ` ↔ ${c.related_study_code}` : ''}
+                    </span>
+                  )}
                   <span className="inline-flex items-center gap-1.5 text-[11px] font-medium tracking-wide text-slate-700">
                     <span className={`w-1.5 h-1.5 rounded-full ${isWarn ? 'bg-amber-400' : 'bg-red-500'}`} />
                     {c.severity}
@@ -154,6 +176,15 @@ export default function ConflictAlert({
                   >
                     {categoryLabel(type, c.severity)}
                   </span>
+                  {missingBadges.map((b) => (
+                    <span
+                      key={b}
+                      className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-md bg-amber-50 text-amber-900 border border-amber-300"
+                    >
+                      <Info className="w-3 h-3 text-amber-600" />
+                      {t(b)}
+                    </span>
+                  ))}
                   {affected.map((s) => (
                     <span
                       key={s.id}
@@ -162,12 +193,58 @@ export default function ConflictAlert({
                       G{s.study_day} • {fmtDateWeekday(s.planned_start)}
                     </span>
                   ))}
+                  {!affected.length && c.planned_start && (
+                    <span className="text-[11px] font-mono font-medium px-2 py-0.5 rounded-md bg-slate-100 text-slate-700 border border-slate-200">
+                      {fmtDateWeekday(c.planned_start)}
+                    </span>
+                  )}
                 </div>
 
                 <div>
                   <p className="text-sm font-semibold text-slate-900 leading-snug">{c.title}</p>
                   <p className="text-xs text-slate-600 leading-relaxed mt-1">{c.description}</p>
                 </div>
+
+                {missingTags.length > 0 && (
+                  <div className="rounded-md border border-amber-200 bg-amber-50/70 px-3 py-2 space-y-1">
+                    {missingTags.map((tag) => (
+                      <p key={tag} className="text-xs font-medium text-amber-900 flex items-center gap-1.5">
+                        <span className="w-1.5 h-1.5 rounded-full bg-amber-500 shrink-0" />
+                        <span>{t(tag)}</span>
+                      </p>
+                    ))}
+                  </div>
+                )}
+
+                {(showNavigationLinks || isMissingInfo) && (c.study_code || c.study_id) && (
+                  <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                    {c.study_code && (
+                      <button
+                        type="button"
+                        onClick={() => navigate('/samples', { state: { highlightStudyCode: c.study_code } })}
+                        className="inline-flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1 rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 transition"
+                      >
+                        <FileUp className="w-3.5 h-3.5 text-slate-500" />
+                        <span>
+                          {t(
+                            'Numune & Çalışma Takip’te Düzenle / PDF Yükle',
+                            'Edit / Upload PDF in Sample & Study Tracking'
+                          )}
+                        </span>
+                      </button>
+                    )}
+                    {c.study_id && (
+                      <button
+                        type="button"
+                        onClick={() => navigate('/planning', { state: { selectedStudyId: c.study_id } })}
+                        className="inline-flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1 rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 transition"
+                      >
+                        <ExternalLink className="w-3.5 h-3.5 text-slate-500" />
+                        <span>{t('Planlama & Takvimde Aç', 'Open in Planning & Calendar')}</span>
+                      </button>
+                    )}
+                  </div>
+                )}
 
                 {showActions && (
                   <div className="pt-1">

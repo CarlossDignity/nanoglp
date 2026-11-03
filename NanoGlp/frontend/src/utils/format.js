@@ -4,18 +4,27 @@ export const todayISO = () => {
   return new Date(d - tz).toISOString().slice(0, 10);
 };
 
+const isEnLang = () => {
+  try {
+    return typeof localStorage !== 'undefined' && localStorage.getItem('nanolab_lang') === 'en';
+  } catch {
+    return false;
+  }
+};
+
 export const fmtDateTime = (iso) =>
-  new Date(iso).toLocaleString('tr-TR', {
+  new Date(iso).toLocaleString(isEnLang() ? 'en-GB' : 'tr-TR', {
     day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit',
   });
 
 export const fmtDate = (iso) =>
-  new Date(iso).toLocaleDateString('tr-TR', { day: '2-digit', month: 'short', year: 'numeric' });
+  new Date(iso).toLocaleDateString(isEnLang() ? 'en-GB' : 'tr-TR', { day: '2-digit', month: 'short', year: 'numeric' });
 
 export const fmtTime = (iso) =>
-  new Date(iso).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' });
+  new Date(iso).toLocaleTimeString(isEnLang() ? 'en-GB' : 'tr-TR', { hour: '2-digit', minute: '2-digit' });
 
 const WEEKDAY_ABBR_TR = ['Paz', 'Pzt', 'Sal', 'Çar', 'Per', 'Cum', 'Cmt'];
+const WEEKDAY_ABBR_EN = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
 /** "08.08.2026 Cmt" biçiminde tarih + kısa gün adı */
 export const fmtDateWeekday = (iso) => {
@@ -23,12 +32,16 @@ export const fmtDateWeekday = (iso) => {
   const d = new Date(iso.length === 10 ? `${iso}T00:00:00` : iso);
   const dd = String(d.getDate()).padStart(2, '0');
   const mm = String(d.getMonth() + 1).padStart(2, '0');
-  return `${dd}.${mm}.${d.getFullYear()} ${WEEKDAY_ABBR_TR[d.getDay()]}`;
+  const abbr = isEnLang() ? WEEKDAY_ABBR_EN[d.getDay()] : WEEKDAY_ABBR_TR[d.getDay()];
+  return `${dd}.${mm}.${d.getFullYear()} ${abbr}`;
 };
 
 export const fmtMinutes = (m) => {
   const h = Math.floor(m / 60);
   const r = m % 60;
+  if (isEnLang()) {
+    return h ? `${h} hr${r ? ` ${r} min` : ''}` : `${r} min`;
+  }
   return h ? `${h} sa${r ? ` ${r} dk` : ''}` : `${r} dk`;
 };
 
@@ -36,6 +49,11 @@ export const fmtMinutes = (m) => {
 export const relativeFromNow = (iso) => {
   const diffMs = new Date(iso) - new Date();
   const hours = Math.round(diffMs / 3600000);
+  if (isEnLang()) {
+    if (hours < 0) return 'Ongoing';
+    if (hours < 24) return `in ${hours} hr`;
+    return `in ${Math.round(hours / 24)} days`;
+  }
   if (hours < 0) return 'Devam ediyor';
   if (hours < 24) return `${hours} saat sonra`;
   return `${Math.round(hours / 24)} gün sonra`;

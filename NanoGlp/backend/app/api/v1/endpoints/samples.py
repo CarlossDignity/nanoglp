@@ -1,4 +1,5 @@
 import copy
+import os
 import re
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
@@ -18,6 +19,7 @@ from app.services import document_ingest as di
 from app.services import sample_service as ss
 from app.services.document_parser import SUPPORTED_EXTENSIONS
 from app.services.study_plan_docx import generate_study_plan_docx
+from app.utils.file_security import validate_and_sanitize_upload
 from app.utils.security import get_current_user
 
 router = APIRouter(prefix="/samples", tags=["Numune ve Çalışma Takip (FAZ 8.1)"])
@@ -42,6 +44,7 @@ class ContactIn(BaseModel):
 
 class SampleIn(BaseModel):
     study_code: Optional[str] = None
+    glp_type: Optional[str] = None
     template_code: Optional[str] = None
     requested_analysis: Optional[str] = None
     test_item_name: Optional[str] = None
@@ -51,11 +54,15 @@ class SampleIn(BaseModel):
     quote_no: Optional[str] = None
     sales_manager: Optional[str] = None
     expected_arrival_date: Optional[date] = None
+    study_agreement_date: Optional[date] = None
+    payment_status: Optional[str] = None
     sample_status: Optional[str] = None
     test_item_code: Optional[str] = None
     istanbul_arrival_date: Optional[date] = None
     lab_arrival_date: Optional[date] = None
     received_quantity: Optional[str] = None
+    animal_consumable_status: Optional[str] = None
+    animal_procurement_date: Optional[date] = None
     lot_no: Optional[str] = None
     expiry_date: Optional[str] = None
     storage_condition: Optional[str] = None
@@ -178,10 +185,17 @@ async def import_excel(
     perms = ss.sample_permissions(current_user)
     if not perms["can_import"]:
         raise HTTPException(status_code=403, detail="Excel içe aktarma yetkiniz yok.")
-    content = await file.read()
+    limit = settings.MAX_UPLOAD_MB * 1024 * 1024
+    content = await file.read(limit + 1)
     if not content:
         raise HTTPException(status_code=400, detail="Dosya boş.")
-    if ss.is_study_status_workbook(file.filename or "", content):
+    clean_filename, _ext = validate_and_sanitize_upload(
+        raw_filename=file.filename or "",
+        content=content,
+        allowed_extensions={"xlsx", "xls", "csv"},
+        max_mb=settings.MAX_UPLOAD_MB,
+    )
+    if ss.is_study_status_workbook(clean_filename, content):
         try:
             result = ss.import_study_status_workbook(db, content, current_user, auto_schedule=True, prune_non_excel=True)
         except ValueError as ve:
@@ -191,7 +205,7 @@ async def import_excel(
         result["data"] = _list_payload(db, perms)
         return result
     try:
-        records = ss.read_tabular_file(file.filename or "", content)
+        records = ss.read_tabular_file(clean_filename, content)
     except ValueError as ve:
         raise HTTPException(status_code=422, detail=str(ve))
     except Exception as exc:  # bozuk dosya
@@ -229,6 +243,23 @@ def auto_schedule_all(db: Session = Depends(get_db), current_user: User = Depend
     }
 
 
+@router.get("/next-code", summary="Sıradaki Önerilen GLP ve Non-GLP Çalışma Kodu (FAZ 9.3)")
+def get_next_study_code(db: Session = Depends(get_db), current_user: User = Depends(require_samples_access)):
+    return ss.compute_next_study_codes(db)
+
+
+@router.get("/export-excel", summary="Güncel Çalışma Takip Listesini Excel (.xlsx) Olarak İndir (FAZ 9.3)")
+def export_samples_excel(db: Session = Depends(get_db), current_user: User = Depends(require_samples_access)):
+    perms = ss.sample_permissions(current_user)
+    xlsx_bytes = ss.export_samples_workbook_bytes(db, perms)
+    filename = "NANOLAB_GLP_Calisma_Takip_Listesi.xlsx"
+    return Response(
+        content=xlsx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.get("/{sample_id}", summary="Numune / Çalışma Detayı (11 adımlı iş akışı dahil)")
 def get_sample(sample_id: int, db: Session = Depends(get_db), current_user: User = Depends(require_samples_access)):
     sample = _get_or_404(db, sample_id)
@@ -244,6 +275,8 @@ def update_sample(
 ):
     sample = _get_or_404(db, sample_id)
     perms = ss.sample_permissions(current_user)
+    if not (perms["can_edit_sales"] or perms["can_edit_trm"] or perms["can_assign_planning"]):
+        raise HTTPException(status_code=403, detail="Numune kaydı düzenleme yetkiniz bulunmamaktadır.")
     data = _payload_dict(payload)
     data.pop("study_code", None)
     _check_edit_perms(data, perms)
@@ -311,6 +344,13 @@ def plan_one(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(pe))
     except ValueError as ve:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
+    if payload.start_date is not None and sample.planned_start is not None:
+        sample.experiment_start_date = sample.planned_start
+        st_obj = ss.find_study(db, sample.study_code)
+        if st_obj is not None:
+            meta = dict(st_obj.dossier_metadata or {})
+            meta["start_date_confirmed"] = True
+            st_obj.dossier_metadata = meta
     out = ss.serialize_sample(db, sample, perms)
     db.commit()
     return {"plan": plan, "sample": out}
@@ -434,21 +474,27 @@ def upload_sample_documents(
     limit = settings.MAX_UPLOAD_MB * 1024 * 1024
     results: List[Dict[str, Any]] = []
     for f in files:
-        name = (f.filename or "").replace("\\", "/").split("/")[-1].strip()
-        row: Dict[str, Any] = {"filename": name, "ok": False}
+        raw_name = f.filename or ""
+        name = os.path.basename(raw_name.replace("\\", "/")).strip()
+        row: Dict[str, Any] = {"filename": name or raw_name, "ok": False}
         try:
-            if not name:
+            if not raw_name.strip():
                 raise ValueError("Dosya adı eksik.")
             data = f.file.read(limit + 1)
             if not data:
                 raise ValueError("Dosya boş.")
             if len(data) > limit:
-                raise ValueError(f"Dosya {settings.MAX_UPLOAD_MB} MB sınırını aşıyor.")
-            doc, err = di.ingest_document(db, data, name, f.content_type, sample.study_code, label, current_user)
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail=f"Dosya boyutu {settings.MAX_UPLOAD_MB} MB sınırını aşıyor.",
+                )
+            doc, err = di.ingest_document(db, data, raw_name, f.content_type, sample.study_code, label, current_user)
             row.update(_doc_row(doc))
             row["ok"] = err is None
             if err is not None:
                 row["error"] = err.message
+        except HTTPException:
+            raise
         except ValueError as ve:
             row["error"] = str(ve)
         except Exception as exc:  # beklenmeyen ayrıştırma hatası tek dosyayı düşürsün

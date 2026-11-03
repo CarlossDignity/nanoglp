@@ -8,6 +8,7 @@ import {
   extractError,
 } from '../services/api';
 import { todayISO } from '../utils/format';
+import { usePreferences } from '../state/PreferencesContext';
 
 const fmt = (iso) => {
   if (!iso) return '—';
@@ -21,6 +22,7 @@ const fmt = (iso) => {
  * Takvim motoru, kısıtlı aralığa denk gelen Gün 0'ı otomatik olarak restricted_until + 1 (ilk iş günü) tarihine öteler.
  */
 export default function RestrictionManager({ canEdit = false, embedded = false }) {
+  const { t, tr, lang } = usePreferences();
   const [rows, setRows] = useState([]);
   const [templates, setTemplates] = useState([]);
   const [loading, setLoading] = useState(true);

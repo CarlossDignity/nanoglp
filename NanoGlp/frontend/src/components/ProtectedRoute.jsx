@@ -17,7 +17,7 @@ const MENU_KEY_TO_PATH = {
 };
 
 export default function ProtectedRoute({ allowedRoles, menuKey, children }) {
-  const { isAuthenticated, authChecking, role, allowedMenus } = useAuth();
+  const { isAuthenticated, authChecking, role, allowedMenus, defaultHomeRoute } = useAuth();
   const location = useLocation();
 
   if (authChecking) {
@@ -33,7 +33,7 @@ export default function ProtectedRoute({ allowedRoles, menuKey, children }) {
     return <Navigate to="/login" state={{ from: location }} replace />;
   }
 
-  const firstAllowedPath = MENU_KEY_TO_PATH[allowedMenus?.[0]] || (role === 'TECHNICIAN' ? '/my-tasks' : '/');
+  const firstAllowedPath = defaultHomeRoute || MENU_KEY_TO_PATH[allowedMenus?.[0]] || (role === 'TECHNICIAN' ? '/my-tasks' : '/samples');
 
   if (menuKey && Array.isArray(allowedMenus) && !allowedMenus.includes(menuKey)) {
     return <Navigate to={firstAllowedPath} replace />;

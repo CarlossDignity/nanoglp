@@ -145,10 +145,14 @@ def find_study(db: Session, code: str) -> Optional[Study]:
 
 
 def match_study_director(db: Session, name: Optional[str], include_inactive: bool = False) -> Optional[User]:
-    q = db.query(User).filter(User.role == UserRole.STUDY_DIRECTOR)
+    q = db.query(User).filter(User.role == UserRole.STUDY_DIRECTOR, User.username != "yigit")
     if not include_inactive:
         q = q.filter(User.is_active == True)  # noqa: E712
-    sds = q.order_by(User.id).all()
+    sds = [
+        u for u in q.order_by(User.id).all()
+        if (u.role.value if hasattr(u.role, "value") else str(u.role or "")).strip().upper() == "STUDY_DIRECTOR"
+        and (u.username or "").strip().lower() != "yigit"
+    ]
     if name:
         key = norm_key(name)
         for u in sds:
@@ -196,12 +200,243 @@ def _approvals_done(state: Dict[str, Any]) -> bool:
     return all(k in ap for k in APPROVAL_ROLES)
 
 
+REFERENCE_DATE = date(2026, 11, 3)
+
+# FAZ 9.3: Excel 4. Sekme (SPONSOR SÖZLŞ.-SPONSOR AGREEM.) firma sözleşme ve taahhüt tarihleri kataloğu
+SPONSOR_AGREEMENT_CATALOG: Dict[str, Dict[str, Any]] = {
+    "toxlab": {
+        "agreement_date": date(2026, 7, 16),
+        "person": "Pınar Erkekoğlu",
+        "email": "pinartox@gmail.com",
+        "items": (
+            (("prp kit",), date(2026, 11, 10), None),
+            (("prp syrnge", "prp syringe"), date(2026, 11, 10), None),
+            (("fat processor",), date(2026, 11, 15), None),
+            (("hydrogel",), date(2026, 11, 15), None),
+        ),
+    },
+    "inovabella": {
+        "agreement_date": date(2026, 7, 22),
+        "person": "Fatma Sezer ŞENOL DENİZ",
+        "email": "feseaser@gmail.com",
+        "items": (
+            (("inovaped",), date(2027, 1, 10), None),
+        ),
+    },
+    "plastimed": {
+        "agreement_date": date(2026, 6, 19),
+        "person": "Cemre Nur EKİNLİ",
+        "email": "cemre.ekinli@plasti-med.com.tr",
+        "items": (
+            (("bakteri viral", "hme filtre"), date(2026, 10, 28), None),
+        ),
+    },
+    "elisa": {
+        "agreement_date": date(2026, 6, 15),
+        "person": "Nadir Akar",
+        "email": "elisatibbi@gmail.com",
+        "items": (
+            (("caha",), date(2026, 12, 26), "İmplantasyon Hariç: 26.12.2026"),
+            (("plla",), date(2026, 12, 26), "İmplantasyon Hariç: 26.12.2026"),
+            (("ultra", "advanced"), date(2026, 10, 15), "İmplantasyon Hariç: 15.10.2026"),
+            (("aqua",), date(2026, 10, 15), "İmplantasyon Hariç: 15.10.2026"),
+            (("hpmc", "ophtalmic"), date(2026, 10, 30), "İmplantasyon Hariç: 30.10.2026"),
+        ),
+    },
+    "merken": {
+        "agreement_date": date(2026, 6, 15),
+        "person": "Nadir Akar",
+        "email": "elisatibbi@gmail.com",
+        "items": (
+            (("caha",), date(2026, 12, 26), "İmplantasyon Hariç: 26.12.2026"),
+            (("plla",), date(2026, 12, 26), "İmplantasyon Hariç: 26.12.2026"),
+            (("ultra", "advanced"), date(2026, 10, 15), "İmplantasyon Hariç: 15.10.2026"),
+            (("aqua",), date(2026, 10, 15), "İmplantasyon Hariç: 15.10.2026"),
+            (("hpmc", "ophtalmic"), date(2026, 10, 30), "İmplantasyon Hariç: 30.10.2026"),
+        ),
+    },
+    "meditera": {
+        "agreement_date": date(2026, 10, 2),
+        "person": "Bora MALTEPE / Sinem KİRAZ",
+        "email": "bora.maltepe@meditera.com.tr, sinem.kiraz@meditera.com.tr",
+        "items": (
+            (("povidon",), date(2026, 11, 10), None),
+            (("chlorhexidal",), date(2026, 11, 10), None),
+        ),
+    },
+    "medfors": {
+        "agreement_date": date(2026, 8, 5),
+        "person": "Barış ARSLAN",
+        "email": "barisarslan@medforsfarma.com.tr",
+        "items": (
+            (("tetagil",), date(2026, 12, 13), None),
+        ),
+    },
+    "alkan": {
+        "agreement_date": date(2026, 5, 8),
+        "person": "Tuna EROĞLU",
+        "email": "tunaeroglu@forelli.com.tr",
+        "items": (
+            (("ayak giysisi",), date(2026, 12, 10), None),
+        ),
+    },
+    "saniter": {
+        "agreement_date": date(2026, 3, 17),
+        "person": "Özge KOÇAK",
+        "email": "ozge@incelermedikal.com",
+        "items": (
+            (("manson",), date(2026, 12, 10), None),
+        ),
+    },
+    "forenscope": {
+        "agreement_date": date(2026, 3, 17),
+        "person": "Pelin Sayıtoğlu",
+        "email": "pelinelifs.oglu@forenscope.com",
+        "items": (
+            (("forenscope", "fingerprint"), date(2026, 9, 30), None),
+        ),
+    },
+    "disera": {
+        "agreement_date": date(2026, 9, 15),
+        "person": "Dilek BOSTANCIOĞLU",
+        "email": "d.uzumcu@disera.com.tr",
+        "items": (
+            (("appearance", "citrate", "sodyum"), None, "Sarf malzeme bekleniyor"),
+        ),
+    },
+}
+
+
+def classify_animal_consumable_status(raw_status: Optional[str]) -> Dict[str, Any]:
+    """FAZ 9.3: Excel 16. sütun (Hayvan/Sarf Malzeme Yeterlilik Durumu) rozet ve karantina analizi."""
+    k = norm_key(raw_status)
+    if not k or k == "-":
+        return {
+            "code": None,
+            "badge": None,
+            "requires_quarantine": False,
+            "quarantine_days": 0,
+        }
+    if "sarf" in k and "bekleniyor" in k:
+        return {
+            "code": "CONSUMABLES_PENDING",
+            "badge": "⚠️ Sarf Malzeme Bekleniyor",
+            "requires_quarantine": False,
+            "quarantine_days": 0,
+        }
+    if "karantina" in k:
+        return {
+            "code": "QUARANTINE",
+            "badge": "Karantina (+7g)",
+            "requires_quarantine": True,
+            "quarantine_days": 7,
+        }
+    if "tekrar" in k:
+        return {
+            "code": "ANIMAL_REUSE",
+            "badge": "Tekrar Kullanım (Vet/HADYEK)",
+            "requires_quarantine": False,
+            "quarantine_days": 0,
+        }
+    return {
+        "code": "AVAILABLE",
+        "badge": None,
+        "requires_quarantine": False,
+        "quarantine_days": 0,
+    }
+
+
+def resolve_sponsor_agreement_info(sample: SampleRecord) -> Dict[str, Any]:
+    """FAZ 9.3: Sponsor sözleşmesi tarihi ve müşteri taahhüt (planlanan gönderim) tarihini çözümler."""
+    wf = dict(sample.workflow or {})
+    stored_contract = wf.get("_contract") or {}
+    ag_date = sample.study_agreement_date or parse_date_any(stored_contract.get("agreement_date"))
+    commit_date = parse_date_any(stored_contract.get("commitment_date"))
+    commit_note = stored_contract.get("commitment_note")
+    person = stored_contract.get("person")
+    email = stored_contract.get("email")
+
+    fk = None
+    for cand in (sample.billing_company, sample.sponsor_name):
+        c_fk = _wf_firm_cat(cand)
+        if c_fk in SPONSOR_AGREEMENT_CATALOG:
+            fk = c_fk
+            break
+    if fk is None:
+        item_k = norm_key(sample.test_item_name)
+        if "merken" in item_k:
+            fk = "elisa"
+        elif "forenscope" in item_k:
+            fk = "forenscope"
+
+    if fk and fk in SPONSOR_AGREEMENT_CATALOG:
+        cat = SPONSOR_AGREEMENT_CATALOG[fk]
+        if ag_date is None:
+            ag_date = cat.get("agreement_date")
+        if not person:
+            person = cat.get("person")
+        if not email:
+            email = cat.get("email")
+        item_k = norm_key(sample.test_item_name)
+        for tokens, dt, note in cat.get("items", ()):
+            if any(tok in item_k for tok in tokens):
+                if commit_date is None and dt is not None:
+                    commit_date = dt
+                if not commit_note and note:
+                    commit_note = note
+                break
+        if commit_date is None and commit_note is None and len(cat.get("items", ())) == 1:
+            _, dt, note = cat["items"][0]
+            commit_date = dt
+            commit_note = note
+
+    return {
+        "agreement_date": ag_date,
+        "commitment_date": commit_date,
+        "commitment_note": commit_note,
+        "person": person,
+        "email": email,
+    }
+
+
+def compute_next_study_codes(db: Session) -> Dict[str, str]:
+    """
+    FAZ 9.3: Gerçek sıralı GLP2026-001..082 ve NGLP-2026-001..011 serilerine göre
+    sıradaki boş çalışma kodunu hesaplar (> 150 olan test kalıntılarını yoksayar).
+    """
+    glp_max = 82
+    nglp_max = 11
+    all_codes: List[str] = [r.study_code for r in db.query(SampleRecord.study_code).all() if r.study_code]
+    all_codes.extend(r.study_code for r in db.query(Study.study_code).all() if r.study_code)
+    for raw in all_codes:
+        c = str(raw).strip().upper()
+        if c.startswith("GLP2026-"):
+            tail = c.split("GLP2026-", 1)[1]
+            m = re.match(r"^(\d{1,3})$", tail)
+            if m:
+                n = int(m.group(1))
+                if 1 <= n <= 150 and n > glp_max:
+                    glp_max = n
+        elif "NGLP" in c and "2026" in c:
+            after_yr = c.split("2026", 1)[1]
+            for m_num in re.findall(r"\d{1,3}", after_yr):
+                n = int(m_num)
+                if 1 <= n <= 150 and n > nglp_max:
+                    nglp_max = n
+    return {
+        "next_glp_code": f"GLP2026-{glp_max + 1:03d}",
+        "next_non_glp_code": f"NGLP-2026-{nglp_max + 1:03d}",
+    }
+
+
 def build_stepper(
     sample: SampleRecord, study: Optional[Study], has_schedule: bool, perms: Dict[str, Any]
 ) -> List[Dict[str, Any]]:
     today = date.today()
     wf = _wf(sample)
     start, end = sample.planned_start, sample.planned_end
+    anim_info = classify_animal_consumable_status(sample.animal_consumable_status)
+    q_days = anim_info["quarantine_days"]
     out: List[Dict[str, Any]] = []
     for sd in WORKFLOW_STEPS:
         no, st = sd["no"], wf.get(str(sd["no"]), {})
@@ -240,7 +475,7 @@ def build_stepper(
                 for k, v in APPROVAL_ROLES.items()
             ]
             if no == 11 and end:
-                due = sample.final_report_date or (end + timedelta(days=7))
+                due = sample.final_report_date or (end + timedelta(days=7 + q_days))
             if no == 6:
                 due = start
         elif no == 7:
@@ -262,8 +497,12 @@ def build_stepper(
                 done = bool((end and end <= today and (sample.stored_status or "").upper() not in ("EXPECTED", "PLANNED")) or st.get("done"))
             done_at = done_at or (end.isoformat() if done and end else None)
         elif no == 9:
-            due = sample.draft_report_date or ((end + timedelta(days=3)) if end else None)
+            due = sample.draft_report_date or ((end + timedelta(days=3 + q_days)) if end else None)
             done = bool(st.get("done") or marker == "+")
+        elif no == 10:
+            done = bool(st.get("done") or marker == "+")
+            if sample.payment_status:
+                extra["payment_status"] = sample.payment_status
         else:
             done = bool(st.get("done") or marker == "+")
         out.append(
@@ -347,6 +586,58 @@ def serialize_sample(
     status = effective_status(s, stepper)
     reasons = overdue_reasons(s, status, stepper)
     end = s.planned_end
+
+    # FAZ 9.3: Hayvan / Sarf durumu ve Karantina (+7g) TAT hesabı
+    anim_info = classify_animal_consumable_status(s.animal_consumable_status)
+    q_days = anim_info["quarantine_days"]
+    tpl_code = resolve_template_code(s.template_code) or infer_template_code(s.requested_analysis) or DEFAULT_TEMPLATE_CODE
+    tpl = TEMPLATES.get(tpl_code) or TEMPLATES[DEFAULT_TEMPLATE_CODE]
+    effective_tat_days = tpl.tat_with_quarantine_days if anim_info["requires_quarantine"] else tpl.tat_without_quarantine_days
+
+    draft_dt = s.draft_report_date or ((end + timedelta(days=3 + q_days)) if end else None)
+    base_final = s.final_report_date or ((end + timedelta(days=7 + q_days)) if end else None)
+    if status != "COMPLETED" and base_final and draft_dt and base_final < draft_dt:
+        final_dt = draft_dt + timedelta(days=4)
+    else:
+        final_dt = base_final
+
+    # FAZ 9.3: Devam Eden (ONGOING) çalışmalar için "Sahada Deneyde" (11) vs "Rapor / QA Aşamasında" (22) kırılımı
+    ongoing_phase = None
+    ongoing_phase_label = None
+    if status == "ONGOING":
+        if s.experiment_end_date and s.experiment_end_date < REFERENCE_DATE:
+            ongoing_phase = "IN_REPORTING_QA"
+            ongoing_phase_label = "Rapor / QA Bekliyor"
+        else:
+            ongoing_phase = "IN_EXPERIMENT"
+            ongoing_phase_label = "Deney Sürüyor"
+
+    is_draft_report_overdue = bool(
+        status == "ONGOING"
+        and (s.glp_type or "GLP") == "GLP"
+        and s.draft_report_date is not None
+        and s.draft_report_date < REFERENCE_DATE
+    )
+
+    # FAZ 9.3: Sponsor sözleşme ve müşteri taahhüt (planlanan gönderim) tarihi eşleştirmesi
+    sp_info = resolve_sponsor_agreement_info(s)
+    ag_dt = s.study_agreement_date or sp_info["agreement_date"]
+    commit_dt = sp_info["commitment_date"]
+    commit_note = sp_info["commitment_note"]
+    is_contract_deadline_exceeded = bool(
+        status not in ("COMPLETED", "CANCELLED")
+        and commit_dt is not None
+        and (
+            (draft_dt is not None and draft_dt > commit_dt)
+            or (final_dt is not None and final_dt > commit_dt)
+            or (REFERENCE_DATE > commit_dt)
+        )
+    )
+    if is_contract_deadline_exceeded:
+        msg = f"Sözleşme termini aşılıyor (Taahhüt: {commit_dt:%d.%m.%Y})"
+        if msg not in reasons:
+            reasons.append(msg)
+
     related: List[Dict[str, Any]] = []
     if s.test_item_code:
         pool = all_samples if all_samples is not None else db.query(SampleRecord).filter(
@@ -356,8 +647,11 @@ def serialize_sample(
             if o.id != s.id and (o.test_item_code or "").strip().lower() == s.test_item_code.strip().lower():
                 related.append({"id": o.id, "study_code": o.study_code, "requested_analysis": o.requested_analysis})
     sd_user = match_study_director(db, s.study_director_name, include_inactive=True)
-    draft_dt = s.draft_report_date or ((end + timedelta(days=3)) if end else None)
-    final_dt = s.final_report_date or ((end + timedelta(days=7)) if end else None)
+
+    contacts_out = list(s.contacts or [])
+    if not contacts_out and (sp_info["person"] or sp_info["email"]):
+        contacts_out = [{"name": sp_info["person"] or "", "email": sp_info["email"] or ""}]
+
     data = {
         "id": s.id,
         "serial_no": s.serial_no,
@@ -369,10 +663,13 @@ def serialize_sample(
         "test_item_name": s.test_item_name,
         "billing_company": s.billing_company,
         "sponsor_name": s.sponsor_name,
-        "contacts": s.contacts or [],
+        "contacts": contacts_out,
         "quote_no": s.quote_no,
         "sales_manager": s.sales_manager,
-        "study_agreement_date": s.study_agreement_date.isoformat() if s.study_agreement_date else None,
+        "study_agreement_date": ag_dt.isoformat() if ag_dt else None,
+        "contract_commitment_date": commit_dt.isoformat() if commit_dt else None,
+        "contract_commitment_note": commit_note,
+        "is_contract_deadline_exceeded": is_contract_deadline_exceeded,
         "expected_arrival_date": s.expected_arrival_date.isoformat() if s.expected_arrival_date else None,
         "sample_status": s.sample_status,
         "test_item_code": s.test_item_code,
@@ -380,6 +677,11 @@ def serialize_sample(
         "lab_arrival_date": s.lab_arrival_date.isoformat() if s.lab_arrival_date else None,
         "received_quantity": s.received_quantity,
         "animal_consumable_status": s.animal_consumable_status,
+        "animal_status_code": anim_info["code"],
+        "animal_status_badge": anim_info["badge"],
+        "requires_quarantine": anim_info["requires_quarantine"],
+        "quarantine_days": q_days,
+        "effective_tat_days": effective_tat_days,
         "animal_procurement_date": s.animal_procurement_date.isoformat() if s.animal_procurement_date else None,
         "lot_no": s.lot_no,
         "expiry_date": s.expiry_date,
@@ -397,6 +699,9 @@ def serialize_sample(
         "raw_status_text": s.raw_status_text,
         "status": status,
         "status_label": STATUS_LABELS[status],
+        "ongoing_phase": ongoing_phase,
+        "ongoing_phase_label": ongoing_phase_label,
+        "is_draft_report_overdue": is_draft_report_overdue,
         "scheduled": has_schedule,
         "study": (
             {"id": study.id, "status": study.status.value, "has_schedule": has_schedule} if study is not None else None
@@ -427,7 +732,7 @@ def serialize_sample(
     return data
 
 
-def build_summary(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+def build_summary(items: List[Dict[str, Any]], db: Optional[Session] = None) -> Dict[str, Any]:
     open_items = [i for i in items if i["status"] not in ("COMPLETED", "CANCELLED")]
     sd_counts: Dict[str, int] = {}
     for i in open_items:
@@ -437,17 +742,44 @@ def build_summary(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     preferred = ["Ezgi Nur AKIN", "Ayşe Özgür", burcu_lbl, "Atanmamış"]
     ordered = [{"name": n, "open_count": sd_counts.get(n, 0)} for n in preferred]
     ordered += [{"name": n, "open_count": c} for n, c in sd_counts.items() if n not in preferred]
+
+    glp_max = 82
+    nglp_max = 11
+    for i in items:
+        c = str(i.get("study_code") or "").strip().upper()
+        if c.startswith("GLP2026-"):
+            tail = c.split("GLP2026-", 1)[1]
+            if re.match(r"^\d{1,3}$", tail):
+                n = int(tail)
+                if 1 <= n <= 150 and n > glp_max:
+                    glp_max = n
+        elif "NGLP" in c and "2026" in c:
+            after_yr = c.split("2026", 1)[1]
+            for m_num in re.findall(r"\d{1,3}", after_yr):
+                n = int(m_num)
+                if 1 <= n <= 150 and n > nglp_max:
+                    nglp_max = n
+
     return {
         "expected": sum(1 for i in items if i["status"] == "EXPECTED"),
         "planned": sum(1 for i in items if i["status"] == "PLANNED"),
         "planned_unscheduled": sum(1 for i in items if i["status"] == "PLANNED" and not i["scheduled"]),
         "ongoing": sum(1 for i in items if i["status"] == "ONGOING"),
+        "ongoing_in_experiment": sum(1 for i in items if i["status"] == "ONGOING" and i.get("ongoing_phase") == "IN_EXPERIMENT"),
+        "ongoing_in_reporting": sum(1 for i in items if i["status"] == "ONGOING" and i.get("ongoing_phase") == "IN_REPORTING_QA"),
+        "ongoing_overdue_draft": sum(1 for i in items if i.get("is_draft_report_overdue")),
+        "consumables_pending": sum(1 for i in items if i.get("animal_status_code") == "CONSUMABLES_PENDING"),
+        "quarantine_count": sum(1 for i in items if i.get("animal_status_code") == "QUARANTINE"),
+        "animal_reuse_count": sum(1 for i in items if i.get("animal_status_code") == "ANIMAL_REUSE"),
+        "contract_deadline_exceeded": sum(1 for i in items if i.get("is_contract_deadline_exceeded")),
         "completed": sum(1 for i in items if i["status"] == "COMPLETED"),
         "cancelled": sum(1 for i in items if i["status"] == "CANCELLED"),
         "overdue": sum(1 for i in items if i["is_overdue"]),
         "glp_count": sum(1 for i in items if (i.get("glp_type") or "GLP") == "GLP"),
         "non_glp_count": sum(1 for i in items if (i.get("glp_type") or "GLP") == "NON-GLP"),
         "total": len(items),
+        "next_glp_code": f"GLP2026-{glp_max + 1:03d}",
+        "next_non_glp_code": f"NGLP-2026-{nglp_max + 1:03d}",
         "by_study_director": ordered,
     }
 
@@ -569,10 +901,15 @@ def plan_sample(
     sample.template_code = tpl.code
     sample.planned_start = study.acclimatization_start_date
     sample.planned_end = study.target_end_date
+    anim_meta = classify_animal_consumable_status(sample.animal_consumable_status)
+    q_days = 7 if anim_meta["requires_quarantine"] else 0
     if not sample.draft_report_date and sample.planned_end:
-        sample.draft_report_date = sample.planned_end + timedelta(days=3)
+        sample.draft_report_date = sample.planned_end + timedelta(days=3 + q_days)
     if not sample.final_report_date and sample.planned_end:
-        sample.final_report_date = sample.planned_end + timedelta(days=7)
+        base_final = sample.planned_end + timedelta(days=7 + q_days)
+        if sample.draft_report_date and base_final < sample.draft_report_date + timedelta(days=4):
+            base_final = sample.draft_report_date + timedelta(days=4)
+        sample.final_report_date = base_final
     if not sample.study_director_name and study.study_director:
         sample.study_director_name = study.study_director.full_name
     if not preserve_status and not sample.raw_status_text and (sample.stored_status or "").upper() in ("", "EXPECTED"):
@@ -988,6 +1325,7 @@ def _wf_firm_cat(f: Any) -> str:
         ("db medikal", "db"),
         ("disera", "disera"),
         ("saniter", "saniter"),
+        ("inceler", "saniter"),
         ("alkan", "alkan"),
         ("medfors", "medfors"),
         ("inovabella", "inovabella"),
@@ -996,6 +1334,7 @@ def _wf_firm_cat(f: Any) -> str:
         ("t lab", "toxlab"),
         ("plasti", "plastimed"),
         ("meditera", "meditera"),
+        ("forenscope", "forenscope"),
         ("acto", "acto"),
         ("merken", "merken"),
         ("turkuaz", "turkuaz"),
@@ -1394,7 +1733,7 @@ def import_study_status_workbook(
             plan_st = parse_date_any(ws_nglp.cell(r, 16).value) or parse_date_any(ws_nglp.cell(r, 18).value)
             exp_st = parse_date_any(ws_nglp.cell(r, 19).value) or parse_date_any(ws_nglp.cell(r, 17).value)
             exp_end = parse_date_any(ws_nglp.cell(r, 21).value) or parse_date_any(ws_nglp.cell(r, 20).value)
-            draft_dt = parse_date_any(ws_nglp.cell(r, 24).value)
+            draft_dt = None
             final_dt = parse_date_any(ws_nglp.cell(r, 24).value)
             col17_str = str(ws_nglp.cell(r, 17).value or "").strip()
             col23_str = str(ws_nglp.cell(r, 23).value or "").strip()
@@ -1454,6 +1793,14 @@ def import_study_status_workbook(
         for old_row in db.query(SampleRecord).all():
             if old_row.study_code not in excel_codes:
                 db.delete(old_row)
+        from app.models.conflict import Conflict
+        for old_st in db.query(Study).all():
+            if old_st.study_code not in excel_codes:
+                db.query(Conflict).filter((Conflict.study_id == old_st.id) | (Conflict.related_study_id == old_st.id)).delete(synchronize_session=False)
+                for st_step in db.query(StudyStep).filter(StudyStep.study_id == old_st.id).all():
+                    st_step.assignees = []
+                    db.delete(st_step)
+                db.delete(old_st)
         db.flush()
 
     created = updated = 0
@@ -1559,6 +1906,12 @@ def import_study_status_workbook(
     if auto_schedule:
         sched_res = auto_schedule_excel_studies(db, user)
         scheduled_count = sched_res["scheduled"]
+        from app.services.scheduling_engine import sync_historical_completion_and_conflicts
+
+        sync_historical_completion_and_conflicts(db)
+        db.commit()
+
+    sync_faz_9_3_sample_fields(db)
 
     db.add(
         AuditLog(
@@ -1651,3 +2004,239 @@ def auto_schedule_excel_studies(db: Session, user: User) -> Dict[str, Any]:
         "failed": sum(1 for r in results if not r["ok"]),
         "results": results,
     }
+
+
+# ---------------------------------------------------------------------------
+# FAZ 9.3 — SÖZLEŞME / TAAHHÜT TARİHLERİ, KARANTİNA (+7G), SAYAÇ & EXCEL (.XLSX) DIŞA AKTARIM
+# ---------------------------------------------------------------------------
+def sync_faz_9_3_sample_fields(db: Session) -> Dict[str, Any]:
+    """
+    FAZ 9.3 veri senkronizasyonu (hiçbir gerçek çalışma silinmez):
+    1) Test amaçlı > 150 kodlu kalıntı varsa temizler.
+    2) SPONSOR SÖZLŞ.-SPONSOR AGREEM. sekmesindeki 10 firmanın sözleşme tarihi, iletişim bilgisi ve
+       taahhüt (`Planlanan Gönderim Tarihi`) tarihlerini eşleştirir.
+    3) Non-GLP çalışmalarda ayrı Taslak Rapor sütunu olmadığı için `draft_report_date = None` yapar.
+    4) `Mevcut (Karantina)` olan Planlanan/Beklenen çalışmalarda (`+7g` karantina TAT farkı)
+       `draft_report_date` ve `final_report_date` tarihlerini karantina süresini içerecek şekilde günceller.
+    """
+    from app.models.conflict import Conflict
+
+    pruned_test_codes: List[str] = []
+    for s in db.query(SampleRecord).all():
+        m = re.match(r"^(?:GLP|NGLP)-?\d{4}-(\d+)$", str(s.study_code or "").strip().upper())
+        if m and int(m.group(1)) > 150:
+            pruned_test_codes.append(s.study_code)
+            db.delete(s)
+    for st_obj in db.query(Study).all():
+        m = re.match(r"^(?:GLP|NGLP)-?\d{4}-(\d+)$", str(st_obj.study_code or "").strip().upper())
+        if m and int(m.group(1)) > 150:
+            db.query(Conflict).filter((Conflict.study_id == st_obj.id) | (Conflict.related_study_id == st_obj.id)).delete(synchronize_session=False)
+            for st_step in db.query(StudyStep).filter(StudyStep.study_id == st_obj.id).all():
+                st_step.assignees = []
+                db.delete(st_step)
+            db.delete(st_obj)
+    db.flush()
+
+    updated_contracts = 0
+    updated_quarantine_dates = 0
+    for s in db.query(SampleRecord).all():
+        if (s.glp_type or "GLP").upper() != "GLP" and s.draft_report_date is not None and s.draft_report_date == s.final_report_date:
+            s.draft_report_date = None
+
+        sp_info = resolve_sponsor_agreement_info(s)
+        if sp_info:
+            if not s.study_agreement_date and sp_info.get("agreement_date"):
+                s.study_agreement_date = sp_info["agreement_date"]
+            if not s.contacts and (sp_info.get("person") or sp_info.get("email")):
+                s.contacts = [{"name": sp_info.get("person") or "", "email": sp_info.get("email") or ""}]
+            wf = copy.deepcopy(s.workflow or {})
+            wf["_contract"] = {
+                "agreement_date": (s.study_agreement_date or sp_info.get("agreement_date")).isoformat()
+                if (s.study_agreement_date or sp_info.get("agreement_date"))
+                else None,
+                "commitment_date": sp_info["commitment_date"].isoformat() if sp_info.get("commitment_date") else None,
+                "commitment_note": sp_info.get("commitment_note"),
+            }
+            s.workflow = wf
+            updated_contracts += 1
+
+        anim_meta = classify_animal_consumable_status(s.animal_consumable_status)
+        end_ref = s.experiment_end_date or s.planned_end
+        st_code = (s.stored_status or "").upper()
+        if anim_meta["requires_quarantine"] and st_code in ("PLANNED", "EXPECTED") and end_ref:
+            min_draft = end_ref + timedelta(days=10)
+            min_final = end_ref + timedelta(days=14)
+            if not s.draft_report_date or s.draft_report_date < min_draft:
+                s.draft_report_date = min_draft
+                updated_quarantine_dates += 1
+            if not s.final_report_date or s.final_report_date < min_final:
+                s.final_report_date = min_final
+        elif s.draft_report_date and s.final_report_date and s.final_report_date < s.draft_report_date:
+            s.final_report_date = s.draft_report_date + timedelta(days=4)
+
+    db.commit()
+    codes = compute_next_study_codes(db)
+    return {
+        "pruned_test_codes": pruned_test_codes,
+        "updated_contracts": updated_contracts,
+        "updated_quarantine_dates": updated_quarantine_dates,
+        **codes,
+    }
+
+
+def export_samples_workbook_bytes(db: Session, perms: Dict[str, Any]) -> bytes:
+    """
+    Tüm çalışmaları (93 çalışma: 88 GLP + 5 Non-GLP) kurumsal başlıklar, renk kodlu durum hücreleri
+    ve 11 Adımlı Numune İş Akışı özetiyle birlikte Excel (.xlsx) olarak dışa aktarır.
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    samples = (
+        db.query(SampleRecord)
+        .order_by(
+            SampleRecord.glp_type.asc(),
+            SampleRecord.serial_no.asc().nullslast(),
+            SampleRecord.study_code.asc(),
+        )
+        .all()
+    )
+    rows = [serialize_sample(db, s, perms) for s in samples]
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Çalışma Takip Listesi"
+
+    headers = [
+        "Sıra No",
+        "GLP / Non-GLP Türü",
+        "Çalışma Kodu",
+        "TRM Kodu",
+        "Talep Edilen Analiz",
+        "Test Maddesi",
+        "Sponsor",
+        "Fatura Edilecek Firma",
+        "Çalışma Yöneticisi (SD)",
+        "Satış Yöneticisi",
+        "Teklif No",
+        "Sözleşme Tarihi",
+        "Müşteri Taahhüt Tarihi",
+        "Hayvan / Sarf Durumu",
+        "Numune Geliş Tarihi",
+        "Planlanan Başlangıç",
+        "Deney Başlangıç",
+        "Deney Bitiş",
+        "Taslak Rapor Tarihi",
+        "Final Rapor Tarihi",
+        "Ödeme Durumu",
+        "Genel Durum",
+        "11 Adımlı İş Akışı Özeti",
+    ]
+
+    header_fill = PatternFill(start_color="0F172A", end_color="0F172A", fill_type="solid")
+    header_font = Font(name="Calibri", size=10, bold=True, color="FFFFFF")
+    thin_border = Border(
+        left=Side(style="thin", color="CBD5E1"),
+        right=Side(style="thin", color="CBD5E1"),
+        top=Side(style="thin", color="CBD5E1"),
+        bottom=Side(style="thin", color="CBD5E1"),
+    )
+
+    status_fills = {
+        "COMPLETED": PatternFill(start_color="DCFCE7", end_color="DCFCE7", fill_type="solid"),
+        "ONGOING": PatternFill(start_color="FEF3C7", end_color="FEF3C7", fill_type="solid"),
+        "PLANNED": PatternFill(start_color="DBEAFE", end_color="DBEAFE", fill_type="solid"),
+        "EXPECTED": PatternFill(start_color="F1F5F9", end_color="F1F5F9", fill_type="solid"),
+    }
+    warn_fill = PatternFill(start_color="FEE2E2", end_color="FEE2E2", fill_type="solid")
+
+    def _fmt_dt(iso_str: Optional[str]) -> str:
+        if not iso_str:
+            return "-"
+        try:
+            d = date.fromisoformat(str(iso_str)[:10])
+            return d.strftime("%d.%m.%Y")
+        except Exception:
+            return str(iso_str)
+
+    ws.append(headers)
+    for col_idx in range(1, len(headers) + 1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = thin_border
+    ws.row_dimensions[1].height = 28
+
+    for r_idx, r in enumerate(rows, start=2):
+        stepper = r.get("stepper") or []
+        done_cnt = sum(1 for st in stepper if st.get("done"))
+        wf_parts = [f"A{st['index']}:{'+' if st.get('done') else (st.get('marker') or '-')}" for st in stepper]
+        wf_summary = f"{done_cnt}/11 Tamamlandı ({' '.join(wf_parts)})"
+
+        status_lbl = r.get("status_label") or r.get("status") or "-"
+        if r.get("status") == "ONGOING" and r.get("ongoing_phase_label"):
+            status_lbl = f"{status_lbl} ({r['ongoing_phase_label']})"
+
+        commit_txt = _fmt_dt(r.get("contract_commitment_date"))
+        if r.get("is_contract_deadline_exceeded"):
+            commit_txt = f"{commit_txt} (Sözleşme Termini Aşılıyor!)"
+
+        anim_txt = r.get("animal_consumable_status") or "-"
+        if r.get("requires_quarantine"):
+            anim_txt = f"{anim_txt} (+7g Karantina TAT)"
+
+        row_vals = [
+            r.get("serial_no") or (r_idx - 1),
+            r.get("glp_type") or "GLP",
+            r.get("study_code") or "-",
+            r.get("test_item_code") or "Beklemede",
+            r.get("requested_analysis") or "-",
+            r.get("test_item_name") or "-",
+            r.get("sponsor_name") or "-",
+            r.get("billing_company") or "-",
+            r.get("study_director_name") or "-",
+            r.get("sales_manager") or "-",
+            r.get("quote_no") or "-",
+            _fmt_dt(r.get("study_agreement_date")),
+            commit_txt,
+            anim_txt,
+            _fmt_dt(r.get("lab_arrival_date") or r.get("istanbul_arrival_date") or r.get("expected_arrival_date")),
+            _fmt_dt(r.get("planned_start")),
+            _fmt_dt(r.get("experiment_start_date") or r.get("planned_start")),
+            _fmt_dt(r.get("experiment_end_date") or r.get("planned_end")),
+            _fmt_dt(r.get("draft_report_date")),
+            _fmt_dt(r.get("final_report_date")),
+            r.get("payment_status") or "-",
+            status_lbl,
+            wf_summary,
+        ]
+        ws.append(row_vals)
+        ws.row_dimensions[r_idx].height = 21
+        st_code = r.get("status") or "EXPECTED"
+        for col_idx in range(1, len(headers) + 1):
+            c = ws.cell(row=r_idx, column=col_idx)
+            c.font = Font(name="Calibri", size=10)
+            c.border = thin_border
+            c.alignment = Alignment(vertical="center", wrap_text=(col_idx in (5, 6, 7, 8, 23)))
+            if col_idx == 22 and st_code in status_fills:
+                c.fill = status_fills[st_code]
+                c.font = Font(name="Calibri", size=10, bold=True)
+            elif col_idx == 13 and r.get("is_contract_deadline_exceeded"):
+                c.fill = warn_fill
+                c.font = Font(name="Calibri", size=10, bold=True, color="991B1B")
+            elif col_idx == 14 and r.get("animal_status_code") == "CONSUMABLES_PENDING":
+                c.fill = warn_fill
+                c.font = Font(name="Calibri", size=10, bold=True, color="92400E")
+
+    widths = [8, 14, 16, 15, 36, 28, 26, 26, 22, 18, 18, 15, 24, 26, 16, 16, 16, 16, 16, 16, 18, 28, 48]
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.freeze_panes = "D2"
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    wb.close()
+    return buf.getvalue()
+

@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import { getMyTasks, updateStepStatus, extractError } from '../services/api';
 import { useAuth } from '../state/AuthContext';
+import { usePreferences } from '../state/PreferencesContext';
 import { fmtDateTime, fmtTime, fmtMinutes, todayISO, ROLE_LABEL } from '../utils/format';
 
 const STATUS_BADGE = {
@@ -23,6 +24,7 @@ const STATUS_BADGE = {
 
 export default function MyTasks() {
   const { user, isReadOnly } = useAuth();
+  const { t, tr, lang, formatStatusBadge } = usePreferences();
   const [targetDate, setTargetDate] = useState(todayISO());
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);

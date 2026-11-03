@@ -11,7 +11,7 @@ from app.models.test_restriction import TestRestriction
 from app.models.user import User
 from app.services.capacity_service import apply_restriction_shift
 from app.services.templates import TEMPLATES, resolve_template_code
-from app.utils.security import require_management_read, require_management_write
+from app.utils.security import require_management_read, require_sysadmin
 
 router = APIRouter(prefix="/restrictions", tags=["Test Kısıtlama ve Uygunluk Takvimi (FAZ 8.1)"])
 
@@ -95,12 +95,12 @@ def list_restrictions(
     }
 
 
-@router.post("", status_code=status.HTTP_201_CREATED, summary="Yeni Test Kısıtlaması Ekle")
+@router.post("", status_code=status.HTTP_201_CREATED, summary="Yeni Test Kısıtlaması Ekle (Sadece SYSADMIN)")
 @router.post("/", status_code=status.HTTP_201_CREATED, include_in_schema=False)
 def create_restriction(
     payload: RestrictionIn,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_management_write),
+    current_user: User = Depends(require_sysadmin),
 ):
     row = TestRestriction(
         template_code=payload.template_code,
@@ -128,12 +128,12 @@ def create_restriction(
     return _serialize(row)
 
 
-@router.put("/{restriction_id}", summary="Test Kısıtlamasını Güncelle")
+@router.put("/{restriction_id}", summary="Test Kısıtlamasını Güncelle (Sadece SYSADMIN)")
 def update_restriction(
     restriction_id: int,
     payload: RestrictionUpdate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_management_write),
+    current_user: User = Depends(require_sysadmin),
 ):
     row = db.query(TestRestriction).filter(TestRestriction.id == restriction_id).first()
     if not row:
@@ -167,11 +167,11 @@ def update_restriction(
     return _serialize(row)
 
 
-@router.delete("/{restriction_id}", summary="Test Kısıtlamasını Sil")
+@router.delete("/{restriction_id}", summary="Test Kısıtlamasını Sil (Sadece SYSADMIN)")
 def delete_restriction(
     restriction_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_management_write),
+    current_user: User = Depends(require_sysadmin),
 ):
     row = db.query(TestRestriction).filter(TestRestriction.id == restriction_id).first()
     if not row:

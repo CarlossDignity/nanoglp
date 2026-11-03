@@ -15,6 +15,7 @@ from app.models.document import Document
 from app.models.user import User, UserRole
 from app.services import document_parser
 from app.services.document_parser import SUPPORTED_EXTENSIONS, DocumentParsingError, aggregate_dossier
+from app.utils.file_security import validate_and_sanitize_upload
 from app.utils.security import require_management_read, require_management_write
 
 router = APIRouter(prefix="/documents", tags=["Belge Yükleme, Vision OCR ve Dosya Birleştirme (FAZ 6.1 & 6.2)"])
@@ -109,19 +110,14 @@ def upload_document(
     Dosyayı alır, değiştirmeden saklar (SHA-256), PyMuPDF ile sayfa görüntülerine çevirir ve
     GPT-4o Vision ile belge kategorisini ve o belgede bulunan GLP alanlarını ayrıştırır.
     """
-    filename = os.path.basename(file.filename or "").strip()
-    if not filename:
-        raise HTTPException(status_code=400, detail="Dosya adı eksik.")
-    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-    if ext not in SUPPORTED_EXTENSIONS:
-        raise HTTPException(
-            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            detail=f"Desteklenmeyen dosya türü '.{ext}'. Desteklenen: PDF, XLSX, PNG, JPG, TXT, CSV.",
-        )
-
+    raw_filename = file.filename or ""
     content = _read_limited(file)
-    if not content:
-        raise HTTPException(status_code=400, detail="Dosya boş.")
+    filename, ext = validate_and_sanitize_upload(
+        raw_filename=raw_filename,
+        content=content,
+        allowed_extensions=SUPPORTED_EXTENSIONS,
+        max_mb=settings.MAX_UPLOAD_MB,
+    )
     sha256 = hashlib.sha256(content).hexdigest()
 
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
@@ -235,12 +231,18 @@ def get_dossier_summary(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_management_read),
 ):
+    from app.services.sample_service import compute_next_study_codes
+
     q = db.query(Document)
     if dossier_key:
         q = q.filter(Document.dossier_key == dossier_key)
     docs = q.order_by(Document.uploaded_at.desc(), Document.id.desc()).all()
     active_sds = _get_active_sds(db)
-    return aggregate_dossier(docs, active_sds=active_sds, dossier_key=dossier_key)
+    summary = aggregate_dossier(docs, active_sds=active_sds, dossier_key=dossier_key)
+    codes = compute_next_study_codes(db)
+    summary["next_glp_code"] = codes["next_glp_code"]
+    summary["next_non_glp_code"] = codes["next_non_glp_code"]
+    return summary
 
 
 @router.post("/{document_id}/reparse", response_model=DocumentOut, summary="Belgeyi Vision OCR ile Yeniden Analiz Et (Re-parse)")

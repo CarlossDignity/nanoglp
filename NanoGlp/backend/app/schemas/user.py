@@ -33,6 +33,7 @@ class UserBase(BaseModel):
     email: Optional[EmailStr] = None
     full_name: str
     role: Union[UserRole, str] = UserRole.ANALYST
+    department: Optional[str] = None
     is_active: bool = True
     qualifications: List[str] = []
     max_daily_hours: int = 9
@@ -74,6 +75,7 @@ class UserUpdate(BaseModel):
     email: Optional[EmailStr] = None
     full_name: Optional[str] = None
     role: Optional[Union[UserRole, str]] = None
+    department: Optional[str] = None
     is_active: Optional[bool] = None
     qualifications: Optional[List[str]] = None
     max_daily_hours: Optional[int] = None

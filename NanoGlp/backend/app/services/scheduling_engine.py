@@ -39,10 +39,26 @@ from app.services.capacity_service import (
 MAX_DAILY_WORKLOAD_MINUTES = 540  # 9 Saat = 540 Dakika (Yasal & GLP Üst Sınırı)
 WORKDAY_START = time(8, 0)
 WORKDAY_END = time(18, 0)
+REFERENCE_DATE = date(2026, 11, 3)  # FAZ 9.2 Referans Operasyon Tarihi (03.11.2026)
 
 # Yeni taslağın kıyaslandığı çalışma durumları (bu çalışmalar ASLA değiştirilmez)
 COMPARED_STUDY_STATUSES = (StudyStatus.APPROVED, StudyStatus.IN_PROGRESS, StudyStatus.DRAFT)
 LOCKED_STUDY_STATUSES = (StudyStatus.APPROVED, StudyStatus.IN_PROGRESS)
+
+# FAZ 8.4: Personel İş Yükü ve görev atamalarından hariç tutulan idari/satış/kabul rolleri
+EXCLUDED_WORKLOAD_ROLES = {"SYSADMIN", "ADMIN", "EXECUTIVE", "SALES", "TRM_KABUL", "TRM_ACCEPTANCE"}
+
+
+def is_eligible_lab_personnel(user: Optional[User]) -> bool:
+    """SYSADMIN, EXECUTIVE, SALES ve TRM_KABUL/TRM_ACCEPTANCE rollerine SD veya biyolojik adım atanamaz."""
+    if user is None:
+        return False
+    role_code = (user.role.value if hasattr(user.role, "value") else str(user.role or "")).strip().upper()
+    if role_code in EXCLUDED_WORKLOAD_ROLES:
+        return False
+    if (user.username or "").strip().lower() == "yigit":
+        return False
+    return True
 
 _TR_DAYS = ["Pazartesi", "Salı", "Çarşamba", "Perşembe", "Cuma", "Cumartesi", "Pazar"]
 
@@ -352,13 +368,24 @@ def _assign_roles(
     for role in needed:
         if role == UserRole.STUDY_DIRECTOR:
             sd = study.study_director
-            if sd is not None and sd.is_active:
+            if sd is not None and sd.is_active and is_eligible_lab_personnel(sd):
                 assignment[role] = sd
             else:
-                unfilled.append(role)
+                fallback_sds = [
+                    u for u in db.query(User).filter(User.role == UserRole.STUDY_DIRECTOR, User.is_active == True).order_by(User.id).all()  # noqa: E712
+                    if is_eligible_lab_personnel(u)
+                ]
+                if fallback_sds:
+                    assignment[role] = fallback_sds[0]
+                    study.study_director_id = fallback_sds[0].id
+                else:
+                    unfilled.append(role)
             continue
 
-        candidates = db.query(User).filter(User.role == role, User.is_active == True).order_by(User.id).all()  # noqa: E712
+        candidates = [
+            u for u in db.query(User).filter(User.role == role, User.is_active == True).order_by(User.id).all()  # noqa: E712
+            if is_eligible_lab_personnel(u)
+        ]
         if not candidates:
             unfilled.append(role)
             continue
@@ -444,6 +471,10 @@ def build_conflict_resolutions(
     conflict: Conflict,
     study: Optional[Study] = None,
     existing_steps: Optional[List[StudyStep]] = None,
+    fast_mode: bool = False,
+    active_techs: Optional[List[User]] = None,
+    water_bath: Optional[Equipment] = None,
+    step_by_id: Optional[Dict[int, StudyStep]] = None,
 ) -> List[Dict[str, Any]]:
     """
     FAZ 6.2 — Her çakışma/uyarı kartının içine doğrudan "Tek Tık Çözüm Butonları" üretir.
@@ -493,25 +524,35 @@ def build_conflict_resolutions(
     if conflict.conflict_type == ConflictType.PERSONNEL_OVERLAP or (
         conflict.conflict_type == ConflictType.BIOLOGICAL_TIME_VIOLATION and "Personel Dolu" in conflict.title
     ):
-        step = conflict.step or (
-            db.query(StudyStep).filter(StudyStep.id == conflict.step_id).first() if conflict.step_id else None
+        step = (
+            step_by_id.get(conflict.step_id)
+            if (step_by_id is not None and conflict.step_id)
+            else (
+                conflict.step
+                or (db.query(StudyStep).filter(StudyStep.id == conflict.step_id).first() if conflict.step_id else None)
+            )
         )
         current_assignee_ids = set(step.assignee_ids) if step else set()
         target_day = step.planned_start.date() if step else date.today()
 
         techs = (
-            db.query(User)
-            .filter(User.role == UserRole.TECHNICIAN, User.is_active == True)  # noqa: E712
-            .order_by(User.id.asc())
-            .all()
+            active_techs
+            if active_techs is not None
+            else [
+                u for u in db.query(User).filter(User.role == UserRole.TECHNICIAN, User.is_active == True).order_by(User.id.asc()).all()  # noqa: E712
+                if is_eligible_lab_personnel(u)
+            ]
         )
         backup_candidates = [u for u in techs if u.id not in current_assignee_ids] or techs
         best_backup = None
         if backup_candidates:
-            best_backup = min(
-                backup_candidates,
-                key=lambda u: (calculate_personnel_workload(db, u.id, target_day)["total_minutes"], u.id),
-            )
+            if fast_mode:
+                best_backup = backup_candidates[0]
+            else:
+                best_backup = min(
+                    backup_candidates,
+                    key=lambda u: (calculate_personnel_workload(db, u.id, target_day)["total_minutes"], u.id),
+                )
         resolutions.append(
             {
                 "action": "REASSIGN_TO_BACKUP_TECHNICIAN",
@@ -534,8 +575,14 @@ def build_conflict_resolutions(
     # c0) FAZ 8.1: Kafes kapasitesi / 24-72s uzun süreli cihaz kapasitesi aşımı → ilk boşalan tarihe yönlendir
     if study and is_capacity_conflict(conflict):
         base_day0 = study.acclimatization_start_date or study.target_start_date or date.today()
-        tpl_for_study = get_template(getattr(study, 'template_code', None) or DEFAULT_TEMPLATE_CODE, db=db)
-        free_g0 = find_first_free_g0(db, study, tpl_for_study, base_day0, study.extraction_start_offset_days or 0)
+        if fast_mode:
+            cand_dt = (study.target_end_date or (base_day0 + timedelta(days=7))) + timedelta(days=1)
+            while cand_dt.weekday() >= 5:
+                cand_dt += timedelta(days=1)
+            free_g0 = cand_dt.isoformat()
+        else:
+            tpl_for_study = get_template(getattr(study, 'template_code', None) or DEFAULT_TEMPLATE_CODE, db=db)
+            free_g0 = find_first_free_g0(db, study, tpl_for_study, base_day0, study.extraction_start_offset_days or 0)
         if free_g0:
             resolutions.append(
                 {
@@ -553,7 +600,7 @@ def build_conflict_resolutions(
 
     # c) Cihaz Kapasite Aşımı (EQUIPMENT_OVERLAP)
     if conflict.conflict_type == ConflictType.EQUIPMENT_OVERLAP and study:
-        water_bath = seed_default_equipment(db)
+        water_bath = water_bath or seed_default_equipment(db)
         base_day0 = study.acclimatization_start_date or study.target_start_date or date.today()
         cur_offset = study.extraction_start_offset_days or 0
         if existing_steps is None:
@@ -606,6 +653,11 @@ def evaluate_study_conflicts(
     """
     findings: List[Tuple[Conflict, List[int]]] = []
     approved_wk_steps = preserve_approved_weekend_step_ids or set()
+    existing_steps = [
+        ex for ex in existing_steps
+        if ex.status != StepStatus.COMPLETED
+        and (not getattr(ex, "study", None) or ex.study.status != StudyStatus.COMPLETED)
+    ]
 
     def record(conflict: Conflict, step_ids: List[int]):
         db.add(conflict)
@@ -634,6 +686,8 @@ def evaluate_study_conflicts(
             )
 
     for step in steps:
+        if step.status == StepStatus.COMPLETED:
+            continue
         # 6a) Biyolojik kilitli adım mesai dışı / hafta sonu → WARNING (Nöbetçi personel onayı veya Cuma hizalama sunulur)
         issue = _working_hours_issue(step.planned_start, step.planned_end)
         if step.is_biological_fixed_time and issue and step.id not in approved_wk_steps:
@@ -784,6 +838,8 @@ def evaluate_study_conflicts(
     # 6d) KURAL 1: kişi-gün bazında 9 saat kontrolü (tüm çalışmalar dahil)
     person_days: Dict[Tuple[int, date], Tuple[User, List[int]]] = {}
     for step in steps:
+        if step.status == StepStatus.COMPLETED:
+            continue
         for person in step.assignees:
             person_days.setdefault((person.id, step.planned_start.date()), (person, []))[1].append(step.id)
     for (_, day), (person, step_ids) in sorted(person_days.items(), key=lambda kv: (kv[0][1], kv[0][0])):
@@ -983,12 +1039,10 @@ def schedule_new_study(
                     for ex in existing_steps
                 )
                 if has_overlap and r != UserRole.STUDY_DIRECTOR:
-                    candidates = (
-                        db.query(User)
-                        .filter(User.role == r, User.is_active == True)  # noqa: E712
-                        .order_by(User.id.asc())
-                        .all()
-                    )
+                    candidates = [
+                        u for u in db.query(User).filter(User.role == r, User.is_active == True).order_by(User.id.asc()).all()  # noqa: E712
+                        if is_eligible_lab_personnel(u)
+                    ]
                     free_candidates = [
                         u for u in candidates
                         if all(
@@ -1128,6 +1182,10 @@ def _format_schedule_response(
     active_findings = [(c, sids) for c, sids in findings if not c.is_resolved]
     critical_count = sum(1 for c, _ in active_findings if c.severity == ConflictSeverity.CRITICAL)
     warning_count = sum(1 for c, _ in active_findings if c.severity == ConflictSeverity.WARNING)
+    cat_by_id = {
+        item["id"]: item
+        for item in enrich_conflicts_with_category(db, [c for c, _ in active_findings], include_resolutions=False)
+    }
 
     return {
         "study_id": study.id,
@@ -1171,6 +1229,12 @@ def _format_schedule_response(
                 "step_id": c.step_id,
                 "step_ids": step_ids,
                 "related_study_id": c.related_study_id,
+                "conflict_category": (cat_by_id.get(c.id) or {}).get("conflict_category", "CONFIRMED_CONFLICT"),
+                "missing_info_badges": (cat_by_id.get(c.id) or {}).get("missing_info_badges", []),
+                "missing_info_tags": (cat_by_id.get(c.id) or {}).get("missing_info_tags", []),
+                "missing_info_codes": (cat_by_id.get(c.id) or {}).get("missing_info_codes", []),
+                "study_code": study.study_code,
+                "sample_id": (cat_by_id.get(c.id) or {}).get("sample_id"),
                 "resolutions": build_conflict_resolutions(db, c, study=study, existing_steps=existing_steps),
             }
             for c, step_ids in active_findings
@@ -1196,6 +1260,152 @@ def _format_schedule_response(
             for s in steps
         ],
     }
+
+
+def get_all_studies_calendar_details(
+    db: Session,
+    studies: List[Study],
+    all_steps_orm: List[StudyStep],
+) -> List[Dict[str, Any]]:
+    """
+    FAZ 8.4 — Toplu Master Takvim (/api/v1/planning/calendar) için N+1 sorgusu yapmadan
+    tüm çalışmaların adımlarını ve açık çakışmalarını tek seferde bellekte birleştirir.
+    """
+    from app.services.templates import TEMPLATES
+
+    water_bath = seed_default_equipment(db)
+    active_techs = [
+        u for u in db.query(User).filter(User.role == UserRole.TECHNICIAN, User.is_active == True).order_by(User.id.asc()).all()  # noqa: E712
+        if is_eligible_lab_personnel(u)
+    ]
+    templates_map = {code: get_template(code, db=db) for code in TEMPLATES}
+    default_tpl = templates_map.get(DEFAULT_TEMPLATE_CODE) or get_template(DEFAULT_TEMPLATE_CODE, db=db)
+
+    steps_by_study: Dict[int, List[StudyStep]] = {s.id: [] for s in studies}
+    step_by_id: Dict[int, StudyStep] = {}
+    for st in all_steps_orm:
+        step_by_id[st.id] = st
+        if st.study_id in steps_by_study:
+            steps_by_study[st.study_id].append(st)
+    for sid in steps_by_study:
+        steps_by_study[sid].sort(key=lambda x: x.step_order)
+
+    open_conflicts = (
+        db.query(Conflict)
+        .filter(Conflict.is_resolved == False)  # noqa: E712
+        .order_by(Conflict.id.asc())
+        .all()
+    )
+    cat_by_id = {
+        item["id"]: item
+        for item in enrich_conflicts_with_category(db, open_conflicts, include_resolutions=False)
+    }
+    conflicts_by_study: Dict[int, List[Conflict]] = {s.id: [] for s in studies}
+    for c in open_conflicts:
+        if c.study_id in conflicts_by_study:
+            conflicts_by_study[c.study_id].append(c)
+
+    locked_codes = [s.study_code for s in studies if s.status in LOCKED_STUDY_STATUSES]
+    draft_codes = [s.study_code for s in studies if s.status == StudyStatus.DRAFT]
+
+    def person_dict(u: User) -> Dict[str, Any]:
+        return {"id": u.id, "full_name": u.full_name, "role": u.role.value if hasattr(u.role, "value") else str(u.role)}
+
+    results: List[Dict[str, Any]] = []
+    for study in studies:
+        tpl_code = getattr(study, "template_code", None) or DEFAULT_TEMPLATE_CODE
+        template = templates_map.get(tpl_code) or default_tpl
+        base_day0 = study.acclimatization_start_date or study.target_start_date or date.today()
+        st_steps = steps_by_study.get(study.id, [])
+        st_conflicts = conflicts_by_study.get(study.id, [])
+        critical_count = sum(1 for c in st_conflicts if c.severity == ConflictSeverity.CRITICAL)
+        warning_count = sum(1 for c in st_conflicts if c.severity == ConflictSeverity.WARNING)
+
+        results.append(
+            {
+                "study_id": study.id,
+                "study_code": study.study_code,
+                "study_status": study.status.value,
+                "title": study.title,
+                "sponsor_name": study.sponsor_name,
+                "test_item_name": study.test_item_name,
+                "test_item_batch": study.test_item_batch,
+                "extraction_polar": study.extraction_polar,
+                "extraction_polar_solvent": study.extraction_polar_solvent,
+                "extraction_non_polar": study.extraction_non_polar,
+                "extraction_non_polar_solvent": study.extraction_non_polar_solvent,
+                "study_director_id": study.study_director_id,
+                "study_director_name": study.study_director.full_name if study.study_director else None,
+                "template": {"code": template.code, "standard": template.standard, "title": template.title},
+                "acclimatization_start_date": base_day0.isoformat(),
+                "target_start_date": (study.target_start_date or base_day0).isoformat(),
+                "target_end_date": study.target_end_date.isoformat() if study.target_end_date else None,
+                "protocol_approved_at": study.protocol_approved_at.isoformat() if study.protocol_approved_at else None,
+                "extraction_start_offset_days": study.extraction_start_offset_days or 0,
+                "auto_schedule_notice": get_auto_schedule_notice(study),
+                "capacity_info": None,
+                "status": (
+                    "CONFLICTS_DETECTED"
+                    if critical_count > 0
+                    else ("WARNINGS_DETECTED" if warning_count > 0 else "SCHEDULED_CLEAN")
+                ),
+                "can_approve": study.status == StudyStatus.DRAFT and critical_count == 0 and len(st_steps) > 0,
+                "total_conflicts": len(st_conflicts),
+                "critical_conflicts": critical_count,
+                "warning_conflicts": warning_count,
+                "superseded_conflicts": 0,
+                "conflicts": [
+                    {
+                        "id": c.id,
+                        "type": c.conflict_type.value,
+                        "severity": c.severity.value,
+                        "title": c.title,
+                        "description": c.description,
+                        "step_id": c.step_id,
+                        "step_ids": [c.step_id] if c.step_id else [],
+                        "related_study_id": c.related_study_id,
+                        "conflict_category": (cat_by_id.get(c.id) or {}).get("conflict_category", "CONFIRMED_CONFLICT"),
+                        "missing_info_badges": (cat_by_id.get(c.id) or {}).get("missing_info_badges", []),
+                        "missing_info_tags": (cat_by_id.get(c.id) or {}).get("missing_info_tags", []),
+                        "missing_info_codes": (cat_by_id.get(c.id) or {}).get("missing_info_codes", []),
+                        "study_code": study.study_code,
+                        "sample_id": (cat_by_id.get(c.id) or {}).get("sample_id"),
+                        "resolutions": build_conflict_resolutions(
+                            db,
+                            c,
+                            study=study,
+                            existing_steps=all_steps_orm,
+                            fast_mode=True,
+                            active_techs=active_techs,
+                            water_bath=water_bath,
+                            step_by_id=step_by_id,
+                        ),
+                    }
+                    for c in st_conflicts
+                ],
+                "untouched_approved_studies": [c for c in locked_codes if c != study.study_code],
+                "compared_draft_studies": [c for c in draft_codes if c != study.study_code],
+                "total_new_steps": len(st_steps),
+                "steps": [
+                    {
+                        "id": s.id,
+                        "step_order": s.step_order,
+                        "study_day": s.study_day,
+                        "step_name": s.step_name,
+                        "step_type": s.step_type,
+                        "planned_start": s.planned_start.isoformat(),
+                        "planned_end": s.planned_end.isoformat(),
+                        "duration_minutes": s.duration_minutes,
+                        "is_biological_fixed_time": s.is_biological_fixed_time,
+                        "biological_tolerance_minutes": s.biological_tolerance_minutes,
+                        "equipment_id": s.equipment_id,
+                        "assignees": [person_dict(u) for u in s.assignees],
+                    }
+                    for s in st_steps
+                ],
+            }
+        )
+    return results
 
 
 def get_study_schedule_detail(db: Session, study: Study) -> Dict[str, Any]:
@@ -1344,13 +1554,13 @@ def apply_conflict_resolution(
 
         if target_user_id:
             backup = db.query(User).filter(User.id == target_user_id, User.is_active == True).first()  # noqa: E712
+            if backup and not is_eligible_lab_personnel(backup):
+                raise ValueError("SYSADMIN, EXECUTIVE veya SALES rolündeki kullanıcılara biyolojik görev atanamaz.")
         else:
-            techs = (
-                db.query(User)
-                .filter(User.role == UserRole.TECHNICIAN, User.is_active == True)  # noqa: E712
-                .order_by(User.id.asc())
-                .all()
-            )
+            techs = [
+                u for u in db.query(User).filter(User.role == UserRole.TECHNICIAN, User.is_active == True).order_by(User.id.asc()).all()  # noqa: E712
+                if is_eligible_lab_personnel(u)
+            ]
             candidates = [u for u in techs if u.id not in current_ids] or techs
             backup = (
                 min(candidates, key=lambda u: (calculate_personnel_workload(db, u.id, target_day)["total_minutes"], u.id))
@@ -1404,6 +1614,9 @@ def apply_conflict_resolution(
             f"Yedek Teknisyen Devri ({user.full_name}): Görev iş yükü müsait olan "
             f"'{backup.full_name}' personeline devredildi ve çakışma denetimi yenilendi."
         )
+        meta = dict(study.dossier_metadata or {})
+        meta["technician_confirmed"] = True
+        study.dossier_metadata = meta
         conflict.is_resolved = True
         conflict.resolved_by_id = user.id
         conflict.resolved_at = now
@@ -1551,3 +1764,416 @@ def apply_conflict_resolution(
     )
     res["resolution_applied"] = {"action": action, "message": "Çözüm başarıyla uygulandı ve denetim izine kaydedildi."}
     return res
+
+
+# ---------------------------------------------------------------------------
+# FAZ 9.2 — GEÇMİŞ GÖREVLERİN KAPATILMASI, ÇAKIŞMA KATEGORİZASYONU & RECOMPUTE
+# ---------------------------------------------------------------------------
+def sync_historical_completion_and_conflicts(
+    db: Session,
+    ref_date: date = REFERENCE_DATE,
+) -> Dict[str, Any]:
+    """
+    FAZ 9.2 (Madde 1): Hiçbir çalışmayı veya adımı veritabanından SİLMEDEN:
+      - Excel'de `Biten/Finished` (`COMPLETED`, 41 çalışma) olan çalışmaların `Study.status` değerini ve tüm
+        `StudyStep` adımlarını `COMPLETED` (`TAMAMLANDI`) yapar.
+      - Excel'de `Devam eden/On going` olup `experiment_end_date < ref_date` olan çalışmaların (deneyi Eylül/Ekim
+        2026'da bitmiş, rapor aşamasında olanlar) tüm deney adımlarını `COMPLETED` yapar.
+      - Devam eden diğer aktif çalışmaların `planned_start.date() < ref_date` olan geçmiş tarihli adımlarını
+        (örn. `GLP2026-005` 11.02.2026 & 12.05.2026 vb.) `COMPLETED` yapar.
+      - Tamamlanmış çalışmalara / adımlara / geçmiş tarihlere ait açık `Conflict` kayıtlarını
+        `is_resolved = True`, `resolution_notes = 'Geçmiş tarihte tamamlandı'` ile kapatır.
+    """
+    from app.models.sample import SampleRecord
+
+    now = datetime.utcnow()
+    samples = db.query(SampleRecord).all()
+    sample_by_code = {s.study_code: s for s in samples if s.study_code}
+    studies = db.query(Study).all()
+    study_by_id = {s.id: s for s in studies}
+
+    completed_studies_count = 0
+    newly_completed_steps = 0
+
+    for st in studies:
+        sr = sample_by_code.get(st.study_code)
+        steps = (
+            db.query(StudyStep)
+            .filter(StudyStep.study_id == st.id, StudyStep.status != StepStatus.CANCELLED)
+            .all()
+        )
+        if st.status == StudyStatus.COMPLETED or (sr and (sr.stored_status or "").upper() == "COMPLETED"):
+            if st.status != StudyStatus.COMPLETED:
+                st.status = StudyStatus.COMPLETED
+            completed_studies_count += 1
+            for step in steps:
+                if step.status != StepStatus.COMPLETED:
+                    step.status = StepStatus.COMPLETED
+                    step.actual_start = step.actual_start or step.planned_start
+                    step.actual_end = step.actual_end or step.planned_end
+                    newly_completed_steps += 1
+        elif sr and (sr.stored_status or "").upper() == "ONGOING" and sr.experiment_end_date and sr.experiment_end_date < ref_date:
+            for step in steps:
+                if step.status != StepStatus.COMPLETED:
+                    step.status = StepStatus.COMPLETED
+                    step.actual_start = step.actual_start or step.planned_start
+                    step.actual_end = step.actual_end or step.planned_end
+                    newly_completed_steps += 1
+        elif sr is not None:
+            for step in steps:
+                if step.planned_start and step.planned_start.date() < ref_date and step.status != StepStatus.COMPLETED:
+                    step.status = StepStatus.COMPLETED
+                    step.actual_start = step.actual_start or step.planned_start
+                    step.actual_end = step.actual_end or step.planned_end
+                    newly_completed_steps += 1
+
+    db.flush()
+
+    step_by_id = {s.id: s for s in db.query(StudyStep).all()}
+    open_conflicts = db.query(Conflict).filter(Conflict.is_resolved == False).all()  # noqa: E712
+    resolved_past_conflicts = 0
+    note = f"Geçmiş tarihte tamamlandı (Referans: {ref_date:%d.%m.%Y})"
+
+    for c in open_conflicts:
+        st = study_by_id.get(c.study_id)
+        sr = sample_by_code.get(st.study_code) if st else None
+        rel_st = study_by_id.get(c.related_study_id) if c.related_study_id else None
+        rel_sr = sample_by_code.get(rel_st.study_code) if rel_st else None
+        step = step_by_id.get(c.step_id) if c.step_id else None
+
+        should_close = False
+        if st and st.status == StudyStatus.COMPLETED:
+            should_close = True
+        elif sr and (
+            (sr.stored_status or "").upper() == "COMPLETED"
+            or ((sr.stored_status or "").upper() == "ONGOING" and sr.experiment_end_date and sr.experiment_end_date < ref_date)
+        ):
+            should_close = True
+        elif step and (
+            step.status == StepStatus.COMPLETED
+            or (sr is not None and step.planned_start and step.planned_start.date() < ref_date)
+        ):
+            should_close = True
+        elif rel_st and rel_st.status == StudyStatus.COMPLETED:
+            should_close = True
+        elif rel_sr and (
+            (rel_sr.stored_status or "").upper() == "COMPLETED"
+            or ((rel_sr.stored_status or "").upper() == "ONGOING" and rel_sr.experiment_end_date and rel_sr.experiment_end_date < ref_date)
+        ):
+            should_close = True
+
+        if should_close:
+            c.is_resolved = True
+            c.resolved_at = now
+            c.resolution_notes = note
+            resolved_past_conflicts += 1
+
+    db.flush()
+    return {
+        "reference_date": ref_date.isoformat(),
+        "completed_studies_count": completed_studies_count,
+        "newly_completed_steps": newly_completed_steps,
+        "total_completed_steps": db.query(StudyStep).filter(StudyStep.status == StepStatus.COMPLETED).count(),
+        "total_pending_steps": db.query(StudyStep).filter(StudyStep.status == StepStatus.PENDING).count(),
+        "resolved_past_conflicts": resolved_past_conflicts,
+    }
+
+
+def classify_conflict_record(
+    conflict: Conflict,
+    study: Optional[Study],
+    sample: Optional[Any],
+    related_study: Optional[Study],
+    related_sample: Optional[Any],
+    step: Optional[StudyStep],
+    doc_study_codes: set,
+) -> Dict[str, Any]:
+    """
+    FAZ 9.2 (Madde 2): Açık bir çakışmayı "Gerçek Çakışma" (`CONFIRMED_CONFLICT`) veya
+    "Eksik Bilgi Sebebiyle Çakışma" (`MISSING_INFO`) olarak sınıflandırır ve sebep rozetlerini üretir.
+    """
+    reasons: List[Dict[str, str]] = []
+    meta = (study.dossier_metadata or {}) if study else {}
+    rel_meta = (related_study.dossier_metadata or {}) if related_study else {}
+
+    # 1) Excel'de Test Başlangıç Tarihi boş (`-`) olduğu için sistem tarafından tahmini tarihe yerleştirilmişse
+    study_missing_start = (
+        sample is not None
+        and sample.experiment_start_date is None
+        and not meta.get("start_date_confirmed")
+    )
+    rel_missing_start = (
+        related_sample is not None
+        and related_sample.experiment_start_date is None
+        and not rel_meta.get("start_date_confirmed")
+    )
+    if study_missing_start or rel_missing_start:
+        reasons.append(
+            {
+                "code": "MISSING_START_DATE",
+                "badge": "Başlangıç Tarihi Eksik",
+                "tag": "Eksik Bilgi: Başlangıç Tarihi Girilmedi (Excel'de Boş)",
+            }
+        )
+
+    # 2) Saha teknisyeni belirtilmediği için sistem otomatik varsayılan teknisyen (`In Vivo Teknisyeni 1/2`) atamışsa
+    title_str = conflict.title or ""
+    if (
+        conflict.conflict_type == ConflictType.PERSONNEL_OVERLAP
+        and ("Teknisyen" in title_str or "invivo_" in (conflict.description or "").lower())
+        and not meta.get("technician_confirmed")
+    ):
+        reasons.append(
+            {
+                "code": "DEFAULT_TECHNICIAN",
+                "badge": "Teknisyen Ataması Varsayılan",
+                "tag": "Eksik Bilgi: Saha Teknisyeni Atanmadı (Varsayılan Teknisyen)",
+            }
+        )
+
+    # 3) TIIS / CoA PDF henüz yüklenmemişse veya ekstraksiyon saati/cihazı manuel teyit edilmemişse
+    study_code = study.study_code if study else ""
+    has_docs = bool(
+        study_code in doc_study_codes
+        or (sample is not None and bool(sample.document_autofill))
+        or meta.get("equipment_time_confirmed")
+    )
+    if not has_docs and (
+        conflict.conflict_type == ConflictType.BIOLOGICAL_TIME_VIOLATION
+        or (
+            conflict.conflict_type == ConflictType.EQUIPMENT_OVERLAP
+            and ("Su Banyosu" in title_str or (study is not None and study.extraction_polar is None and study.extraction_non_polar is None))
+        )
+    ):
+        reasons.append(
+            {
+                "code": "MISSING_TIIS_OR_EQUIPMENT",
+                "badge": "TIIS PDF / Cihaz Bilgisi Eksik",
+                "tag": "Eksik Bilgi: TIIS PDF / Cihaz & Saat Teyit Edilmedi",
+            }
+        )
+
+    category = "MISSING_INFO" if reasons else "CONFIRMED_CONFLICT"
+    return {
+        "conflict_category": category,
+        "missing_info_codes": [r["code"] for r in reasons],
+        "missing_info_badges": [r["badge"] for r in reasons],
+        "missing_info_tags": [r["tag"] for r in reasons],
+        "study_code": study.study_code if study else None,
+        "study_title": study.title if study else None,
+        "sample_id": sample.id if sample else None,
+        "related_study_code": related_study.study_code if related_study else None,
+        "step_name": step.step_name if step else None,
+        "planned_start": step.planned_start.isoformat() if (step and step.planned_start) else None,
+    }
+
+
+def enrich_conflicts_with_category(
+    db: Session,
+    conflicts: List[Conflict],
+    include_resolutions: bool = False,
+) -> List[Dict[str, Any]]:
+    """
+    Verilen Conflict ORM listesini tek sorgu kümesiyle zenginleştirerek `conflict_category`,
+    `missing_info_badges`, `missing_info_tags`, `study_code`, `sample_id` ve isteğe bağlı `resolutions` döner.
+    """
+    if not conflicts:
+        return []
+    from app.models.document import Document
+    from app.models.sample import SampleRecord
+
+    studies = db.query(Study).all()
+    study_by_id = {s.id: s for s in studies}
+    samples = db.query(SampleRecord).all()
+    sample_by_code = {s.study_code: s for s in samples if s.study_code}
+    step_ids = {c.step_id for c in conflicts if c.step_id is not None}
+    step_by_id = (
+        {s.id: s for s in db.query(StudyStep).filter(StudyStep.id.in_(step_ids)).all()}
+        if step_ids
+        else {}
+    )
+    doc_codes = {
+        row[0]
+        for row in db.query(Document.dossier_key).filter(Document.dossier_key.isnot(None)).distinct().all()
+        if row[0]
+    }
+
+    all_steps_orm: List[StudyStep] = []
+    all_steps_by_id: Dict[int, StudyStep] = {}
+    active_techs: List[User] = []
+    water_bath: Optional[Equipment] = None
+    if include_resolutions:
+        water_bath = seed_default_equipment(db)
+        active_techs = [
+            u for u in db.query(User).filter(User.role == UserRole.TECHNICIAN, User.is_active == True).order_by(User.id.asc()).all()  # noqa: E712
+            if is_eligible_lab_personnel(u)
+        ]
+        all_steps_orm = (
+            db.query(StudyStep)
+            .options(selectinload(StudyStep.assignees), selectinload(StudyStep.study))
+            .filter(StudyStep.status != StepStatus.CANCELLED, StudyStep.status != StepStatus.COMPLETED)
+            .all()
+        )
+        all_steps_by_id = {s.id: s for s in all_steps_orm}
+
+    out: List[Dict[str, Any]] = []
+    for c in conflicts:
+        st = study_by_id.get(c.study_id)
+        sr = sample_by_code.get(st.study_code) if st else None
+        rel_st = study_by_id.get(c.related_study_id) if c.related_study_id else None
+        rel_sr = sample_by_code.get(rel_st.study_code) if rel_st else None
+        step = step_by_id.get(c.step_id) if c.step_id else None
+
+        meta_info = classify_conflict_record(c, st, sr, rel_st, rel_sr, step, doc_codes)
+        row: Dict[str, Any] = {
+            "id": c.id,
+            "conflict_type": c.conflict_type,
+            "type": c.conflict_type.value if hasattr(c.conflict_type, "value") else str(c.conflict_type),
+            "severity": c.severity,
+            "title": c.title,
+            "description": c.description,
+            "study_id": c.study_id,
+            "step_id": c.step_id,
+            "related_study_id": c.related_study_id,
+            "is_resolved": c.is_resolved,
+            "resolved_by_id": c.resolved_by_id,
+            "resolved_at": c.resolved_at,
+            "resolution_notes": c.resolution_notes,
+            "detected_at": c.detected_at,
+            **meta_info,
+        }
+        if include_resolutions and st is not None and not c.is_resolved:
+            row["resolutions"] = build_conflict_resolutions(
+                db,
+                c,
+                study=st,
+                existing_steps=all_steps_orm,
+                fast_mode=True,
+                active_techs=active_techs,
+                water_bath=water_bath,
+                step_by_id=all_steps_by_id,
+            )
+        else:
+            row["resolutions"] = []
+        out.append(row)
+    return out
+
+
+def recompute_all_conflicts(
+    db: Session,
+    user: Optional[User] = None,
+    ref_date: date = REFERENCE_DATE,
+) -> Dict[str, Any]:
+    """
+    FAZ 9.2 (Madde 3): "Tüm Çakışmaları Yeniden Hesapla" (`Recompute Conflicts`):
+      1) Geçmiş / tamamlanmış çalışmaları ve adımları (`< ref_date`) `COMPLETED` olarak kapatır.
+      2) Aktif / planlanan çalışmaların bekleyen (`PENDING`) adımlarını güncel başlangıç tarihleri,
+         teknisyen atamaları, TIIS/CoA PDF verileri ve oda/cihaz kapasitelerine göre yeniden denetler.
+      3) Açık çakışmaları `CONFIRMED_CONFLICT` ve `MISSING_INFO` olarak sınıflandırıp özet döner.
+    """
+    sync_stats = sync_historical_completion_and_conflicts(db, ref_date=ref_date)
+    now = datetime.utcnow()
+
+    prev_approved = (
+        db.query(Conflict)
+        .filter(
+            Conflict.is_resolved == True,  # noqa: E712
+            Conflict.conflict_type == ConflictType.BIOLOGICAL_TIME_VIOLATION,
+            Conflict.resolution_notes.like("GLP Hafta Sonu Nöbetçi Personel Onayı%"),
+        )
+        .all()
+    )
+    approved_wk_steps = {c.step_id for c in prev_approved if c.step_id is not None}
+
+    superseded_note = f"RECOMPUTED: Tüm çakışmalar {now:%d.%m.%Y %H:%M} UTC itibarıyla yeniden hesaplandı."
+    db.query(Conflict).filter(Conflict.is_resolved == False).update(  # noqa: E712
+        {Conflict.is_resolved: True, Conflict.resolved_at: now, Conflict.resolution_notes: superseded_note},
+        synchronize_session=False,
+    )
+    db.flush()
+
+    water_bath = seed_default_equipment(db)
+    studies = (
+        db.query(Study)
+        .filter(Study.status.notin_([StudyStatus.COMPLETED, StudyStatus.CANCELLED]))
+        .order_by(Study.id.asc())
+        .all()
+    )
+
+    prior_steps: List[StudyStep] = []
+    prior_assignees: Dict[int, set] = {}
+    seen_workload_titles: set = set()
+
+    for st in studies:
+        pending_steps = (
+            db.query(StudyStep)
+            .options(selectinload(StudyStep.assignees), selectinload(StudyStep.study))
+            .filter(
+                StudyStep.study_id == st.id,
+                StudyStep.status != StepStatus.CANCELLED,
+                StudyStep.status != StepStatus.COMPLETED,
+            )
+            .order_by(StudyStep.step_order.asc())
+            .all()
+        )
+        if not pending_steps:
+            continue
+        tpl = get_template(getattr(st, "template_code", None) or DEFAULT_TEMPLATE_CODE, db=db)
+        findings = evaluate_study_conflicts(
+            db=db,
+            study=st,
+            steps=pending_steps,
+            existing_steps=prior_steps,
+            existing_assignees=prior_assignees,
+            water_bath=water_bath,
+            template=tpl,
+            preserve_approved_weekend_step_ids=approved_wk_steps,
+        )
+        # Aynı kişi-gün için 9 saat iş yükü aşımı uyarısını tekilleştir (aşımı tetikleyen son çalışmada tut)
+        for c, _ in findings:
+            if (c.title or "").startswith("9 Saat İş Yükü Aşımı:"):
+                if c.title in seen_workload_titles:
+                    c.is_resolved = True
+                    c.resolved_at = now
+                    c.resolution_notes = "Aynı kişi-gün iş yükü aşımı ilgili günün ana çakışma kaydında birleştirildi."
+                else:
+                    seen_workload_titles.add(c.title)
+
+        for ps in pending_steps:
+            prior_steps.append(ps)
+            prior_assignees[ps.id] = {u.id for u in ps.assignees}
+
+    db.flush()
+    open_conflicts = db.query(Conflict).filter(Conflict.is_resolved == False).order_by(Conflict.id.asc()).all()  # noqa: E712
+    enriched = enrich_conflicts_with_category(db, open_conflicts, include_resolutions=False)
+    confirmed_count = sum(1 for item in enriched if item["conflict_category"] == "CONFIRMED_CONFLICT")
+    missing_count = sum(1 for item in enriched if item["conflict_category"] == "MISSING_INFO")
+
+    db.add(
+        AuditLog(
+            user_id=user.id if user else None,
+            entity_name="Conflict",
+            entity_id=0,
+            action="RECOMPUTE_ALL_CONFLICTS",
+            new_values={
+                "reference_date": ref_date.isoformat(),
+                "confirmed_conflicts": confirmed_count,
+                "missing_info_conflicts": missing_count,
+                "total_open_conflicts": len(enriched),
+                **sync_stats,
+            },
+            reason=(
+                f"{user.full_name if user else 'Sistem'}: Tüm çalışma çakışmaları yeniden hesaplandı — "
+                f"{confirmed_count} gerçek çakışma, {missing_count} eksik bilgi kaynaklı olası çakışma."
+            ),
+        )
+    )
+    db.commit()
+    return {
+        "status": "success",
+        "confirmed_conflicts": confirmed_count,
+        "missing_info_conflicts": missing_count,
+        "total_open_conflicts": len(enriched),
+        **sync_stats,
+    }
+

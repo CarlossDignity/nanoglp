@@ -66,7 +66,6 @@ DEFAULT_ROLE_PERMISSIONS: List[Dict[str, Any]] = [
         "role_code": "STUDY_DIRECTOR",
         "role_label": "Çalışma Yöneticisi (SD)",
         "allowed_menus": [
-            "dashboard",
             "samples",
             "upload",
             "planning",
@@ -83,7 +82,6 @@ DEFAULT_ROLE_PERMISSIONS: List[Dict[str, Any]] = [
         "role_code": "PLANNING_COORDINATOR",
         "role_label": "Planlama Koordinatörü (PK)",
         "allowed_menus": [
-            "dashboard",
             "samples",
             "upload",
             "planning",
@@ -100,7 +98,6 @@ DEFAULT_ROLE_PERMISSIONS: List[Dict[str, Any]] = [
         "role_code": "QA",
         "role_label": "Kalite Güvence (QA)",
         "allowed_menus": [
-            "dashboard",
             "samples",
             "upload",
             "planning",
@@ -120,6 +117,20 @@ DEFAULT_ROLE_PERMISSIONS: List[Dict[str, Any]] = [
         "is_system": True,
     },
     {
+        "role_code": "TECH",
+        "role_label": "In Vivo Teknisyeni (TECH)",
+        "allowed_menus": ["my_tasks"],
+        "is_read_only": False,
+        "is_system": True,
+    },
+    {
+        "role_code": "VET",
+        "role_label": "Veteriner Hekim (VET)",
+        "allowed_menus": ["my_tasks", "studies"],
+        "is_read_only": False,
+        "is_system": True,
+    },
+    {
         "role_code": "ANALYST",
         "role_label": "Analist",
         "allowed_menus": ["my_tasks"],
@@ -129,7 +140,7 @@ DEFAULT_ROLE_PERMISSIONS: List[Dict[str, Any]] = [
     {
         "role_code": "SALES",
         "role_label": "Satış",
-        "allowed_menus": ["samples", "dashboard"],
+        "allowed_menus": ["samples"],
         "is_read_only": True,
         "is_system": True,
     },
@@ -182,6 +193,7 @@ def ensure_default_role_permissions(db: Session) -> List[RolePermission]:
         db.commit()
     _migrate_add_samples_menu(db)
     _migrate_faz83_role_menus(db)
+    _migrate_faz84_dashboard_menus(db)
     return db.query(RolePermission).order_by(RolePermission.id.asc()).all()
 
 
@@ -249,6 +261,37 @@ def _migrate_faz83_role_menus(db: Session) -> None:
             entity_id=0,
             action="MIGRATE_FAZ83_ROLE_MENUS",
             reason="FAZ 8.3: SALES rolüne ['samples', 'dashboard'] ve TRM_KABUL/TRM_ACCEPTANCE rollerine ['samples', 'upload'] yetkisi tanımlandı.",
+        )
+    )
+    db.commit()
+
+
+def _migrate_faz84_dashboard_menus(db: Session) -> None:
+    """FAZ 8.4: 'dashboard' (Yönetici Paneli) yetkisini varsayılan olarak sadece SYSADMIN, EXECUTIVE ve TFM rollerinde bırakır."""
+    from app.models.audit_log import AuditLog
+
+    marker = (
+        db.query(AuditLog)
+        .filter(AuditLog.entity_name == "RolePermission", AuditLog.action == "MIGRATE_FAZ84_DASHBOARD_MENUS")
+        .first()
+    )
+    if marker is not None:
+        return
+    allowed_dashboard_roles = {"SYSADMIN", "EXECUTIVE", "TFM", "ADMIN"}
+    for row in db.query(RolePermission).all():
+        code = (row.role_code or "").strip().upper()
+        menus = list(row.allowed_menus or [])
+        if code not in allowed_dashboard_roles and "dashboard" in menus:
+            menus = [m for m in menus if m != "dashboard"]
+            if not menus:
+                menus = ["my_tasks"] if code in {"TECHNICIAN", "TECH", "VET", "ANALYST"} else ["samples"]
+            row.allowed_menus = menus
+    db.add(
+        AuditLog(
+            entity_name="RolePermission",
+            entity_id=0,
+            action="MIGRATE_FAZ84_DASHBOARD_MENUS",
+            reason="FAZ 8.4: Yönetici Paneli ('dashboard') erişimi yalnızca SYSADMIN, EXECUTIVE ve TFM rollerine sınırlandı.",
         )
     )
     db.commit()

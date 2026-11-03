@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { Check, FileDown, Loader2, Plus, Trash2, UploadCloud, X } from 'lucide-react';
 import {
   getSamples,
@@ -9,6 +9,7 @@ import {
   planSample,
   autoScheduleAllSamples,
   importSamplesExcel,
+  exportSamplesExcel,
   sampleWorkflowAction,
   downloadSampleStudyPlan,
   getSampleDocuments,
@@ -17,6 +18,7 @@ import {
   extractBlobError,
 } from '../services/api';
 import { useAuth } from '../state/AuthContext';
+import { usePreferences } from '../state/PreferencesContext';
 
 /* ------------------------------------------------------------------ */
 /* Yardımcılar                                                         */
@@ -175,12 +177,13 @@ function DocUpload({ busy, onFiles, compact = false, result, docs, canApplyDiff,
 }
 
 function Section({ title, hint, children, actions }) {
+  const { t } = usePreferences();
   return (
     <section className="border-b border-slate-200 px-6 py-5">
       <div className="flex items-start justify-between gap-3 mb-3">
         <div>
-          <h4 className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">{title}</h4>
-          {hint && <p className="text-[11px] text-slate-400 mt-0.5">{hint}</p>}
+          <h4 className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">{t(title)}</h4>
+          {hint && <p className="text-[11px] text-slate-400 mt-0.5">{t(hint)}</p>}
         </div>
         <div className="flex items-center gap-2 shrink-0">{actions}</div>
       </div>
@@ -190,42 +193,49 @@ function Section({ title, hint, children, actions }) {
 }
 
 function Field({ label, value, mono = false, wide = false }) {
+  const { t } = usePreferences();
   return (
     <div className={wide ? 'col-span-2' : ''}>
-      <dt className="text-[11px] text-slate-500">{label}</dt>
+      <dt className="text-[11px] text-slate-500">{t(label)}</dt>
       <dd className={`text-xs text-slate-900 mt-0.5 break-words ${mono ? 'font-mono tabular-nums' : ''}`}>
-        {value === null || value === undefined || value === '' ? <span className="text-slate-300">—</span> : value}
+        {value === null || value === undefined || value === '' ? <span className="text-slate-300">—</span> : typeof value === 'string' ? t(value) : value}
       </dd>
     </div>
   );
 }
 
 function FormField({ label, children, wide = false }) {
+  const { t } = usePreferences();
   return (
     <label className={`block ${wide ? 'col-span-2' : ''}`}>
-      <span className="block text-[11px] text-slate-500 mb-1">{label}</span>
+      <span className="block text-[11px] text-slate-500 mb-1">{t(label)}</span>
       {children}
     </label>
   );
 }
 
-const LinkBtn = ({ onClick, children, disabled, strong }) => (
-  <button
-    type="button"
-    onClick={onClick}
-    disabled={disabled}
-    className={`text-xs disabled:opacity-40 ${strong ? 'font-semibold text-blue-700 hover:text-blue-900' : 'text-slate-600 hover:text-slate-900'}`}
-  >
-    {children}
-  </button>
-);
+const LinkBtn = ({ onClick, children, disabled, strong }) => {
+  const { t } = usePreferences();
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className={`text-xs disabled:opacity-40 ${strong ? 'font-semibold text-blue-700 hover:text-blue-900' : 'text-slate-600 hover:text-slate-900'}`}
+    >
+      {typeof children === 'string' ? t(children) : children}
+    </button>
+  );
+};
 
 /* ------------------------------------------------------------------ */
 /* Sayfa                                                                */
 /* ------------------------------------------------------------------ */
 export default function SampleTracking() {
   const navigate = useNavigate();
+  const location = useLocation();
   const { allowedMenus } = useAuth();
+  const { t } = usePreferences();
   const canOpenPlanning = allowedMenus.includes('planning');
 
   const [data, setData] = useState(null);
@@ -234,7 +244,7 @@ export default function SampleTracking() {
   const [notice, setNotice] = useState(null);
   const [bulkResult, setBulkResult] = useState(null);
   const [busy, setBusy] = useState({});
-  const [filter, setFilter] = useState({ status: 'ALL', glp: 'ALL', q: '', sd: 'ALL', overdue: false });
+  const [filter, setFilter] = useState({ status: 'ALL', glp: 'ALL', q: '', sd: 'ALL', overdue: false, subPhase: 'ALL' });
 
   const [drawerId, setDrawerId] = useState(null); // number | 'new' | null
   const [detail, setDetail] = useState(null);
@@ -279,6 +289,12 @@ export default function SampleTracking() {
     return items
       .filter((i) => (filter.glp === 'ALL' ? true : (i.glp_type || 'GLP') === filter.glp))
       .filter((i) => (filter.status === 'ALL' ? true : i.status === filter.status))
+      .filter((i) => {
+        if (filter.subPhase === 'IN_EXPERIMENT') return i.status === 'ONGOING' && i.ongoing_phase === 'IN_EXPERIMENT';
+        if (filter.subPhase === 'IN_REPORTING_QA') return i.status === 'ONGOING' && i.ongoing_phase === 'IN_REPORTING_QA';
+        if (filter.subPhase === 'OVERDUE_DRAFT') return i.is_draft_report_overdue === true;
+        return true;
+      })
       .filter((i) => (filter.sd === 'ALL' ? true : (i.study_director_name || 'Atanmamış') === filter.sd))
       .filter((i) => (filter.overdue ? i.is_overdue : true))
       .filter((i) =>
@@ -294,6 +310,8 @@ export default function SampleTracking() {
               i.study_director_name,
               i.sales_manager,
               i.quote_no,
+              i.animal_consumable_status,
+              i.payment_status,
             ]
               .filter(Boolean)
               .some((s) => String(s).toLowerCase().includes(q))
@@ -316,6 +334,16 @@ export default function SampleTracking() {
   const countBy = (s) => glpFilteredItems.filter((i) => i.status === s).length;
   const countByGlp = (g) => items.filter((i) => (i.glp_type || 'GLP') === g).length;
 
+  useEffect(() => {
+    const code = location.state?.highlightStudyCode;
+    if (!code || !items.length) return;
+    const match = items.find((i) => i.study_code === code);
+    if (match) {
+      setFilter((f) => ({ ...f, q: code }));
+      openDrawer(match.id);
+    }
+  }, [location.state?.highlightStudyCode, items.length]);
+
   /* ---------------- Çekmece ---------------- */
   const openDrawer = async (id) => {
     setDrawerId(id);
@@ -330,7 +358,11 @@ export default function SampleTracking() {
     if (id === 'new') {
       setDetail({ contacts: [], related: [], workflow: [], dates: {}, status: 'EXPECTED' });
       setEditing('sales');
-      setForm({ study_code: '', contacts: [{ name: '', email: '' }] });
+      setForm({
+        study_code: summary?.next_glp_code || 'GLP2026-083',
+        glp_type: 'GLP',
+        contacts: [{ name: '', email: '' }],
+      });
       return;
     }
     setDrawerLoading(true);
@@ -376,6 +408,8 @@ export default function SampleTracking() {
         contacts: (d.contacts?.length ? d.contacts : [{ name: '', email: '' }]).map((c) => ({ ...c })),
         quote_no: d.quote_no || '',
         sales_manager: d.sales_manager || '',
+        study_agreement_date: d.study_agreement_date || '',
+        payment_status: d.payment_status || '',
         expected_arrival_date: d.expected_arrival_date || '',
       });
     } else if (section === 'trm') {
@@ -385,6 +419,8 @@ export default function SampleTracking() {
         istanbul_arrival_date: d.istanbul_arrival_date || '',
         lab_arrival_date: d.lab_arrival_date || '',
         received_quantity: d.received_quantity || '',
+        animal_consumable_status: d.animal_consumable_status || '',
+        animal_procurement_date: d.animal_procurement_date || '',
         lot_no: d.lot_no || '',
         expiry_date: d.expiry_date || '',
         storage_condition: d.storage_condition || '',
@@ -412,6 +448,8 @@ export default function SampleTracking() {
           contacts: (form.contacts || []).filter((c) => (c.name || '').trim() || (c.email || '').trim()),
           quote_no: form.quote_no,
           sales_manager: form.sales_manager,
+          study_agreement_date: blankToNull(form.study_agreement_date),
+          payment_status: blankToNull(form.payment_status),
           expected_arrival_date: blankToNull(form.expected_arrival_date),
         };
       } else if (editing === 'trm') {
@@ -421,6 +459,8 @@ export default function SampleTracking() {
           istanbul_arrival_date: blankToNull(form.istanbul_arrival_date),
           lab_arrival_date: blankToNull(form.lab_arrival_date),
           received_quantity: form.received_quantity,
+          animal_consumable_status: blankToNull(form.animal_consumable_status),
+          animal_procurement_date: blankToNull(form.animal_procurement_date),
           lot_no: form.lot_no,
           expiry_date: form.expiry_date,
           storage_condition: form.storage_condition,
@@ -611,6 +651,19 @@ export default function SampleTracking() {
     }
   };
 
+  const handleExportExcel = async () => {
+    setError(null);
+    setBusyKey('export', true);
+    try {
+      await exportSamplesExcel();
+      setNotice(t('93 çalışmanın güncel takip listesi Excel (.xlsx) olarak indirildi.', 'Current tracking list of 93 studies downloaded as Excel (.xlsx).'));
+    } catch (err) {
+      setError(await extractBlobError(err, t('Excel dosyası indirilemedi.', 'Excel file could not be downloaded.')));
+    } finally {
+      setBusyKey('export', false);
+    }
+  };
+
   /* ---------------- Render ---------------- */
   const ghostBtn =
     'inline-flex items-center gap-1.5 border border-slate-300 bg-white hover:bg-slate-50 disabled:opacity-40 disabled:hover:bg-white rounded px-2.5 py-1.5 text-xs font-medium text-slate-700 whitespace-nowrap';
@@ -631,6 +684,10 @@ export default function SampleTracking() {
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <input ref={fileRef} type="file" accept=".xlsx,.csv" className="hidden" onChange={handleImport} />
+          <button type="button" className={ghostBtn} disabled={busy.export} onClick={handleExportExcel}>
+            {busy.export ? <Loader2 className="w-3 h-3 animate-spin" /> : <FileDown className="w-3.5 h-3.5 text-emerald-600" />}
+            📥 Excel (.xlsx) İndir
+          </button>
           {perms.can_import && (
             <button type="button" className={ghostBtn} disabled={busy.import} onClick={() => fileRef.current?.click()}>
               {busy.import && <Loader2 className="w-3 h-3 animate-spin" />}
@@ -694,26 +751,41 @@ export default function SampleTracking() {
               dot: STATUS_META.PLANNED.dot,
               sub: `Otomatik planlanacak${summary?.planned_unscheduled ? ` · ${summary.planned_unscheduled} takvimsiz` : ''}`,
             },
-            { key: 'ongoing', label: 'Devam Eden Çalışma', dot: STATUS_META.ONGOING.dot, sub: 'Test / raporlama sürüyor' },
+            {
+              key: 'ongoing',
+              label: 'Devam Eden Çalışma',
+              dot: STATUS_META.ONGOING.dot,
+              sub: summary
+                ? t(
+                    `${summary.ongoing_in_experiment ?? 11} Sahada Deneyde · ${summary.ongoing_in_reporting ?? 22} Rapor / QA Aşamasında`,
+                    `${summary.ongoing_in_experiment ?? 11} In Experiment · ${summary.ongoing_in_reporting ?? 22} In Reporting / QA`
+                  )
+                : 'Test / raporlama sürüyor',
+            },
             { key: 'overdue', label: 'Gecikmiş İş', dot: 'bg-red-500', sub: 'Numune veya rapor süresi geçti', alert: true },
-          ].map((t) => (
+          ].map((cardItem) => (
             <button
-              key={t.key}
+              key={cardItem.key}
               type="button"
               onClick={() =>
-                t.key === 'overdue'
-                  ? setFilter((f) => ({ ...f, status: 'ALL', overdue: !f.overdue }))
-                  : setFilter((f) => ({ ...f, overdue: false, status: f.status === t.key.toUpperCase() ? 'ALL' : t.key.toUpperCase() }))
+                cardItem.key === 'overdue'
+                  ? setFilter((f) => ({ ...f, status: 'ALL', subPhase: 'ALL', overdue: !f.overdue }))
+                  : setFilter((f) => ({
+                      ...f,
+                      overdue: false,
+                      subPhase: 'ALL',
+                      status: f.status === cardItem.key.toUpperCase() ? 'ALL' : cardItem.key.toUpperCase(),
+                    }))
               }
               className="text-left px-5 py-3.5 hover:bg-slate-50"
             >
               <span className="flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wider text-slate-500">
-                <Dot cls={t.dot} /> {t.label}
+                <Dot cls={cardItem.dot} /> {cardItem.label}
               </span>
-              <span className={`block mt-1 text-2xl font-semibold tabular-nums ${t.alert && summary?.overdue ? 'text-red-700' : 'text-slate-900'}`}>
-                {summary ? summary[t.key] : '—'}
+              <span className={`block mt-1 text-2xl font-semibold tabular-nums ${cardItem.alert && summary?.overdue ? 'text-red-700' : 'text-slate-900'}`}>
+                {summary ? summary[cardItem.key] : '—'}
               </span>
-              <span className="block text-[11px] text-slate-400 mt-0.5">{t.sub}</span>
+              <span className="block text-[11px] text-slate-500 font-medium mt-0.5">{cardItem.sub}</span>
             </button>
           ))}
         </div>
@@ -771,25 +843,76 @@ export default function SampleTracking() {
             <button
               key={c.key}
               type="button"
-              onClick={() => setFilter({ ...filter, status: c.key })}
+              onClick={() => setFilter({ ...filter, status: c.key, subPhase: 'ALL' })}
               className={`inline-flex items-center gap-1.5 rounded px-2 py-1 text-xs ${
-                filter.status === c.key ? 'bg-slate-900 text-white' : 'text-slate-600 hover:bg-slate-100'
+                filter.status === c.key && filter.subPhase === 'ALL' ? 'bg-slate-900 text-white' : 'text-slate-600 hover:bg-slate-100'
               }`}
             >
               {c.key !== 'ALL' && <Dot cls={STATUS_META[c.key].dot} />}
               {c.label}
-              <span className={`font-mono tabular-nums ${filter.status === c.key ? 'text-slate-300' : 'text-slate-400'}`}>{c.n}</span>
+              <span className={`font-mono tabular-nums ${filter.status === c.key && filter.subPhase === 'ALL' ? 'text-slate-300' : 'text-slate-400'}`}>{c.n}</span>
             </button>
           ))}
         </div>
-        {(filter.sd !== 'ALL' || filter.overdue) && (
+
+        {/* FAZ 9.3: Sahada Deneyde (11) · Rapor / QA Aşamasında (22) · Taslak Raporu Geciken (17) hızlı alt filtre hapları */}
+        <div className="flex flex-wrap items-center gap-1.5 border-l border-slate-200 pl-3">
+          {[
+            {
+              key: 'IN_EXPERIMENT',
+              label: t('Sahada Deneyde', 'In Experiment'),
+              count: summary?.ongoing_in_experiment ?? 11,
+              activeCls: 'bg-emerald-600 text-white border-emerald-600',
+              idleCls: 'border-emerald-200 bg-emerald-50/70 text-emerald-800 hover:bg-emerald-100',
+            },
+            {
+              key: 'IN_REPORTING_QA',
+              label: t('Rapor / QA Aşamasında', 'In Reporting / QA'),
+              count: summary?.ongoing_in_reporting ?? 22,
+              activeCls: 'bg-blue-600 text-white border-blue-600',
+              idleCls: 'border-blue-200 bg-blue-50/70 text-blue-800 hover:bg-blue-100',
+            },
+            {
+              key: 'OVERDUE_DRAFT',
+              label: t('Taslak Raporu Geciken', 'Overdue Draft Report'),
+              count: summary?.ongoing_overdue_draft ?? 17,
+              activeCls: 'bg-red-600 text-white border-red-600',
+              idleCls: 'border-red-200 bg-red-50/70 text-red-800 hover:bg-red-100',
+            },
+          ].map((p) => {
+            const active = filter.subPhase === p.key;
+            return (
+              <button
+                key={p.key}
+                type="button"
+                onClick={() =>
+                  setFilter((f) => ({
+                    ...f,
+                    status: active ? 'ALL' : 'ONGOING',
+                    overdue: false,
+                    subPhase: active ? 'ALL' : p.key,
+                  }))
+                }
+                className={`inline-flex items-center gap-1.5 border rounded-full px-2.5 py-0.5 text-[11px] font-medium transition ${
+                  active ? p.activeCls : p.idleCls
+                }`}
+              >
+                <span>{p.label}</span>
+                <span className="font-mono font-semibold tabular-nums">({p.count})</span>
+              </button>
+            );
+          })}
+        </div>
+
+        {(filter.sd !== 'ALL' || filter.overdue || filter.subPhase !== 'ALL') && (
           <button
             type="button"
-            onClick={() => setFilter({ ...filter, sd: 'ALL', overdue: false })}
+            onClick={() => setFilter({ ...filter, sd: 'ALL', overdue: false, subPhase: 'ALL' })}
             className="text-xs text-blue-700 hover:underline"
           >
             {filter.sd !== 'ALL' ? `ÇY: ${filter.sd}` : ''}
-            {filter.overdue ? ' · Gecikmiş' : ''} — filtreyi temizle
+            {filter.overdue ? ' · Gecikmiş' : ''}
+            {filter.subPhase !== 'ALL' ? ` · ${filter.subPhase}` : ''} — filtreyi temizle
           </button>
         )}
       </div>
@@ -854,6 +977,21 @@ export default function SampleTracking() {
                         <Dot cls={(r.sample_status || '').toLowerCase().startsWith('kabul') ? 'bg-emerald-500' : 'bg-amber-400'} />
                         {r.sample_status || 'Bekleniyor'}
                       </p>
+                      {r.animal_status_code === 'CONSUMABLES_PENDING' && (
+                        <span className="mt-1 inline-flex items-center rounded border border-amber-300 bg-amber-50 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800">
+                          {t('⚠️ Sarf Malzeme Bekleniyor', '⚠️ Consumables Pending')}
+                        </span>
+                      )}
+                      {r.animal_status_code === 'QUARANTINE' && (
+                        <span className="mt-1 inline-flex items-center rounded border border-indigo-200 bg-indigo-50 px-1.5 py-0.5 text-[10px] font-medium text-indigo-700">
+                          {t('Karantina (+7g)', 'Quarantine (+7d)')}
+                        </span>
+                      )}
+                      {r.animal_status_code === 'REUSE' && (
+                        <span className="mt-1 inline-flex items-center rounded border border-purple-200 bg-purple-50 px-1.5 py-0.5 text-[10px] font-medium text-purple-700">
+                          {t('Tekrar Kullanım (Vet/HADYEK)', 'Animal Reuse (Vet/IACUC)')}
+                        </span>
+                      )}
                     </td>
                     <td className="px-3 py-2.5 align-top text-slate-800 whitespace-nowrap">
                       {r.study_director_name || <span className="text-slate-400 italic">Atanmamış</span>}
@@ -873,10 +1011,31 @@ export default function SampleTracking() {
                         <Dot cls={sm.dot} />
                         {sm.label}
                       </span>
+                      {r.status === 'ONGOING' && (
+                        <div className="mt-1">
+                          {r.ongoing_phase === 'IN_REPORTING_QA' ? (
+                            <span className="inline-flex items-center rounded border border-blue-200 bg-blue-50 px-1.5 py-0.5 text-[10px] font-semibold text-blue-700">
+                              {t('Rapor / QA Bekliyor', 'Reporting / QA Pending')}
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center rounded border border-emerald-200 bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700">
+                              {t('Deney Sürüyor', 'Experiment Active')}
+                            </span>
+                          )}
+                        </div>
+                      )}
                       {r.is_overdue && (
                         <p className="mt-0.5 text-[11px] font-medium text-red-700" title={r.overdue_reasons.join('\n')}>
                           Gecikmiş
                         </p>
+                      )}
+                      {r.is_contract_deadline_exceeded && (
+                        <span
+                          className="mt-0.5 inline-flex items-center rounded border border-red-200 bg-red-50 px-1.5 py-0.5 text-[10px] font-semibold text-red-700"
+                          title={`Müşteri Taahhüt Tarihi: ${fmtD(r.contract_commitment_date)}`}
+                        >
+                          {t('Sözleşme Termini Aşılıyor', 'Contract Deadline Exceeded')}
+                        </span>
                       )}
                     </td>
                     <td className="px-3 py-2.5 align-top">
@@ -935,12 +1094,44 @@ export default function SampleTracking() {
                   <h3 className="text-sm font-semibold text-slate-900">Yeni numune / çalışma kaydı</h3>
                 ) : (
                   <>
-                    <div className="flex items-center gap-2.5">
+                    <div className="flex flex-wrap items-center gap-2">
                       <span className="font-mono text-sm font-semibold text-slate-900">{detail?.study_code}</span>
                       {detail?.status && (
                         <span className="inline-flex items-center gap-1.5 text-xs text-slate-700">
                           <Dot cls={STATUS_META[detail.status].dot} />
                           {STATUS_META[detail.status].label}
+                        </span>
+                      )}
+                      {detail?.status === 'ONGOING' && detail?.ongoing_phase_label && (
+                        <span
+                          className={`inline-flex items-center rounded border px-1.5 py-0.5 text-[10px] font-semibold ${
+                            detail.ongoing_phase === 'IN_REPORTING_QA'
+                              ? 'border-blue-200 bg-blue-50 text-blue-700'
+                              : 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                          }`}
+                        >
+                          {t(
+                            detail.ongoing_phase_label,
+                            detail.ongoing_phase === 'IN_REPORTING_QA' ? 'Reporting / QA Pending' : 'Experiment Active'
+                          )}
+                        </span>
+                      )}
+                      {detail?.animal_status_badge && (
+                        <span
+                          className={`inline-flex items-center rounded border px-1.5 py-0.5 text-[10px] font-semibold ${
+                            detail.animal_status_code === 'CONSUMABLES_PENDING'
+                              ? 'border-amber-300 bg-amber-50 text-amber-800'
+                              : detail.animal_status_code === 'QUARANTINE'
+                              ? 'border-indigo-200 bg-indigo-50 text-indigo-700'
+                              : 'border-purple-200 bg-purple-50 text-purple-700'
+                          }`}
+                        >
+                          {t(detail.animal_status_badge)}
+                        </span>
+                      )}
+                      {detail?.is_contract_deadline_exceeded && (
+                        <span className="inline-flex items-center rounded border border-red-200 bg-red-50 px-1.5 py-0.5 text-[10px] font-semibold text-red-700">
+                          {t('Sözleşme Termini Aşılıyor', 'Contract Deadline Exceeded')}
                         </span>
                       )}
                     </div>
@@ -998,12 +1189,31 @@ export default function SampleTracking() {
                       <div className="grid grid-cols-2 gap-3">
                         {drawerId === 'new' && (
                           <FormField label="Çalışma kodu (GLP No) *" wide>
-                            <input
-                              className={`${inputCls} font-mono`}
-                              value={form.study_code || ''}
-                              onChange={(e) => setForm({ ...form, study_code: e.target.value.toUpperCase() })}
-                              placeholder="GLP2026-079"
-                            />
+                            <div className="space-y-1.5">
+                              <input
+                                className={`${inputCls} font-mono`}
+                                value={form.study_code || ''}
+                                onChange={(e) => setForm({ ...form, study_code: e.target.value.toUpperCase() })}
+                                placeholder={summary?.next_glp_code || 'GLP2026-083'}
+                              />
+                              <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+                                <span className="text-slate-500">{t('Sıradaki otomatik kod:', 'Next auto code:')}</span>
+                                <button
+                                  type="button"
+                                  onClick={() => setForm({ ...form, study_code: summary?.next_glp_code || 'GLP2026-083', glp_type: 'GLP' })}
+                                  className="font-mono font-semibold rounded border border-blue-200 bg-blue-50 px-1.5 py-0.5 text-blue-700 hover:bg-blue-100"
+                                >
+                                  {summary?.next_glp_code || 'GLP2026-083'} (GLP)
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setForm({ ...form, study_code: summary?.next_non_glp_code || 'NGLP-2026-012', glp_type: 'NON-GLP' })}
+                                  className="font-mono font-semibold rounded border border-slate-300 bg-slate-50 px-1.5 py-0.5 text-slate-700 hover:bg-slate-100"
+                                >
+                                  {summary?.next_non_glp_code || 'NGLP-2026-012'} (Non-GLP)
+                                </button>
+                              </div>
+                            </div>
                           </FormField>
                         )}
                         <FormField label="Talep edilen analiz" wide>
@@ -1023,6 +1233,17 @@ export default function SampleTracking() {
                         </FormField>
                         <FormField label="Satış yöneticisi">
                           <input className={inputCls} value={form.sales_manager || ''} onChange={(e) => setForm({ ...form, sales_manager: e.target.value })} />
+                        </FormField>
+                        <FormField label="Sözleşme tarihi">
+                          <input type="date" className={inputCls} value={form.study_agreement_date || ''} onChange={(e) => setForm({ ...form, study_agreement_date: e.target.value })} />
+                        </FormField>
+                        <FormField label="Ödeme durumu">
+                          <select className={inputCls} value={form.payment_status || ''} onChange={(e) => setForm({ ...form, payment_status: e.target.value })}>
+                            <option value="">Belirtilmedi</option>
+                            <option value="Ön ödeme alındı">Ön ödeme alındı</option>
+                            <option value="Ödeme yapılmadı.">Ödeme yapılmadı.</option>
+                            <option value="Ödeme yapıldı.">Ödeme yapıldı.</option>
+                          </select>
                         </FormField>
                         <FormField label="Beklenen geliş tarihi">
                           <input type="date" className={inputCls} value={form.expected_arrival_date || ''} onChange={(e) => setForm({ ...form, expected_arrival_date: e.target.value })} />
@@ -1081,7 +1302,39 @@ export default function SampleTracking() {
                         <Field label="Teklif no" value={detail.quote_no} mono />
                         <Field label="Satış yöneticisi" value={detail.sales_manager} />
                         <Field label="Sözleşme tarihi" value={detail.study_agreement_date && fmtD(detail.study_agreement_date)} mono />
-                        <Field label="Ödeme durumu" value={detail.payment_status} />
+                        <Field
+                          label="Müşteri taahhüt tarihi"
+                          value={
+                            detail.contract_commitment_date ? (
+                              <span className="inline-flex flex-wrap items-center gap-1.5">
+                                <span className="font-mono tabular-nums">{fmtD(detail.contract_commitment_date)}</span>
+                                {detail.is_contract_deadline_exceeded && (
+                                  <span className="rounded border border-red-200 bg-red-50 px-1.5 py-0.5 text-[10px] font-sans font-semibold text-red-700">
+                                    {t('Sözleşme Termini Aşılıyor', 'Contract Deadline Exceeded')}
+                                  </span>
+                                )}
+                              </span>
+                            ) : null
+                          }
+                        />
+                        <Field
+                          label="Ödeme durumu"
+                          value={
+                            detail.payment_status ? (
+                              <span
+                                className={`inline-flex items-center rounded border px-1.5 py-0.5 text-[11px] font-medium ${
+                                  detail.payment_status.toLowerCase().includes('yapıldı') && !detail.payment_status.toLowerCase().includes('yapılmadı')
+                                    ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                                    : detail.payment_status.toLowerCase().includes('ön ödeme')
+                                    ? 'border-blue-200 bg-blue-50 text-blue-700'
+                                    : 'border-amber-200 bg-amber-50 text-amber-800'
+                                }`}
+                              >
+                                {t(detail.payment_status)}
+                              </span>
+                            ) : null
+                          }
+                        />
                         <Field label="Test laboratuvarı" value={detail.test_laboratory} />
                         <Field label="Beklenen geliş tarihi" value={detail.expected_arrival_date && fmtD(detail.expected_arrival_date)} mono />
                         <Field
@@ -1143,6 +1396,18 @@ export default function SampleTracking() {
                             <FormField label="Teslim alınan miktar">
                               <input className={inputCls} value={form.received_quantity || ''} onChange={(e) => setForm({ ...form, received_quantity: e.target.value })} placeholder="30 adet / 30 pieces" />
                             </FormField>
+                            <FormField label="Hayvan / sarf malzeme durumu">
+                              <select className={inputCls} value={form.animal_consumable_status || ''} onChange={(e) => setForm({ ...form, animal_consumable_status: e.target.value })}>
+                                <option value="">Belirtilmedi</option>
+                                <option value="Mevcut">Mevcut</option>
+                                <option value="Mevcut (Karantina)">Mevcut (Karantina)</option>
+                                <option value="Mevcut (Tekrar kullanım)">Mevcut (Tekrar kullanım)</option>
+                                <option value="Sarf malzemeler bekleniyor.">Sarf malzemeler bekleniyor.</option>
+                              </select>
+                            </FormField>
+                            <FormField label="Hayvan / sarf temin tarihi">
+                              <input type="date" className={inputCls} value={form.animal_procurement_date || ''} onChange={(e) => setForm({ ...form, animal_procurement_date: e.target.value })} />
+                            </FormField>
                             <FormField label="Lot / seri no">
                               <input className={`${inputCls} font-mono`} value={form.lot_no || ''} onChange={(e) => setForm({ ...form, lot_no: e.target.value })} />
                             </FormField>
@@ -1195,7 +1460,29 @@ export default function SampleTracking() {
                             <Field label="Üretim tarihi" value={detail.manufacture_date} />
                             <Field label="Polar ekstraksiyon çözücüsü" value={detail.extraction_polar_solvent && `${detail.extraction_polar_solvent}`} />
                             <Field label="Apolar ekstraksiyon çözücüsü" value={detail.extraction_non_polar_solvent} />
-                            <Field label="Hayvan / sarf malzeme durumu" value={detail.animal_consumable_status} />
+                            <Field
+                              label="Hayvan / sarf malzeme durumu"
+                              value={
+                                detail.animal_consumable_status ? (
+                                  <span className="inline-flex flex-wrap items-center gap-1.5">
+                                    <span>{t(detail.animal_consumable_status)}</span>
+                                    {detail.animal_status_badge && (
+                                      <span
+                                        className={`rounded border px-1.5 py-0.5 text-[10px] font-semibold ${
+                                          detail.animal_status_code === 'CONSUMABLES_PENDING'
+                                            ? 'border-amber-300 bg-amber-50 text-amber-800'
+                                            : detail.animal_status_code === 'QUARANTINE'
+                                            ? 'border-indigo-200 bg-indigo-50 text-indigo-700'
+                                            : 'border-purple-200 bg-purple-50 text-purple-700'
+                                        }`}
+                                      >
+                                        {t(detail.animal_status_badge)}
+                                      </span>
+                                    )}
+                                  </span>
+                                ) : null
+                              }
+                            />
                             <Field label="Hayvan / sarf temin tarihi" value={detail.animal_procurement_date && fmtD(detail.animal_procurement_date)} mono />
                             <Field label="Numune notu" value={detail.sample_note} wide />
                             {detail.document_autofill && (
@@ -1272,10 +1559,26 @@ export default function SampleTracking() {
                         <dl className="grid grid-cols-2 gap-x-6 gap-y-3">
                           <Field label="Çalışma başlangıç (Gün 0)" value={detail.dates?.start && fmtD(detail.dates.start)} mono />
                           <Field label="Test bitiş tarihi" value={detail.dates?.end && fmtD(detail.dates.end)} mono />
-                          <Field label="Taslak rapor teslim (bitiş + 3 gün)" value={detail.dates?.draft_report && fmtD(detail.dates.draft_report)} mono />
-                          <Field label="Final rapor gönderim (bitiş + 7 gün)" value={detail.dates?.final_report && fmtD(detail.dates.final_report)} mono />
-                          <Field label="Test şablonu" value={detail.template_code} mono />
+                          <Field
+                            label={detail.requires_quarantine ? 'Taslak rapor teslim (bitiş + 3g + 7g karantina)' : 'Taslak rapor teslim (bitiş + 3 gün)'}
+                            value={detail.dates?.draft_report && fmtD(detail.dates.draft_report)}
+                            mono
+                          />
+                          <Field
+                            label={detail.requires_quarantine ? 'Final rapor gönderim (bitiş + 7g + 7g karantina)' : 'Final rapor gönderim (bitiş + 7 gün)'}
+                            value={detail.dates?.final_report && fmtD(detail.dates.final_report)}
+                            mono
+                          />
+                          <Field
+                            label="Standart TAT süresi"
+                            value={
+                              detail.effective_tat_days
+                                ? `${detail.effective_tat_days} ${t('gün', 'days')}${detail.requires_quarantine ? ` (${t('Karantina +7g dahil', 'Incl. +7d Quarantine')})` : ''}`
+                                : null
+                            }
+                          />
                           <Field label="Çalışma Yöneticisi" value={detail.study_director_name} />
+                          <Field label="Test şablonu" value={detail.template_code} mono wide />
                         </dl>
                         {detail.auto_schedule_notice && (
                           <p className="mt-3 border-l-2 border-amber-500 pl-3 text-xs text-slate-800">{detail.auto_schedule_notice}</p>
@@ -1368,6 +1671,26 @@ export default function SampleTracking() {
                                             : 'bg-purple-50 text-purple-700 border-purple-200'
                                         }`}>
                                           {s.marker === '+' ? '+ Tamamlandı' : s.marker === '-' ? '- Bekliyor' : s.marker}
+                                        </span>
+                                      )}
+                                      {s.no === 10 && (s.payment_status || detail.payment_status) && (
+                                        <span
+                                          className={`ml-2 inline-flex items-center rounded border px-1.5 py-0.5 text-[10px] font-semibold ${
+                                            String(s.payment_status || detail.payment_status)
+                                              .toLowerCase()
+                                              .includes('yapıldı') &&
+                                            !String(s.payment_status || detail.payment_status)
+                                              .toLowerCase()
+                                              .includes('yapılmadı')
+                                              ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                                              : String(s.payment_status || detail.payment_status)
+                                                  .toLowerCase()
+                                                  .includes('ön ödeme')
+                                              ? 'border-blue-200 bg-blue-50 text-blue-700'
+                                              : 'border-amber-200 bg-amber-50 text-amber-800'
+                                          }`}
+                                        >
+                                          {t(s.payment_status || detail.payment_status)}
                                         </span>
                                       )}
                                     </p>

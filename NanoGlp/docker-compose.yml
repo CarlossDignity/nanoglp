@@ -1,23 +1,28 @@
-version: '3.8'
+version: "3.9"
 
 services:
-  db:
-    image: postgres:16-alpine
-    container_name: nanolab_glp_db
-    restart: always
-    environment:
-      POSTGRES_USER: glp_user
-      POSTGRES_PASSWORD: glp_secret_password
-      POSTGRES_DB: nanolab_glp
+  nanolab-glp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nanolab-glp-production
+    restart: unless-stopped
     ports:
-      - "5432:5432"
+      - "8000:8000"
+    env_file:
+      - .env.example
+    environment:
+      - ENV=production
+      - APP_ENV=production
+      - DATABASE_URL=sqlite:////app/backend/data/nanolab_glp.db
+      - UPLOAD_DIR=/app/backend/uploads
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      # SQLite WAL veritabanı ve yüklenen PDF/Excel belgeleri için kalıcı (persistent) disk alanları
+      - ./backend/nanolab_glp.db:/app/backend/nanolab_glp.db
+      - ./backend/uploads:/app/backend/uploads
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U glp_user -d nanolab_glp"]
-      interval: 5s
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/api/v1/health"]
+      interval: 30s
       timeout: 5s
-      retries: 5
-
-volumes:
-  postgres_data:
+      retries: 3
+      start_period: 10s

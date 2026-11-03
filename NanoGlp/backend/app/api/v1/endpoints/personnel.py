@@ -12,6 +12,11 @@ from app.utils.security import get_password_hash, require_management_read, requi
 router = APIRouter(prefix="/personnel", tags=["Personel Yönetimi"])
 
 _TR_MAP = str.maketrans("çğıöşüÇĞİÖŞÜ", "cgiosuCGIOSU")
+EXCLUDED_PERSONNEL_ROLES = {"SYSADMIN", "ADMIN", "EXECUTIVE", "SALES", "TRM_KABUL", "TRM_ACCEPTANCE"}
+
+
+def _role_str(user: User) -> str:
+    return (user.role.value if hasattr(user.role, "value") else str(user.role or "")).strip().upper()
 
 
 def _derive_unique_username(db: Session, full_name: str) -> str:
@@ -24,20 +29,32 @@ def _derive_unique_username(db: Session, full_name: str) -> str:
     return candidate
 
 
-@router.get("/", response_model=List[UserOut])
+@router.get("", response_model=List[UserOut])
+@router.get("/", response_model=List[UserOut], include_in_schema=False)
 def get_all_personnel(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_management_read),
 ):
-    return db.query(User).order_by(User.id).all()
+    rows = db.query(User).order_by(User.id).all()
+    return [
+        u for u in rows
+        if _role_str(u) not in EXCLUDED_PERSONNEL_ROLES and (u.username or "").strip().lower() != "yigit"
+    ]
 
 
-@router.post("/", response_model=UserOut, status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=UserOut, status_code=status.HTTP_201_CREATED)
+@router.post("/", response_model=UserOut, status_code=status.HTTP_201_CREATED, include_in_schema=False)
 def create_personnel(
     user_in: PersonnelCreate,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_management_write),
 ):
+    role_code = (user_in.role.value if hasattr(user_in.role, "value") else str(user_in.role or "")).strip().upper()
+    if role_code in EXCLUDED_PERSONNEL_ROLES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Personel İş Yükü ekranından yalnızca laboratuvar ve çalışma personeli (STUDY_DIRECTOR, TECHNICIAN, ANALYST, VET, QA, TFM, PLANNING_COORDINATOR) eklenebilir.",
+        )
     if user_in.username:
         try:
             username = validate_username_format(user_in.username)

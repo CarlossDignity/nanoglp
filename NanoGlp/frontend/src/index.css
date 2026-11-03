@@ -1,5 +1,25 @@
 @tailwind base;
 @tailwind components;
+
+/* FAZ 7 — Kurumsal tasarım standartları (tüm ekranlarda ortak) */
+@layer components {
+  .nl-card {
+    @apply bg-white dark:bg-slate-900 rounded-lg border border-slate-200 dark:border-slate-800 shadow-xs;
+  }
+  .nl-th {
+    @apply text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400;
+  }
+  .nl-badge {
+    @apply inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-md border;
+  }
+  .nl-badge-draft {
+    @apply bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-950/50 dark:text-amber-300 dark:border-amber-800/60;
+  }
+  .nl-badge-approved {
+    @apply bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/50 dark:text-emerald-300 dark:border-emerald-800/60;
+  }
+}
+
 @tailwind utilities;
 
 body {
@@ -8,21 +28,318 @@ body {
   font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
 }
 
-/* FAZ 7 — Kurumsal tasarım standartları (tüm ekranlarda ortak) */
-@layer components {
-  .nl-card {
-    @apply bg-white rounded-lg border border-slate-200 shadow-xs;
-  }
-  .nl-th {
-    @apply text-xs font-semibold uppercase tracking-wider text-slate-500;
-  }
-  .nl-badge {
-    @apply inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-md border;
-  }
-  .nl-badge-draft {
-    @apply bg-amber-50 text-amber-700 border-amber-200;
-  }
-  .nl-badge-approved {
-    @apply bg-emerald-50 text-emerald-700 border-emerald-200;
-  }
+/* ==========================================================================
+   AÇIK MOD (html:not(.dark)) — KESİN ZEMİN, METİN, INPUT VE ROZET KURALLARI
+   ========================================================================== */
+html:not(.dark),
+html:not(.dark) body,
+html:not(.dark) #root {
+  background-color: #f8fafc !important;
+  color: #0f172a !important;
+  color-scheme: light !important;
+}
+
+html:not(.dark) input,
+html:not(.dark) select,
+html:not(.dark) textarea {
+  background-color: #ffffff !important;
+  color: #0f172a !important;
+  border-color: #cbd5e1 !important;
+  color-scheme: light !important;
+  font-weight: 500;
+}
+
+html:not(.dark) input::placeholder,
+html:not(.dark) textarea::placeholder {
+  color: #64748b !important;
+}
+
+html:not(.dark) input:disabled,
+html:not(.dark) select:disabled,
+html:not(.dark) textarea:disabled {
+  background-color: #f1f5f9 !important;
+  color: #475569 !important;
+}
+
+/* Açık Mod Kırmızı Uyarı Kutuları (bg-red-50, bg-rose-50, ConflictAlert) */
+html:not(.dark) .nl-conflict-banner,
+html:not(.dark) .bg-red-50,
+html:not(.dark) .bg-red-50\/70,
+html:not(.dark) .bg-red-50\/60,
+html:not(.dark) .bg-rose-50 {
+  background-color: #fef2f2 !important;
+  border-color: #fecaca !important;
+}
+html:not(.dark) .nl-conflict-title {
+  color: #991b1b !important;
+  font-weight: 600 !important;
+}
+html:not(.dark) .nl-conflict-subtitle {
+  color: #7f1d1d !important;
+}
+
+/* Açık Mod Yeşil Rozet ve Kutular (bg-emerald-50, bg-emerald-100, bg-green-50, bg-green-100) */
+html:not(.dark) .bg-emerald-50,
+html:not(.dark) .bg-emerald-50\/60,
+html:not(.dark) .bg-emerald-100,
+html:not(.dark) .bg-green-50,
+html:not(.dark) .bg-green-100 {
+  background-color: #ecfdf5 !important;
+  color: #065f46 !important;
+  border-color: #6ee7b7 !important;
+}
+html:not(.dark) .text-emerald-950,
+html:not(.dark) .text-emerald-900,
+html:not(.dark) .text-emerald-800,
+html:not(.dark) .text-emerald-700,
+html:not(.dark) .text-emerald-600,
+html:not(.dark) .text-green-800,
+html:not(.dark) .text-green-700 {
+  color: #065f46 !important;
+}
+
+/* Açık Mod Mavi Butonlar (bg-blue-50, bg-blue-100) ve Aktif Kod Kutusu */
+html:not(.dark) .nl-blue-btn,
+html:not(.dark) button.bg-blue-50,
+html:not(.dark) button.bg-blue-50\/70,
+html:not(.dark) button.bg-blue-100,
+html:not(.dark) button.bg-indigo-50 {
+  background-color: #eff6ff !important;
+  color: #1d4ed8 !important;
+  border-color: #bfdbfe !important;
+  font-weight: 600 !important;
+}
+html:not(.dark) .nl-code-box {
+  background-color: #f1f5f9 !important;
+  color: #334155 !important;
+}
+
+/* ==========================================================================
+   KOYU MOD (html.dark) — KESİN ZEMİN, METİN, INPUT VE ROZET KURALLARI
+   ========================================================================== */
+html.dark,
+html.dark body,
+html.dark #root {
+  background-color: #090d16 !important;
+  color: #f8fafc !important;
+  color-scheme: dark !important;
+}
+
+html.dark .bg-white,
+html.dark .bg-white\/90,
+html.dark .bg-white\/80 {
+  background-color: #0f172a !important;
+}
+
+html.dark .bg-slate-50,
+html.dark .bg-slate-50\/70,
+html.dark .bg-slate-50\/80,
+html.dark .bg-slate-50\/60,
+html.dark .bg-slate-50\/50,
+html.dark .bg-slate-50\/40,
+html.dark .bg-gray-50 {
+  background-color: #0b1120 !important;
+}
+
+html.dark .bg-slate-100,
+html.dark .bg-gray-100 {
+  background-color: #1e293b !important;
+}
+
+html.dark .bg-slate-200 {
+  background-color: #334155 !important;
+}
+
+html.dark .hover\:bg-slate-50:hover,
+html.dark .hover\:bg-slate-50\/80:hover,
+html.dark .hover\:bg-slate-50\/70:hover,
+html.dark .hover\:bg-slate-100:hover,
+html.dark .hover\:bg-white:hover {
+  background-color: #1e293b !important;
+}
+
+html.dark .text-slate-950,
+html.dark .text-slate-900,
+html.dark .text-slate-800,
+html.dark .text-gray-900,
+html.dark h1,
+html.dark h2,
+html.dark h3 {
+  color: #f8fafc !important;
+}
+
+html.dark .text-slate-700,
+html.dark .text-slate-600,
+html.dark .text-gray-700 {
+  color: #cbd5e1 !important;
+}
+
+html.dark .text-slate-500,
+html.dark .text-slate-400 {
+  color: #94a3b8 !important;
+}
+
+html.dark .text-slate-300 {
+  color: #64748b !important;
+}
+
+html.dark .border-slate-100,
+html.dark .border-slate-200,
+html.dark .border-slate-300,
+html.dark .border-gray-200,
+html.dark .divide-slate-100 > :not([hidden]) ~ :not([hidden]),
+html.dark .divide-slate-200 > :not([hidden]) ~ :not([hidden]) {
+  border-color: #1e293b !important;
+}
+
+html.dark input,
+html.dark select,
+html.dark textarea {
+  background-color: #0f172a !important;
+  color: #f8fafc !important;
+  border-color: #334155 !important;
+  color-scheme: dark !important;
+}
+
+html.dark input::placeholder,
+html.dark textarea::placeholder {
+  color: #64748b !important;
+}
+
+html.dark input:disabled,
+html.dark select:disabled,
+html.dark textarea:disabled {
+  background-color: #111827 !important;
+  color: #64748b !important;
+}
+
+/* Birincil koyu butonlar ve seçili sekme/filtre hapları */
+html.dark button.bg-slate-900,
+html.dark a.bg-slate-900,
+html.dark span.bg-slate-900 {
+  background-color: #2563eb !important;
+  border-color: #3b82f6 !important;
+  color: #ffffff !important;
+}
+
+html.dark button.bg-slate-900:hover,
+html.dark a.bg-slate-900:hover {
+  background-color: #1d4ed8 !important;
+}
+
+/* Koyu Mod Kırmızı Uyarı Kutuları (bg-red-50, bg-rose-50, ConflictAlert) */
+html.dark .nl-conflict-banner,
+html.dark .bg-red-50,
+html.dark .bg-red-50\/70,
+html.dark .bg-red-50\/60,
+html.dark .bg-red-50\/40,
+html.dark .bg-red-50\/30,
+html.dark .bg-red-100,
+html.dark .bg-rose-50 {
+  background-color: #2a1215 !important;
+  border-color: #7f1d1d !important;
+  color: #fecaca !important;
+}
+html.dark .border-red-100,
+html.dark .border-red-200,
+html.dark .border-red-300 {
+  border-color: #7f1d1d !important;
+}
+html.dark .nl-conflict-title,
+html.dark .text-red-950,
+html.dark .text-red-900,
+html.dark .text-red-800,
+html.dark .text-red-700,
+html.dark .text-red-600 {
+  color: #fecaca !important;
+}
+html.dark .nl-conflict-subtitle {
+  color: #fca5a5 !important;
+}
+
+/* Koyu Mod Yeşil Rozet ve Kutular (bg-emerald-50, bg-emerald-100, bg-green-50, bg-green-100) */
+html.dark .bg-emerald-50,
+html.dark .bg-emerald-50\/60,
+html.dark .bg-emerald-100,
+html.dark .bg-green-50,
+html.dark .bg-green-100 {
+  background-color: #062e22 !important;
+  color: #a7f3d0 !important;
+  border-color: rgba(16, 185, 129, 0.45) !important;
+}
+html.dark .border-emerald-200,
+html.dark .border-emerald-300,
+html.dark .border-green-200,
+html.dark .border-green-300 {
+  border-color: rgba(16, 185, 129, 0.45) !important;
+}
+html.dark .text-emerald-950,
+html.dark .text-emerald-900,
+html.dark .text-emerald-800,
+html.dark .text-emerald-700,
+html.dark .text-emerald-600,
+html.dark .text-green-800,
+html.dark .text-green-700 {
+  color: #a7f3d0 !important;
+}
+
+/* Koyu Mod Mavi Butonlar (bg-blue-50, bg-blue-100) ve Aktif Kod Kutusu */
+html.dark .nl-blue-btn,
+html.dark .bg-blue-50,
+html.dark .bg-blue-50\/70,
+html.dark .bg-blue-50\/60,
+html.dark .bg-blue-100,
+html.dark .bg-indigo-50,
+html.dark .bg-indigo-100 {
+  background-color: #1e3a8a !important;
+  color: #dbeafe !important;
+  border-color: #3b82f6 !important;
+}
+html.dark .border-blue-200,
+html.dark .border-blue-300,
+html.dark .border-indigo-200,
+html.dark .border-indigo-300 {
+  border-color: #3b82f6 !important;
+}
+html.dark .text-blue-950,
+html.dark .text-blue-900,
+html.dark .text-blue-800,
+html.dark .text-blue-700,
+html.dark .text-indigo-950,
+html.dark .text-indigo-900,
+html.dark .text-indigo-800,
+html.dark .text-indigo-700 {
+  color: #dbeafe !important;
+}
+html.dark .nl-code-box {
+  background-color: #1e293b !important;
+  color: #e2e8f0 !important;
+  border-color: #334155 !important;
+}
+
+/* Koyu Mod Kehribar / Amber Uyarı Yüzeyleri */
+html.dark .bg-amber-50,
+html.dark .bg-amber-50\/90,
+html.dark .bg-amber-50\/60,
+html.dark .bg-amber-50\/50,
+html.dark .bg-amber-50\/40,
+html.dark .bg-amber-100 {
+  background-color: rgba(120, 53, 15, 0.35) !important;
+  border-color: rgba(217, 119, 6, 0.5) !important;
+}
+html.dark .text-amber-950,
+html.dark .text-amber-900,
+html.dark .text-amber-800,
+html.dark .text-amber-700 {
+  color: #fde68a !important;
+}
+
+html.dark .bg-purple-50,
+html.dark .bg-purple-100 {
+  background-color: rgba(88, 28, 135, 0.35) !important;
+}
+html.dark .text-purple-900,
+html.dark .text-purple-800,
+html.dark .text-purple-700 {
+  color: #e9d5ff !important;
 }

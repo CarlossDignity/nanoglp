@@ -31,10 +31,15 @@ api.interceptors.response.use(
   }
 );
 
-// Kimlik Doğrulama (FAZ 5 & 5.1 Auth & RBAC)
+// Kimlik Doğrulama (FAZ 5, 5.1 & FAZ 10 Auth & RBAC)
 export const loginApi = (username, password) =>
   api.post('/auth/login', { username, password });
 export const getMe = () => api.get('/auth/me');
+export const changePasswordApi = (currentPassword, newPassword) =>
+  api.post('/auth/change-password', {
+    current_password: currentPassword,
+    new_password: newPassword,
+  });
 
 // Kullanıcı ve Rol Yönetimi (SYSADMIN ve TFM)
 export const getUsers = () => api.get('/users');
@@ -75,6 +80,7 @@ export const getWeeklyWorkload = (targetDate) =>
 export const scheduleStudy = (data) => api.post('/planning/schedule-study', data);
 export const checkPersonnelWorkload = (data) => api.post('/planning/check-workload', data);
 export const getConflicts = (params) => api.get('/planning/conflicts', { params });
+export const recomputeConflicts = () => api.post('/planning/recompute-conflicts');
 export const resolveConflict = (id, data) => api.post(`/planning/conflicts/${id}/resolve`, data);
 export const applyConflictResolution = (conflictId, data) =>
   api.post(`/planning/conflicts/${conflictId}/apply-resolution`, data);
@@ -136,6 +142,7 @@ export const updateLongEquipment = (code, data) => api.put(`/long-equipment/${co
 
 // FAZ 8.1: Numune & Çalışma Takip
 export const getSamples = () => api.get('/samples');
+export const getNextSampleCode = () => api.get('/samples/next-code');
 export const getSample = (id) => api.get(`/samples/${id}`);
 export const createSample = (data) => api.post('/samples', data);
 export const updateSample = (id, data) => api.put(`/samples/${id}`, data);
@@ -150,6 +157,20 @@ export const importSamplesExcel = (file) => {
     headers: { 'Content-Type': 'multipart/form-data' },
     timeout: 120000,
   });
+};
+export const exportSamplesExcel = async () => {
+  const res = await api.get('/samples/export-excel', { responseType: 'blob', timeout: 120000 });
+  const blob = new Blob([res.data], {
+    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  });
+  const url = window.URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'NANOLAB_GLP_Calisma_Takip_Listesi.xlsx';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.URL.revokeObjectURL(url);
 };
 export const downloadSampleStudyPlan = async (sampleId, studyCode = '') => {
   const res = await api.get(`/samples/${sampleId}/study-plan-docx`, { responseType: 'blob', timeout: 180000 });

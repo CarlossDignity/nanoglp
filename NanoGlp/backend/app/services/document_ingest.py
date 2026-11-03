@@ -18,6 +18,7 @@ from app.models.study import Study
 from app.models.user import User
 from app.services import document_parser
 from app.services.document_parser import SUPPORTED_EXTENSIONS, DocumentParsingError, aggregate_dossier
+from app.utils.file_security import validate_and_sanitize_upload
 
 # (belge alanı, SampleRecord alanı, Study alanı, etiket)
 AUTOFILL_FIELDS: List[Tuple[str, str, str, str]] = [
@@ -63,9 +64,18 @@ def ingest_document(
     user: User,
 ) -> Tuple[Document, Optional[DocumentParsingError]]:
     """Dosyayı SHA-256 ile saklar, mevcut Vision OCR / PDF ayrıştırıcıyla okur ve Document kaydı oluşturur."""
-    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-    if ext not in SUPPORTED_EXTENSIONS:
-        raise ValueError(f"Desteklenmeyen dosya türü '.{ext}'. Desteklenen: PDF, XLSX, PNG, JPG, TXT, CSV.")
+    from fastapi import HTTPException
+    try:
+        filename, ext = validate_and_sanitize_upload(
+            raw_filename=filename,
+            content=content,
+            allowed_extensions=SUPPORTED_EXTENSIONS,
+            max_mb=settings.MAX_UPLOAD_MB,
+        )
+    except HTTPException as he:
+        if he.status_code == 413:
+            raise
+        raise ValueError(str(he.detail))
     sha256 = hashlib.sha256(content).hexdigest()
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
     stored_name = f"{datetime.utcnow():%Y%m%d%H%M%S}_{uuid.uuid4().hex[:8]}.{ext}"

@@ -22,6 +22,8 @@ import {
   Layers,
   CheckCheck,
   Edit3,
+  Search,
+  RefreshCw,
 } from 'lucide-react';
 import ConflictAlert from '../components/ConflictAlert';
 import GanttChart from '../components/GanttChart';
@@ -30,13 +32,15 @@ import {
   getTemplates,
   getPersonnel,
   getCalendar,
+  getStudySchedule,
   approveStudyPlan,
   applyConflictResolution,
+  recomputeConflicts,
   downloadStudyPlanDocx,
   extractError,
 } from '../services/api';
 import { useAuth } from '../state/AuthContext';
-import RestrictionManager from '../components/RestrictionManager';
+import { usePreferences } from '../state/PreferencesContext';
 import { fmtDateTime, fmtMinutes, fmtTime, todayISO, ROLE_SHORT } from '../utils/format';
 
 const Chip = ({ children, tone = 'slate' }) => (
@@ -159,6 +163,7 @@ function fmtWeekRangeTR(mondayIso) {
 
 export default function Planning({ onScheduled }) {
   const { isReadOnly, isExecutive, role } = useAuth();
+  const { t, tr, lang, formatStatusBadge } = usePreferences();
   const location = useLocation();
   const navigate = useNavigate();
 
@@ -169,7 +174,9 @@ export default function Planning({ onScheduled }) {
   const [templateCode, setTemplateCode] = useState('');
   const [showTemplate, setShowTemplate] = useState(false);
   const [isFormOpen, setIsFormOpen] = useState(false);
-  const [showRestrictions, setShowRestrictions] = useState(false);
+  const [isStudiesListOpen, setIsStudiesListOpen] = useState(true);
+  const [studySearchQuery, setStudySearchQuery] = useState('');
+  const [studyStatusFilter, setStudyStatusFilter] = useState('ALL');
   const [studyCode, setStudyCode] = useState(() => prefill?.study_code || '');
   const [startDate, setStartDate] = useState(() => prefill?.start_date || todayISO());
   const [activeSds, setActiveSds] = useState(() => prefill?.sd_resolution?.active_sds || []);
@@ -196,6 +203,7 @@ export default function Planning({ onScheduled }) {
   const [submitting, setSubmitting] = useState(false);
   const [approving, setApproving] = useState(false);
   const [downloadingDocx, setDownloadingDocx] = useState(false);
+  const [recomputingConflicts, setRecomputingConflicts] = useState(false);
   const [resolutionNotice, setResolutionNotice] = useState(null);
   const [error, setError] = useState(null);
   const [result, setResult] = useState(null);
@@ -239,6 +247,11 @@ export default function Planning({ onScheduled }) {
 
           if (matched) {
             setResult(matched);
+            getStudySchedule(matched.study_id)
+              .then((detailRes) => {
+                if (detailRes?.data) setResult(detailRes.data);
+              })
+              .catch(() => {});
             if (!prefill) {
               if (matched.study_code) setStudyCode(matched.study_code);
               if (matched.acclimatization_start_date) setStartDate(matched.acclimatization_start_date);
@@ -468,6 +481,30 @@ export default function Planning({ onScheduled }) {
     }
   };
 
+  const handleRecomputeAllConflicts = async () => {
+    if (isReadOnly) return;
+    setRecomputingConflicts(true);
+    setError(null);
+    setResolutionNotice(null);
+    try {
+      const res = await recomputeConflicts();
+      const d = res.data || {};
+      await loadCalendar(result?.study_id);
+      if (result?.study_id) {
+        const detail = await getStudySchedule(result.study_id).catch(() => null);
+        if (detail?.data) setResult(detail.data);
+      }
+      onScheduled?.();
+      setResolutionNotice(
+        `Tüm çakışmalar yeniden hesaplandı: ${d.confirmed_conflicts ?? 0} gerçek çakışma, ${d.missing_info_conflicts ?? 0} eksik bilgi kaynaklı olası çakışma (${d.total_completed_steps ?? 0} geçmiş adım TAMAMLANDI).`
+      );
+    } catch (err) {
+      setError(extractError(err, 'Çakışmalar yeniden hesaplanırken hata oluştu.'));
+    } finally {
+      setRecomputingConflicts(false);
+    }
+  };
+
   const syncFormWithStudy = (st) => {
     if (!st) return;
     if (st.study_code) setStudyCode(st.study_code);
@@ -488,7 +525,36 @@ export default function Planning({ onScheduled }) {
     setError(null);
     setResolutionNotice(null);
     syncFormWithStudy(st);
+    if (st?.study_id) {
+      getStudySchedule(st.study_id)
+        .then((detailRes) => {
+          if (detailRes?.data) setResult(detailRes.data);
+        })
+        .catch(() => {});
+    }
   };
+
+  const filteredStudiesList = useMemo(() => {
+    const q = (studySearchQuery || '').trim().toLowerCase();
+    return (calendarData.studies || []).filter((st) => {
+      if (studyStatusFilter === 'DRAFT' && st.study_status !== 'DRAFT') return false;
+      if (studyStatusFilter === 'APPROVED' && st.study_status === 'DRAFT') return false;
+      if (studyStatusFilter === 'CRITICAL' && !(st.critical_conflicts > 0)) return false;
+      if (!q) return true;
+      const hay = `${st.study_code || ''} ${st.title || ''} ${st.sponsor_name || ''} ${st.test_item_name || ''} ${st.study_director_name || ''}`.toLowerCase();
+      return hay.includes(q);
+    });
+  }, [calendarData.studies, studySearchQuery, studyStatusFilter]);
+
+  const studyFilterCounts = useMemo(() => {
+    const list = calendarData.studies || [];
+    return {
+      ALL: list.length,
+      DRAFT: list.filter((s) => s.study_status === 'DRAFT').length,
+      APPROVED: list.filter((s) => s.study_status !== 'DRAFT').length,
+      CRITICAL: list.filter((s) => s.critical_conflicts > 0).length,
+    };
+  }, [calendarData.studies]);
 
   const handleLoadIntoForm = (st) => {
     syncFormWithStudy(st);
@@ -562,167 +628,233 @@ export default function Planning({ onScheduled }) {
           </p>
         </div>
 
-        {/* Görünüm Sekmeleri */}
-        <div className="inline-flex rounded-lg border border-slate-300 bg-white p-1 shadow-xs">
-          <button
-            type="button"
-            onClick={() => setViewMode('study')}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold transition ${
-              viewMode === 'study'
-                ? 'bg-slate-900 text-white shadow-xs'
-                : 'text-slate-600 hover:bg-slate-100'
-            }`}
-          >
-            <Layers className="w-3.5 h-3.5" />
-            <span>Çalışma Detay & Gantt</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => setViewMode('weekly')}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold transition ${
-              viewMode === 'weekly'
-                ? 'bg-slate-900 text-white shadow-xs'
-                : 'text-slate-600 hover:bg-slate-100'
-            }`}
-          >
-            <CalendarIcon className="w-3.5 h-3.5" />
-            <span>Haftalık Master Takvim (Pzt–Paz)</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => setViewMode('daily')}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold transition ${
-              viewMode === 'daily'
-                ? 'bg-slate-900 text-white shadow-xs'
-                : 'text-slate-600 hover:bg-slate-100'
-            }`}
-          >
-            <Clock className="w-3.5 h-3.5" />
-            <span>Günlük Saatlik Akış (08:00–18:00)</span>
-          </button>
+        {/* Görünüm Sekmeleri ve Çakışmaları Yeniden Hesapla */}
+        <div className="flex flex-wrap items-center gap-2">
+          {!isReadOnly && (
+            <button
+              type="button"
+              disabled={recomputingConflicts}
+              onClick={handleRecomputeAllConflicts}
+              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-slate-900 bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 shadow-xs transition disabled:opacity-60"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${recomputingConflicts ? 'animate-spin' : ''}`} />
+              <span>{t('Çakışmaları Yeniden Hesapla', 'Recompute Conflicts')}</span>
+            </button>
+          )}
+          <div className="inline-flex rounded-lg border border-slate-300 bg-white p-1 shadow-xs">
+            <button
+              type="button"
+              onClick={() => setViewMode('study')}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold transition ${
+                viewMode === 'study'
+                  ? 'bg-slate-900 text-white shadow-xs'
+                  : 'text-slate-600 hover:bg-slate-100'
+              }`}
+            >
+              <Layers className="w-3.5 h-3.5" />
+              <span>Çalışma Detay & Gantt</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setViewMode('weekly')}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold transition ${
+                viewMode === 'weekly'
+                  ? 'bg-slate-900 text-white shadow-xs'
+                  : 'text-slate-600 hover:bg-slate-100'
+              }`}
+            >
+              <CalendarIcon className="w-3.5 h-3.5" />
+              <span>Haftalık Master Takvim (Pzt–Paz)</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setViewMode('daily')}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold transition ${
+                viewMode === 'daily'
+                  ? 'bg-slate-900 text-white shadow-xs'
+                  : 'text-slate-600 hover:bg-slate-100'
+              }`}
+            >
+              <Clock className="w-3.5 h-3.5" />
+              <span>Günlük Saatlik Akış (08:00–18:00)</span>
+            </button>
+          </div>
         </div>
       </div>
 
-      {/* FAZ 8.1: Test Kısıtlama ve Uygunluk Takvimi (Blackout) */}
-      <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
+      {/* FAZ 6.3 & 8.4: Kayıtlı & Taslak Çalışmalar Açılır/Kapanır (Collapsible) Seçim Paneli */}
+      <div className="bg-white border border-slate-200 rounded-lg shadow-xs overflow-hidden">
         <button
           type="button"
-          onClick={() => setShowRestrictions((v) => !v)}
-          className="w-full flex flex-wrap items-center justify-between gap-2 px-4 py-2.5 text-left hover:bg-slate-50"
+          onClick={() => setIsStudiesListOpen((v) => !v)}
+          className="w-full px-4 py-3 flex flex-wrap items-center justify-between gap-2 text-left hover:bg-slate-50 transition"
         >
-          <span className="text-xs font-semibold text-slate-800">Test Kısıtlama ve Uygunluk Takvimi</span>
-          <span className="text-[11px] text-slate-500">
-            {showRestrictions
-              ? 'Paneli kapat'
-              : 'Bir test belirli bir tarihe kadar yapılamıyorsa kaydedin — Gün 0 otomatik ötelenir'}
-          </span>
-        </button>
-        {showRestrictions && (
-          <div className="border-t border-slate-200">
-            <RestrictionManager embedded canEdit={!isReadOnly} />
-          </div>
-        )}
-      </div>
-
-      {/* FAZ 6.3: Kayıtlı & Taslak Çalışmalar Kalıcı Seçim Şeridi */}
-      <div className="bg-white border border-slate-200 rounded-lg p-4 shadow-xs space-y-3">
-        <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex items-center gap-2">
+            {isStudiesListOpen ? (
+              <ChevronDown className="w-4 h-4 text-slate-500" />
+            ) : (
+              <ChevronRight className="w-4 h-4 text-slate-500" />
+            )}
             <CalendarIcon className="w-4 h-4 text-slate-500" />
-            <h3 className="text-xs font-bold uppercase tracking-wider text-slate-700">
+            <h3 className="text-xs font-bold uppercase tracking-wider text-slate-800">
               Kayıtlı & Taslak Çalışmalar ({calendarData.studies.length})
             </h3>
+            {result?.study_code && (
+              <span className="font-mono text-[11px] font-semibold px-2 py-0.5 rounded bg-slate-100 text-slate-700 border border-slate-200">
+                Seçili: {result.study_code}
+              </span>
+            )}
           </div>
           <span className="text-[11px] text-slate-500">
-            Takvimini, çakışmalarını ve onay durumunu görüntülemek istediğiniz çalışmaya tıklayın
+            {isStudiesListOpen
+              ? 'Paneli daraltmak için tıklayın'
+              : 'Çalışma listesini, arama ve filtreleri açmak için tıklayın'}
           </span>
-        </div>
+        </button>
 
-        {loadingCalendar && calendarData.studies.length === 0 ? (
-          <p className="text-xs text-slate-400 py-2">Kayıtlı çalışmalar yükleniyor…</p>
-        ) : calendarData.studies.length === 0 ? (
-          <p className="text-xs text-slate-500 py-2">
-            Henüz planlanmış çalışma bulunmuyor. Aşağıdaki formdan yeni bir çalışma planlayabilirsiniz.
-          </p>
-        ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-            {calendarData.studies.map((st) => {
-              const isSelected = result?.study_id === st.study_id;
-              const isDraft = st.study_status === 'DRAFT';
-              return (
-                <div
-                  key={st.study_id}
-                  onClick={() => handleSelectStudyCard(st)}
-                  role="button"
-                  tabIndex={0}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' || e.key === ' ') handleSelectStudyCard(st);
-                  }}
-                  className={`cursor-pointer rounded-lg border p-3.5 transition text-left flex flex-col justify-between gap-2 ${
-                    isSelected
-                      ? 'border border-slate-200 bg-blue-50/50 shadow-xs'
-                      : 'border-slate-200 hover:border-blue-300 hover:bg-slate-50'
-                  }`}
-                >
-                  <div className="space-y-1.5">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="font-mono text-xs font-bold text-slate-900">{st.study_code}</span>
-                      <div className="flex items-center gap-1.5">
-                        {st.critical_conflicts > 0 ? (
-                          <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-red-600 text-white">
-                            {st.critical_conflicts} KRİTİK
+        {isStudiesListOpen && (
+          <div className="border-t border-slate-200 p-4 space-y-3">
+            {/* Hızlı Arama ve Durum Filtreleri */}
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="relative flex-1 min-w-[240px] max-w-md">
+                <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                <input
+                  type="text"
+                  value={studySearchQuery}
+                  onChange={(e) => setStudySearchQuery(e.target.value)}
+                  placeholder="GLP kodu, test, sponsor ara..."
+                  className="w-full border border-slate-300 rounded-md pl-8 pr-7 py-1.5 text-xs bg-white focus:outline-none focus:ring-2 focus:ring-slate-900"
+                />
+                {studySearchQuery && (
+                  <button
+                    type="button"
+                    onClick={() => setStudySearchQuery('')}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700"
+                    title="Aramayı temizle"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
+
+              <div className="flex flex-wrap items-center gap-1.5">
+                {[
+                  { key: 'ALL', label: 'Tümü' },
+                  { key: 'DRAFT', label: 'Taslak' },
+                  { key: 'APPROVED', label: 'Onaylı' },
+                  { key: 'CRITICAL', label: 'Kritik Çakışmalı' },
+                ].map((f) => {
+                  const active = studyStatusFilter === f.key;
+                  return (
+                    <button
+                      key={f.key}
+                      type="button"
+                      onClick={() => setStudyStatusFilter(f.key)}
+                      className={`px-2.5 py-1 rounded-md text-xs font-semibold border transition ${
+                        active
+                          ? 'bg-slate-900 text-white border-slate-900'
+                          : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
+                      }`}
+                    >
+                      {f.label} ({studyFilterCounts[f.key] ?? 0})
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {loadingCalendar && calendarData.studies.length === 0 ? (
+              <p className="text-xs text-slate-400 py-2">Kayıtlı çalışmalar yükleniyor…</p>
+            ) : filteredStudiesList.length === 0 ? (
+              <p className="text-xs text-slate-500 py-2">
+                Arama veya filtre kriterlerine uygun çalışma bulunamadı.
+              </p>
+            ) : (
+              <div className="max-h-[420px] overflow-y-auto pr-1 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                {filteredStudiesList.map((st) => {
+                  const isSelected = result?.study_id === st.study_id;
+                  const isDraft = st.study_status === 'DRAFT';
+                  return (
+                    <div
+                      key={st.study_id}
+                      onClick={() => handleSelectStudyCard(st)}
+                      role="button"
+                      tabIndex={0}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === ' ') handleSelectStudyCard(st);
+                      }}
+                      className={`cursor-pointer rounded-lg border p-3.5 transition text-left flex flex-col justify-between gap-2 ${
+                        isSelected
+                          ? 'border-blue-500 bg-blue-50/50 shadow-xs'
+                          : 'border-slate-200 hover:border-blue-300 hover:bg-slate-50'
+                      }`}
+                    >
+                      <div className="space-y-1.5 min-w-0">
+                        <div className="flex items-start justify-between gap-2">
+                          <span
+                            className="font-mono text-xs font-bold text-slate-900 truncate max-w-[165px]"
+                            title={st.study_code}
+                          >
+                            {st.study_code}
                           </span>
-                        ) : st.warning_conflicts > 0 ? (
-                          <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-amber-500 text-white">
-                            {st.warning_conflicts} UYARI
-                          </span>
-                        ) : (
-                          <span className="text-[10px] font-semibold px-2 py-0.5 rounded bg-emerald-100 text-emerald-800">
-                            Çakışmasız
-                          </span>
+                          <div className="shrink-0 flex flex-wrap items-center justify-end gap-1">
+                            {st.critical_conflicts > 0 ? (
+                              <span className="shrink-0 text-[10px] font-bold px-2 py-0.5 rounded bg-red-600 text-white">
+                                {st.critical_conflicts} KRİTİK
+                              </span>
+                            ) : st.warning_conflicts > 0 ? (
+                              <span className="shrink-0 text-[10px] font-bold px-2 py-0.5 rounded bg-amber-500 text-white">
+                                {st.warning_conflicts} UYARI
+                              </span>
+                            ) : (
+                              <span className="shrink-0 text-[10px] font-semibold px-2 py-0.5 rounded border border-[#6ee7b7] bg-[#ecfdf5] text-[#065f46] dark:bg-[#062e22] dark:text-[#a7f3d0] dark:border-emerald-500/45">
+                                Çakışmasız
+                              </span>
+                            )}
+                            <span
+                              className={`shrink-0 text-[10px] font-bold px-2 py-0.5 rounded border ${
+                                isDraft
+                                  ? 'bg-amber-50 text-amber-800 border-amber-300'
+                                  : 'bg-[#ecfdf5] text-[#065f46] border-[#6ee7b7] dark:bg-[#062e22] dark:text-[#a7f3d0] dark:border-emerald-500/45'
+                              }`}
+                            >
+                              {isDraft ? 'TASLAK' : 'ONAYLI'}
+                            </span>
+                          </div>
+                        </div>
+
+                        <p className="text-xs font-medium text-slate-700 truncate" title={st.title}>
+                          {st.title}
+                        </p>
+                        {st.sponsor_name && (
+                          <p className="text-[11px] text-slate-500 truncate">Sponsor: {st.sponsor_name}</p>
                         )}
-                        <span
-                          className={`text-[10px] font-bold px-2 py-0.5 rounded border ${
-                            isDraft
-                              ? 'bg-amber-50 text-amber-800 border-amber-300'
-                              : 'bg-emerald-50 text-emerald-800 border-emerald-300'
-                          }`}
-                        >
-                          {isDraft ? 'TASLAK' : 'ONAYLI'}
+                      </div>
+
+                      <div className="pt-2 border-t border-slate-200/70 flex items-center justify-between text-[11px] text-slate-600">
+                        <span>
+                          Gün 0: <strong>{st.acclimatization_start_date}</strong> · {st.total_new_steps} adım
                         </span>
+                        {isDraft && !isReadOnly && (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleLoadIntoForm(st);
+                            }}
+                            className="inline-flex items-center gap-1 text-blue-700 hover:underline font-medium shrink-0"
+                            title="Bu taslağın kodunu ve tarihini yukarıdaki forma aktar"
+                          >
+                            <Edit3 className="w-3 h-3" />
+                            <span>Forma Aktar</span>
+                          </button>
+                        )}
                       </div>
                     </div>
-
-                    <p className="text-xs font-medium text-slate-700 truncate" title={st.title}>
-                      {st.title}
-                    </p>
-                    {st.sponsor_name && (
-                      <p className="text-[11px] text-slate-500 truncate">Sponsor: {st.sponsor_name}</p>
-                    )}
-                  </div>
-
-                  <div className="pt-2 border-t border-slate-200/70 flex items-center justify-between text-[11px] text-slate-600">
-                    <span>
-                      Gün 0: <strong>{st.acclimatization_start_date}</strong> · {st.total_new_steps} adım
-                    </span>
-                    {isDraft && !isReadOnly && (
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleLoadIntoForm(st);
-                        }}
-                        className="inline-flex items-center gap-1 text-blue-700 hover:underline font-medium"
-                        title="Bu taslağın kodunu ve tarihini yukarıdaki forma aktar"
-                      >
-                        <Edit3 className="w-3 h-3" />
-                        <span>Forma Aktar</span>
-                      </button>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
+                  );
+                })}
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -1138,10 +1270,10 @@ export default function Planning({ onScheduled }) {
               }
             />
           ) : (
-            <div className="rounded-lg border border-emerald-300 bg-emerald-50 p-4 flex flex-wrap items-center justify-between gap-3">
+            <div className="rounded-lg border border-[#6ee7b7] bg-[#ecfdf5] dark:bg-[#062e22] dark:border-emerald-500/45 p-4 flex flex-wrap items-center justify-between gap-3">
               <div className="flex items-center gap-3">
-                <CheckCircle2 className="w-5 h-5 text-emerald-700" />
-                <p className="text-sm text-emerald-950">
+                <CheckCircle2 className="w-5 h-5 text-[#047857] dark:text-[#a7f3d0]" />
+                <p className="text-sm text-[#065f46] dark:text-[#ecfdf5]">
                   <strong>{result.study_code}</strong> çakışmasız planlandı ({result.template?.standard}).{' '}
                   {result.total_new_steps} adım takvime yerleştirildi
                   {result.study_director_name && (

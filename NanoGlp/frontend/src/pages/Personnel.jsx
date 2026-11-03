@@ -12,10 +12,12 @@ import {
 } from 'lucide-react';
 import { getDailyWorkload, getWeeklyWorkload, createPersonnel, extractError } from '../services/api';
 import { useAuth } from '../state/AuthContext';
+import { usePreferences } from '../state/PreferencesContext';
 import { fmtMinutes, fmtTime, todayISO, ROLE_LABEL } from '../utils/format';
 
 const emptyForm = { full_name: '', email: '', role: 'TECHNICIAN', qualifications: '', max_daily_hours: 9 };
 const DAY_SHORT_TR = ['Pzt', 'Sal', 'Çar', 'Per', 'Cum', 'Cmt', 'Paz'];
+const EXCLUDED_WORKLOAD_ROLES = new Set(['SYSADMIN', 'ADMIN', 'EXECUTIVE', 'SALES', 'TRM_KABUL', 'TRM_ACCEPTANCE']);
 
 function addDaysISO(isoDate, delta) {
   const [y, m, d] = isoDate.split('-').map(Number);
@@ -49,6 +51,7 @@ function fmtWeekRangeTR(mondayIso) {
 
 export default function Personnel({ onChanged }) {
   const { isReadOnly, isExecutive, role } = useAuth();
+  const { t, tr, lang } = usePreferences();
   const [date, setDate] = useState(todayISO());
   const [viewTab, setViewTab] = useState('daily'); // 'daily' | 'weekly'
   const [autoFocused, setAutoFocused] = useState(false);
@@ -129,7 +132,12 @@ export default function Personnel({ onChanged }) {
   };
 
   const limit = data?.limit_minutes ?? 540;
-  const people = data?.personnel ?? [];
+  const people = (data?.personnel ?? []).filter(
+    (p) => !EXCLUDED_WORKLOAD_ROLES.has(String(p.role || '').toUpperCase())
+  );
+  const weeklyPeople = (weeklyData?.personnel ?? []).filter(
+    (p) => !EXCLUDED_WORKLOAD_ROLES.has(String(p.role || '').toUpperCase())
+  );
   const activeDates = data?.active_dates ?? [];
   const activeWeeks = weeklyData?.active_weeks ?? data?.active_weeks ?? [];
   const overCount = people.filter((p) => p.exceeds_limit).length;
@@ -434,7 +442,7 @@ export default function Personnel({ onChanged }) {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {weeklyData.personnel.map((p) => (
+                {weeklyPeople.map((p) => (
                   <tr key={p.personnel_id} className="hover:bg-slate-50/70">
                     <td className="px-4 py-3">
                       <p className="font-semibold text-slate-900">{p.full_name}</p>
@@ -517,11 +525,13 @@ export default function Personnel({ onChanged }) {
                 onChange={(e) => setForm({ ...form, role: e.target.value })}
                 className="w-full border border-slate-300 rounded-md px-3 py-2 bg-white"
               >
-                {Object.entries(ROLE_LABEL).map(([v, l]) => (
-                  <option key={v} value={v}>
-                    {l}
-                  </option>
-                ))}
+                {Object.entries(ROLE_LABEL)
+                  .filter(([v]) => !EXCLUDED_WORKLOAD_ROLES.has(String(v).toUpperCase()))
+                  .map(([v, l]) => (
+                    <option key={v} value={v}>
+                      {l}
+                    </option>
+                  ))}
               </select>
             </label>
             <label className="block">

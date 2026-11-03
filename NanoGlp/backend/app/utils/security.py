@@ -39,6 +39,9 @@ MANAGEMENT_READ_ROLES = MANAGEMENT_WRITE_ROLES | {
     UserRole.EXECUTIVE,
     "QA",
     "EXECUTIVE",
+    "SALES",
+    "TRM_KABUL",
+    "TRM_ACCEPTANCE",
 }
 
 # Kullanıcı Yönetimi (/api/v1/users) erişim yetkisi olan roller

@@ -229,6 +229,7 @@ def create_user(
         email=user_in.email,
         full_name=user_in.full_name.strip(),
         role=user_in.role,
+        department=user_in.department,
         is_active=user_in.is_active,
         qualifications=user_in.qualifications or [],
         max_daily_hours=user_in.max_daily_hours,
@@ -266,7 +267,13 @@ def update_user(
     if not user:
         raise HTTPException(status_code=404, detail="Kullanıcı bulunamadı.")
 
+    is_protected_yigit = (user.username or "").strip().lower() == "yigit"
+    curr_role = current_user.role.value if hasattr(current_user.role, "value") else str(current_user.role)
+    is_self_sysadmin = user.id == current_user.id and curr_role.upper() == "SYSADMIN"
+
     if user_in.username is not None and user_in.username.lower() != user.username.lower():
+        if is_protected_yigit:
+            raise HTTPException(status_code=400, detail="Ana sistem yöneticisi ('yigit') kullanıcı adı değiştirilemez.")
         conflict = db.query(User).filter(func.lower(User.username) == user_in.username.lower(), User.id != user_id).first()
         if conflict:
             raise HTTPException(status_code=400, detail=f"'{user_in.username}' kullanıcı adı zaten kullanımda.")
@@ -282,11 +289,22 @@ def update_user(
 
     if user_in.full_name is not None:
         user.full_name = user_in.full_name.strip()
+    if user_in.department is not None:
+        user.department = user_in.department.strip() if user_in.department else None
     if user_in.role is not None:
+        new_role_str = (user_in.role.value if hasattr(user_in.role, "value") else str(user_in.role)).strip().upper()
+        if (is_protected_yigit or is_self_sysadmin) and new_role_str != "SYSADMIN":
+            raise HTTPException(
+                status_code=400,
+                detail="Ana sistem yöneticisi ('yigit') veya kendi oturumundaki aktif SYSADMIN kullanıcısının rolü SYSADMIN dışına düşürülemez.",
+            )
         user.role = user_in.role
     if user_in.is_active is not None:
-        if user.id == current_user.id and not user_in.is_active:
-            raise HTTPException(status_code=400, detail="Kendi aktif oturum hesabınızı pasife alamazsınız.")
+        if (is_protected_yigit or user.id == current_user.id) and not user_in.is_active:
+            raise HTTPException(
+                status_code=400,
+                detail="Ana sistem yöneticisi ('yigit') veya kendi aktif oturum hesabınızı pasife alamazsınız.",
+            )
         user.is_active = user_in.is_active
     if user_in.qualifications is not None:
         user.qualifications = user_in.qualifications
@@ -321,6 +339,8 @@ def delete_user(
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="Kullanıcı bulunamadı.")
+    if (user.username or "").strip().lower() == "yigit":
+        raise HTTPException(status_code=400, detail="Ana sistem yöneticisi ('yigit') silinemez.")
     if user.id == current_user.id:
         raise HTTPException(status_code=400, detail="Kendi aktif oturum hesabınızı silemezsiniz.")
 
@@ -333,6 +353,7 @@ def delete_user(
 
     deleted_username = user.username
     deleted_fullname = user.full_name
+    db.query(AuditLog).filter(AuditLog.user_id == user_id).update({AuditLog.user_id: None}, synchronize_session=False)
     user.assigned_steps = []
     db.delete(user)
     db.add(

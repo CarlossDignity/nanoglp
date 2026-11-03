@@ -17,12 +17,19 @@ from app.schemas.conflict import ConflictOut
 from app.seed import seed_default_equipment
 from app.services.document_parser import CANONICAL_STUDY_CODE_MAPPINGS
 from app.services.scheduling_engine import (
+    EXCLUDED_WORKLOAD_ROLES,
+    REFERENCE_DATE,
     apply_conflict_resolution,
     build_conflict_resolutions,
     check_personnel_workload,
     calculate_personnel_workload,
+    enrich_conflicts_with_category,
+    get_all_studies_calendar_details,
     get_study_schedule_detail,
+    is_eligible_lab_personnel,
+    recompute_all_conflicts,
     schedule_new_study,
+    sync_historical_completion_and_conflicts,
     MAX_DAILY_WORKLOAD_MINUTES,
 )
 from app.services.templates import (
@@ -185,6 +192,14 @@ def _resolve_or_create_draft_study(db: Session, payload: ScheduleStudyRequest) -
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
 
+    if payload.study_director_id is not None:
+        sd_check = db.query(User).filter(User.id == payload.study_director_id).first()
+        if sd_check and not is_eligible_lab_personnel(sd_check):
+            raise HTTPException(
+                status_code=400,
+                detail="SYSADMIN, EXECUTIVE veya SALES rolündeki kullanıcılara Çalışma Yöneticiliği (SD) veya görev atanamaz.",
+            )
+
     if payload.study_id is not None:
         study = db.query(Study).filter(Study.id == payload.study_id).first()
         if not study:
@@ -209,15 +224,16 @@ def _resolve_or_create_draft_study(db: Session, payload: ScheduleStudyRequest) -
     # Çalışma Yöneticisi: açıkça verilen ya da sistemdeki ilk aktif SD
     director_id = payload.study_director_id
     if director_id is None:
-        sd = db.query(User).filter(
-            User.role == UserRole.STUDY_DIRECTOR, User.is_active == True
-        ).order_by(User.id).first()
-        if not sd:
+        sds = [
+            u for u in db.query(User).filter(User.role == UserRole.STUDY_DIRECTOR, User.is_active == True).order_by(User.id).all()  # noqa: E712
+            if is_eligible_lab_personnel(u)
+        ]
+        if not sds:
             raise HTTPException(
                 status_code=400,
                 detail="Sistemde aktif bir Çalışma Yöneticisi (STUDY_DIRECTOR) yok. Önce SD tanımlayın."
             )
-        director_id = sd.id
+        director_id = sds[0].id
 
     study = Study(
         study_code=code,
@@ -382,20 +398,24 @@ def _collect_active_dates_and_weeks(db: Session) -> dict:
 
 
 @router.get("/workload", summary="Tüm Personelin Günlük İş Yükü (Salt-Okunur)")
+@router.get("/personnel-workload", summary="Tüm Personelin Günlük İş Yükü (Alias)", include_in_schema=False)
 def api_get_daily_workload(
     target_date: date = Query(default_factory=date.today, description="YYYY-MM-DD"),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_management_read),
 ):
     """Her personelin hedef gündeki toplam dakikasını ve görev olan aktif tarihleri döner. Conflict tablosuna yazmaz."""
-    users = db.query(User).filter(User.is_active == True).order_by(User.full_name).all()
+    users = [
+        u for u in db.query(User).filter(User.is_active == True).order_by(User.full_name).all()  # noqa: E712
+        if is_eligible_lab_personnel(u)
+    ]
     result = []
     for u in users:
         wl = calculate_personnel_workload(db, u.id, target_date)
         wl.update({
             "full_name": u.full_name,
             "email": u.email,
-            "role": u.role.value,
+            "role": u.role.value if hasattr(u.role, "value") else str(u.role),
             "qualifications": u.qualifications or [],
         })
         result.append(wl)
@@ -417,7 +437,10 @@ def api_get_weekly_workload(
     """Seçilen haftanın 7 günü (Pzt–Paz) boyunca tüm aktif personelin günlük dakikalarını ve görevlerini döner."""
     monday = target_date - timedelta(days=target_date.weekday())
     days = [monday + timedelta(days=i) for i in range(7)]
-    users = db.query(User).filter(User.is_active == True).order_by(User.full_name).all()
+    users = [
+        u for u in db.query(User).filter(User.is_active == True).order_by(User.full_name).all()  # noqa: E712
+        if is_eligible_lab_personnel(u)
+    ]
     personnel_matrix = []
     for u in users:
         daily = []
@@ -433,7 +456,7 @@ def api_get_weekly_workload(
         personnel_matrix.append({
             "personnel_id": u.id,
             "full_name": u.full_name,
-            "role": u.role.value,
+            "role": u.role.value if hasattr(u.role, "value") else str(u.role),
             "qualifications": u.qualifications or [],
             "weekly_total_minutes": sum(item["total_minutes"] for item in daily),
             "weekly_task_count": sum(item["task_count"] for item in daily),
@@ -467,15 +490,6 @@ def api_get_master_calendar(
         .order_by(Study.id.asc())
         .all()
     )
-    study_details = [get_study_schedule_detail(db, s) for s in studies]
-
-    conflict_step_ids = {
-        sid
-        for sd in study_details
-        for c in sd["conflicts"]
-        for sid in (c.get("step_ids") or ([c["step_id"]] if c.get("step_id") else []))
-    }
-
     steps = (
         db.query(StudyStep)
         .join(StudyStep.study)
@@ -487,12 +501,21 @@ def api_get_master_calendar(
         .order_by(StudyStep.planned_start.asc())
         .all()
     )
+    study_details = get_all_studies_calendar_details(db, studies, steps)
+
+    conflict_step_ids = {
+        sid
+        for sd in study_details
+        for c in sd["conflicts"]
+        for sid in (c.get("step_ids") or ([c["step_id"]] if c.get("step_id") else []))
+    }
+
     all_steps = []
     for st in steps:
         serialized = _serialize_step(st)
         serialized["equipment_id"] = st.equipment_id
         serialized["assignees"] = [
-            {"id": u.id, "full_name": u.full_name, "role": u.role.value}
+            {"id": u.id, "full_name": u.full_name, "role": u.role.value if hasattr(u.role, "value") else str(u.role)}
             for u in st.assignees
         ]
         serialized["has_conflict"] = st.id in conflict_step_ids
@@ -869,6 +892,7 @@ def api_get_steps(
     days: int = Query(14, ge=1, le=180),
     biological_only: bool = Query(False),
     include_all: bool = Query(False, description="True ise tarih filtresi uygulamadan tüm planlı adımları döner"),
+    active_only: bool = Query(False, description="True ise tamamlanmış (COMPLETED) ve geçmiş (< 2026-11-03) adımları gizler"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -881,7 +905,13 @@ def api_get_steps(
             Study.status != StudyStatus.CANCELLED,
         )
     )
-    if not include_all:
+    if active_only:
+        q = q.filter(
+            StudyStep.status != StepStatus.COMPLETED,
+            Study.status != StudyStatus.COMPLETED,
+            StudyStep.planned_start >= datetime.combine(REFERENCE_DATE, time.min),
+        )
+    elif not include_all:
         start = start or datetime.now()
         end = start + timedelta(days=days)
         q = q.filter(
@@ -952,10 +982,10 @@ def api_update_step_status(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    if current_user.role == UserRole.QA:
+    if current_user.role in (UserRole.QA, UserRole.EXECUTIVE) or getattr(current_user, "is_read_only", False):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Kalite Güvence (QA) rolü SADECE OKUMA yetkisine sahiptir; görev durumu güncelleyemez.",
+            detail="Kalite Güvence (QA) ve Üst Yönetim (EXECUTIVE) rolleri SADECE OKUMA yetkisine sahiptir; görev durumu güncelleyemez.",
         )
 
     step = (
@@ -1010,12 +1040,15 @@ def api_get_summary(
         Study.status.in_([StudyStatus.APPROVED, StudyStatus.IN_PROGRESS])
     ).count()
     draft_studies = db.query(Study).filter(Study.status == StudyStatus.DRAFT).count()
-    critical_conflicts = db.query(Conflict).filter(
-        Conflict.is_resolved == False, Conflict.severity == ConflictSeverity.CRITICAL
-    ).count()
-    open_conflicts = db.query(Conflict).filter(Conflict.is_resolved == False).count()
+    open_conflict_rows = db.query(Conflict).filter(Conflict.is_resolved == False).all()  # noqa: E712
+    enriched_open = enrich_conflicts_with_category(db, open_conflict_rows, include_resolutions=False)
+    confirmed_conflicts = sum(1 for item in enriched_open if item["conflict_category"] == "CONFIRMED_CONFLICT")
+    missing_info_conflicts = sum(1 for item in enriched_open if item["conflict_category"] == "MISSING_INFO")
+    critical_conflicts = sum(1 for c in open_conflict_rows if c.severity == ConflictSeverity.CRITICAL)
+    open_conflicts = len(open_conflict_rows)
     todays_tasks = db.query(StudyStep).filter(
         StudyStep.status != StepStatus.CANCELLED,
+        StudyStep.status != StepStatus.COMPLETED,
         StudyStep.planned_start <= day_end,
         StudyStep.planned_end >= day_start,
     ).count()
@@ -1028,15 +1061,58 @@ def api_get_summary(
         )
         .count()
     )
+    active_pending_tasks = (
+        db.query(StudyStep)
+        .join(StudyStep.study)
+        .filter(
+            StudyStep.status != StepStatus.CANCELLED,
+            StudyStep.status != StepStatus.COMPLETED,
+            Study.status != StudyStatus.CANCELLED,
+            Study.status != StudyStatus.COMPLETED,
+        )
+        .count()
+    )
+    completed_tasks = (
+        db.query(StudyStep)
+        .join(StudyStep.study)
+        .filter(
+            StudyStep.status == StepStatus.COMPLETED,
+            Study.status != StudyStatus.CANCELLED,
+        )
+        .count()
+    )
+
+    from app.models.sample import SampleRecord
+
+    ongoing_rows = db.query(SampleRecord).filter(SampleRecord.stored_status == "ONGOING").all()
+    ongoing_in_experiment = 0
+    ongoing_in_reporting = 0
+    ongoing_overdue_draft = 0
+    for sr in ongoing_rows:
+        end_ref = sr.experiment_end_date or sr.planned_end
+        if end_ref is not None and end_ref < REFERENCE_DATE:
+            ongoing_in_reporting += 1
+        else:
+            ongoing_in_experiment += 1
+        if (sr.glp_type or "GLP").upper() == "GLP" and sr.draft_report_date is not None and sr.draft_report_date < REFERENCE_DATE:
+            ongoing_overdue_draft += 1
 
     return {
         "date": today.isoformat(),
         "active_studies": active_studies,
         "draft_studies": draft_studies,
+        "ongoing_studies": len(ongoing_rows),
+        "ongoing_in_experiment": ongoing_in_experiment,
+        "ongoing_in_reporting": ongoing_in_reporting,
+        "ongoing_overdue_draft": ongoing_overdue_draft,
         "critical_conflicts": critical_conflicts,
+        "confirmed_conflicts": confirmed_conflicts,
+        "missing_info_conflicts": missing_info_conflicts,
         "open_conflicts": open_conflicts,
         "todays_tasks": todays_tasks,
         "total_planned_tasks": total_planned_tasks,
+        "active_pending_tasks": active_pending_tasks,
+        "completed_tasks": completed_tasks,
     }
 
 
@@ -1044,6 +1120,7 @@ def api_get_summary(
 def api_get_conflicts(
     study_id: Optional[int] = Query(None),
     unresolved_only: bool = Query(True),
+    category: Optional[str] = Query(None, description="CONFIRMED_CONFLICT veya MISSING_INFO"),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_management_read),
 ):
@@ -1051,8 +1128,25 @@ def api_get_conflicts(
     if study_id is not None:
         query = query.filter(Conflict.study_id == study_id)
     if unresolved_only:
-        query = query.filter(Conflict.is_resolved == False)
-    return query.order_by(Conflict.detected_at.desc()).all()
+        query = query.filter(Conflict.is_resolved == False)  # noqa: E712
+    rows = query.order_by(Conflict.detected_at.desc()).all()
+    enriched = enrich_conflicts_with_category(db, rows, include_resolutions=unresolved_only)
+    if category:
+        cat_norm = category.strip().upper()
+        enriched = [item for item in enriched if item.get("conflict_category") == cat_norm]
+    return enriched
+
+
+@router.post("/recompute-conflicts", summary="Tüm Çalışma Çakışmalarını Yeniden Hesapla (FAZ 9.2)")
+def api_recompute_all_conflicts(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_management_write),
+):
+    """
+    FAZ 9.2: Geçmiş/tamamlanmış görevleri kapatır, aktif çalışmaları yeniden denetler ve
+    açık çakışmaları `CONFIRMED_CONFLICT` (Gerçek Çakışma) ile `MISSING_INFO` (Eksik Bilgi) olarak sınıflandırır.
+    """
+    return recompute_all_conflicts(db=db, user=current_user)
 
 
 @router.post("/conflicts/{conflict_id}/resolve", summary="Çakışmayı Çözüldü Olarak İşaretle (GLP Gerekçeli)")

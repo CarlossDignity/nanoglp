@@ -7,6 +7,7 @@ import {
   updateLongEquipment,
   extractError,
 } from '../services/api';
+import { usePreferences } from '../state/PreferencesContext';
 
 const LEVEL = {
   OK: { label: 'Fiziksel kapasite içinde', dot: 'bg-emerald-500' },
@@ -21,6 +22,7 @@ const planningOf = (physical, pct) => Math.round(Number(physical || 0) * (1 + Nu
  * Sistem Planlama Kapasitesi = Fiziksel Kafes Sayısı × (1 + Esneklik Yüzdesi / 100)
  */
 export default function CapacitySettings({ canEdit = false }) {
+  const { t, tr, lang } = usePreferences();
   const [rooms, setRooms] = useState([]);
   const [availableAnimals, setAvailableAnimals] = useState({ 'Guinea pig': 152, Rabbit: 98, Mouse: 20, Rat: 19 });
   const [drafts, setDrafts] = useState({});

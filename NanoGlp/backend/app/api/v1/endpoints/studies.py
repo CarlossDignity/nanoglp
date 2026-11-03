@@ -13,7 +13,8 @@ from app.utils.security import require_management_read, require_management_write
 router = APIRouter(prefix="/studies", tags=["GLP Çalışmaları (Studies)"])
 
 
-@router.get("/", response_model=List[StudyOut])
+@router.get("", response_model=List[StudyOut])
+@router.get("/", response_model=List[StudyOut], include_in_schema=False)
 def get_all_studies(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_management_read),
@@ -21,7 +22,8 @@ def get_all_studies(
     return db.query(Study).all()
 
 
-@router.post("/", response_model=StudyOut, status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=StudyOut, status_code=status.HTTP_201_CREATED)
+@router.post("/", response_model=StudyOut, status_code=status.HTTP_201_CREATED, include_in_schema=False)
 def create_study(
     study_in: StudyCreate,
     db: Session = Depends(get_db),
@@ -33,6 +35,16 @@ def create_study(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"'{study_in.study_code}' kodlu GLP çalışması zaten mevcut.",
         )
+
+    if study_in.study_director_id is not None:
+        sd_user = db.query(User).filter(User.id == study_in.study_director_id).first()
+        if sd_user:
+            sd_role = (sd_user.role.value if hasattr(sd_user.role, "value") else str(sd_user.role or "")).strip().upper()
+            if sd_role in {"SYSADMIN", "ADMIN", "EXECUTIVE", "SALES", "TRM_KABUL", "TRM_ACCEPTANCE"} or (sd_user.username or "").lower() == "yigit":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="SYSADMIN, EXECUTIVE veya SALES rolündeki kullanıcılara Çalışma Yöneticiliği (SD) atanamaz.",
+                )
 
     study = Study(**study_in.model_dump())
     db.add(study)

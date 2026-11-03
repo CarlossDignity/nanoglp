@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import { getCalibration, updateCalibration, extractError } from '../services/api';
 import { useAuth } from '../state/AuthContext';
+import { usePreferences } from '../state/PreferencesContext';
 import RestrictionManager from '../components/RestrictionManager';
 import CapacitySettings from '../components/CapacitySettings';
 import { fmtDateTime, ROLE_SHORT, ROLE_LABEL } from '../utils/format';
@@ -20,7 +21,8 @@ import { fmtDateTime, ROLE_SHORT, ROLE_LABEL } from '../utils/format';
 const MIN_REASON = 3;
 
 export default function Settings() {
-  const { user, isReadOnly, canWriteManagement } = useAuth();
+  const { user, isReadOnly, isSysAdmin, canWriteManagement } = useAuth();
+  const { t, tr, lang } = usePreferences();
 
   const [steps, setSteps] = useState([]);
   const [equipment, setEquipment] = useState([]);
@@ -179,9 +181,9 @@ export default function Settings() {
           </span>
         </div>
       ) : (
-        <div className="flex items-start gap-3 rounded-lg border border-emerald-300 bg-emerald-50 px-4 py-3">
-          <CheckCircle2 className="w-5 h-5 text-emerald-700 shrink-0 mt-0.5" />
-          <p className="text-xs text-emerald-950 leading-relaxed">
+        <div className="flex items-start gap-3 rounded-lg border border-[#6ee7b7] bg-[#ecfdf5] dark:bg-[#062e22] dark:border-emerald-500/45 px-4 py-3">
+          <CheckCircle2 className="w-5 h-5 text-[#047857] dark:text-[#a7f3d0] shrink-0 mt-0.5" />
+          <p className="text-xs text-[#065f46] dark:text-[#ecfdf5] leading-relaxed">
             <strong>Canlı Veritabanı Bağlantısı Aktif (`/api/v1/planning/calibration`):</strong> Bu ekranda yaptığınız
             tüm süre, tolerans ve kapasite güncellemeleri kalıcı olarak veritabanına kaydedilir, elektronik imzanızla{' '}
             <code>AuditLog</code> tablosuna işlenir ve yeni çalışma planlamalarında doğrudan kullanılır.
@@ -449,8 +451,8 @@ export default function Settings() {
         </section>
       </div>
 
-      {/* 3) FAZ 8.1 — Test Kısıtlama ve Uygunluk Takvimi */}
-      <RestrictionManager canEdit={Boolean(canWriteManagement && !isReadOnly)} />
+      {/* 3) FAZ 8.1 & 8.4 — Test Kısıtlama ve Uygunluk Takvimi (Sadece SYSADMIN) */}
+      {isSysAdmin && <RestrictionManager canEdit={isSysAdmin} />}
 
       {/* 4) FAZ 8.1 — Hayvan Odaları Kafes Kapasitesi (Dr. Anoop esneklik %) ve 24-72s darboğaz cihazlar */}
       <CapacitySettings canEdit={Boolean(canWriteManagement && !isReadOnly)} />

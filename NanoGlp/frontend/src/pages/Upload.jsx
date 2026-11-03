@@ -35,6 +35,7 @@ import {
   extractError,
 } from '../services/api';
 import { useAuth } from '../state/AuthContext';
+import { usePreferences } from '../state/PreferencesContext';
 import { fmtDateTime } from '../utils/format';
 
 const ACCEPTED_EXT = ['pdf', 'xlsx', 'png', 'jpg', 'jpeg', 'txt', 'csv'];
@@ -103,6 +104,7 @@ function MergedFieldCard({ item, extraText }) {
 export default function Upload() {
   const navigate = useNavigate();
   const { isReadOnly, canWriteManagement } = useAuth();
+  const { t, tr, lang } = usePreferences();
   const canUpload = canWriteManagement && !isReadOnly;
 
   const [items, setItems] = useState([]);
@@ -131,8 +133,33 @@ export default function Upload() {
   const [openTech, setOpenTech] = useState({});
   // FAZ 7.1: Detaylı belge verileri ve kaynak PDF listesi varsayılan olarak kapalı akordeon içinde
   const [showDossierDetails, setShowDossierDetails] = useState(false);
+  // FAZ 9.3: Çapraz kontrol uyarıları varsayılan olarak gizli; yalnızca rozete tıklandığında veya yeniden analizde açılır
+  const [showCrossChecks, setShowCrossChecks] = useState(false);
   const dragDepth = useRef(0);
   const inputRef = useRef(null);
+
+  const resolveAutoSdId = (sdRes) => {
+    if (!sdRes) return '';
+    const activeSds = sdRes.active_sds || [];
+    const ezgi = activeSds.find(
+      (sd) => /ezgi/i.test(sd.full_name || '') || /ezgi/i.test(sd.username || '')
+    );
+    if (sdRes.requires_handover || /yi[gğ]it/i.test(sdRes.document_sd_name || '')) {
+      return String(ezgi?.id || sdRes.suggested_sd_id || activeSds[0]?.id || '');
+    }
+    return String(sdRes.suggested_sd_id || ezgi?.id || activeSds[0]?.id || '');
+  };
+
+  const dismissCrossChecks = () => {
+    try {
+      const raw = JSON.parse(localStorage.getItem('nanolab_dismissed_crosschecks') || '{}');
+      raw[activeDossierKey] = true;
+      localStorage.setItem('nanolab_dismissed_crosschecks', JSON.stringify(raw));
+    } catch {
+      /* ignore */
+    }
+    setShowCrossChecks(false);
+  };
 
   const patch = (key, p) => setItems((prev) => prev.map((it) => (it.key === key ? { ...it, ...p } : it)));
 
@@ -140,6 +167,7 @@ export default function Upload() {
     const resolvedKey = typeof targetKey === 'string' && targetKey ? targetKey : activeDossierKey;
     setLoadingHistory(true);
     setHistoryError(null);
+    setShowCrossChecks(false);
     try {
       const [pkgsRes, docsRes, dossierRes] = await Promise.all([
         getDossiers(),
@@ -173,8 +201,9 @@ export default function Upload() {
         if (curr && dos?.study_codes?.includes(curr)) return curr;
         return dos?.default_study_code || dos?.study_codes?.[0] || '';
       });
-      if (dos?.sd_resolution?.suggested_sd_id) {
-        setSelectedSdId(String(dos.sd_resolution.suggested_sd_id));
+      const autoSd = resolveAutoSdId(dos?.sd_resolution);
+      if (autoSd) {
+        setSelectedSdId(autoSd);
       }
     } catch (err) {
       setHistoryError(extractError(err, 'Belge ve çalışma dosyası verileri alınamadı.'));
@@ -201,8 +230,9 @@ export default function Upload() {
       }
       setDossier(res.data);
       setSelectedStudyCode((curr) => curr || res.data?.default_study_code || res.data?.study_codes?.[0] || '');
-      if (res.data?.sd_resolution?.suggested_sd_id && !selectedSdId) {
-        setSelectedSdId(String(res.data.sd_resolution.suggested_sd_id));
+      const autoSd = resolveAutoSdId(res.data?.sd_resolution);
+      if (autoSd && !selectedSdId) {
+        setSelectedSdId(autoSd);
       }
     } catch {
       // ignore
@@ -258,6 +288,14 @@ export default function Upload() {
           it.doc?.id === doc.id ? { ...it, status: updated.status, doc: updated, error: updated.error_message } : it
         )
       );
+      try {
+        const raw = JSON.parse(localStorage.getItem('nanolab_dismissed_crosschecks') || '{}');
+        delete raw[activeDossierKey];
+        localStorage.setItem('nanolab_dismissed_crosschecks', JSON.stringify(raw));
+      } catch {
+        /* ignore */
+      }
+      setShowCrossChecks(true);
       await refreshDossierOnly();
     } catch (err) {
       setHistoryError(extractError(err, `"${doc.original_filename}" yeniden analiz edilemedi.`));
@@ -326,9 +364,10 @@ export default function Upload() {
     const mappedGuideline = mappedEntry?.guideline;
     const mappedTemplate = mappedEntry?.suggested_template_code;
     const sdRes = dossier?.sd_resolution;
-    const resolvedSdId = selectedSdId
-      ? parseInt(selectedSdId, 10)
-      : sdRes?.suggested_sd_id || null;
+    const autoIdStr = selectedSdId || resolveAutoSdId(sdRes);
+    const resolvedSdId = autoIdStr ? parseInt(autoIdStr, 10) : sdRes?.suggested_sd_id || null;
+    const rawDocSd = val('study_director') || '';
+    const effectiveSdName = /yi[gğ]it/i.test(String(rawDocSd)) ? 'Ezgi Nur AKIN' : rawDocSd;
 
     navigate('/planning', {
       state: {
@@ -339,8 +378,8 @@ export default function Upload() {
           start_date: val('acclimatization_start_date') || '',
           template_code: mappedTemplate || dossier?.suggested_template_code || 'ISO_10993_23_IC',
           study_director_id: resolvedSdId,
-          former_study_director_name: sdRes?.requires_handover ? sdRes.document_sd_name : null,
-          sd_resolution: sdRes || null,
+          former_study_director_name: null,
+          sd_resolution: sdRes ? { ...sdRes, requires_handover: false } : null,
           test_type: mappedTest || val('test_type'),
           guideline: mappedGuideline || val('guideline'),
           sponsor_name: val('sponsor_name'),
@@ -362,7 +401,7 @@ export default function Upload() {
           animal_count: val('animal_count'),
           animal_birth_date: val('animal_birth_date'),
           requested_start_period: val('requested_start_period'),
-          study_director: val('study_director'),
+          study_director: effectiveSdName,
           source_document_ids: dossier?.document_ids || [],
           source_document_id: dossier?.document_ids?.[0] || null,
           source_filename: `${dossier?.total_documents || 0} Belgelik Birleştirilmiş Çalışma Dosyası (${activeDossierKey})`,
@@ -381,22 +420,22 @@ export default function Upload() {
 
   const docCount = dossier?.total_documents ?? items.length;
   const studyCodeCount = dossier?.study_codes?.length ?? 0;
-  const glpWarningCount =
-    (dossier?.sd_resolution?.requires_handover ? 1 : 0) +
-    (dossier?.cross_checks?.filter((c) => c.status !== 'MATCH').length || 0);
+  const crossCheckIssues = (dossier?.cross_checks || []).filter((c) => c.status !== 'MATCH');
+  const glpWarningCount = crossCheckIssues.length;
 
-  // Sıradaki boş GLP çalışma kodunu hesapla (örn. GLP2026-024/026/031/034 -> GLP2026-035)
+  // Sıradaki boş GLP çalışma kodunu hesapla (gerçek seri GLP2026-001..082 -> GLP2026-083)
   const nextSuggestedGlpCode = (() => {
+    if (dossier?.next_glp_code) return dossier.next_glp_code;
     const codes = [
       ...(dossier?.study_codes || []),
-      ...dossierPackages.flatMap((p) => (p.dossier_label || '').match(/\d{3}/g) || []),
+      ...dossierPackages.flatMap((p) => p.study_codes || []),
     ];
-    let maxSeq = 34;
+    let maxSeq = 82;
     codes.forEach((raw) => {
-      const m = String(raw).match(/(?:GLP\d{4}-)?(\d{2,4})$/i);
+      const m = String(raw).match(/^GLP\d{4}-(\d{2,3})$/i);
       if (m) {
         const n = parseInt(m[1], 10);
-        if (!Number.isNaN(n) && n < 900 && n > maxSeq) maxSeq = n;
+        if (!Number.isNaN(n) && n <= 150 && n > maxSeq) maxSeq = n;
       }
     });
     return `GLP2026-${String(maxSeq + 1).padStart(3, '0')}`;
@@ -524,7 +563,7 @@ export default function Upload() {
               <button
                 type="button"
                 onClick={() => setShowNewDossierForm((v) => !v)}
-                className="inline-flex items-center gap-1.5 text-xs font-semibold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 rounded-lg px-3 py-2 transition"
+                className="nl-blue-btn inline-flex items-center gap-1.5 text-xs font-semibold text-[#1d4ed8] bg-[#eff6ff] hover:bg-blue-100 border border-[#bfdbfe] dark:bg-[#1e3a8a] dark:text-[#dbeafe] dark:border-[#3b82f6] rounded-lg px-3 py-2 transition"
               >
                 <Plus className="w-3.5 h-3.5" />
                 <span>Yeni Müşteri Klasörü Aç</span>
@@ -601,17 +640,24 @@ export default function Upload() {
                   {studyCodeCount} Çalışma Kodu Tespit Edildi
                 </span>
                 <span className="text-slate-300">•</span>
-                <span
-                  className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full font-semibold border ${
-                    glpWarningCount > 0
-                      ? 'bg-amber-50 border-amber-300 text-amber-800'
-                      : 'bg-emerald-50 border-emerald-300 text-emerald-800'
-                  }`}
-                >
-                  {glpWarningCount > 0
-                    ? `${glpWarningCount} GLP Denetim Uyarısı`
-                    : '0 GLP Denetim Uyarısı'}
-                </span>
+                {glpWarningCount > 0 ? (
+                  <button
+                    type="button"
+                    onClick={() => setShowCrossChecks((v) => !v)}
+                    className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full font-semibold border bg-slate-100 hover:bg-slate-200 border-slate-300 text-slate-700 transition cursor-pointer"
+                    title={t('Çapraz kontrol detaylarını göster / gizle', 'Show / hide cross-check details')}
+                  >
+                    <span>
+                      {showCrossChecks
+                        ? `${t('Çapraz Kontrol Uyarılarını Gizle', 'Hide Cross-Check Warnings')} (${glpWarningCount})`
+                        : `${t('Çapraz Kontrol Uyarılarını Göster', 'Show Cross-Check Warnings')} (${glpWarningCount})`}
+                    </span>
+                  </button>
+                ) : (
+                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full font-semibold border bg-emerald-50 border-emerald-300 text-emerald-800">
+                    0 GLP Denetim Uyarısı
+                  </span>
+                )}
               </div>
             </div>
 
@@ -646,10 +692,10 @@ export default function Upload() {
 
                 {/* Çalışma Kodunu Düzenle / Otomatik Sıradaki Kodu Ata */}
                 {canUpload && (
-                  <div className="flex flex-wrap items-center gap-2 bg-white/90 border border-blue-200 rounded-lg px-2.5 py-1.5 shadow-xs">
+                  <div className="nl-code-box flex flex-wrap items-center gap-2 bg-[#f1f5f9] text-[#334155] dark:bg-[#1e293b] dark:text-[#e2e8f0] border border-slate-300 dark:border-slate-700 rounded-lg px-2.5 py-1.5 shadow-xs">
                     <label
                       htmlFor="custom-study-code-input"
-                      className="text-[11px] font-semibold text-slate-600 whitespace-nowrap"
+                      className="text-[11px] font-semibold text-[#334155] dark:text-[#e2e8f0] whitespace-nowrap"
                     >
                       Aktif Kod:
                     </label>
@@ -659,13 +705,13 @@ export default function Upload() {
                       value={selectedStudyCode}
                       onChange={(e) => setSelectedStudyCode(e.target.value.toUpperCase())}
                       placeholder="GLP2026-XXX"
-                      className="w-32 border border-slate-300 rounded px-2 py-1 text-xs font-mono font-bold text-blue-900 bg-white focus:outline-none focus:ring-2 focus:ring-blue-600"
+                      className="w-32 border border-slate-300 dark:border-slate-600 rounded px-2 py-1 text-xs font-mono font-bold text-[#0f172a] dark:text-[#f8fafc] bg-white dark:bg-[#0f172a] focus:outline-none focus:ring-2 focus:ring-blue-600"
                     />
                     <button
                       type="button"
                       onClick={() => setSelectedStudyCode(nextSuggestedGlpCode)}
                       title={`Sıradaki boş GLP çalışma kodunu (${nextSuggestedGlpCode}) otomatik ata`}
-                      className="inline-flex items-center gap-1 text-[11px] font-semibold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 rounded px-2.5 py-1 transition whitespace-nowrap"
+                      className="nl-blue-btn inline-flex items-center gap-1 text-[11px] font-semibold text-[#1d4ed8] bg-[#eff6ff] hover:bg-blue-100 border border-[#bfdbfe] dark:bg-[#1e3a8a] dark:text-[#dbeafe] dark:border-[#3b82f6] rounded px-2.5 py-1 transition whitespace-nowrap"
                     >
                       <Sparkles className="w-3 h-3" />
                       <span>Otomatik Sıradaki Kodu Ata ({nextSuggestedGlpCode})</span>
@@ -707,53 +753,8 @@ export default function Upload() {
               )}
             </div>
 
-            {/* 2) HER ZAMAN AÇIK: Çalışma Direktörü (SD) Eşleştirme ve Devir Kutusu */}
-            {dossier.sd_resolution && (
-              <div
-                className={`rounded-lg border px-4 py-3.5 text-xs flex flex-wrap items-center justify-between gap-4 ${
-                  dossier.sd_resolution.requires_handover
-                    ? 'border-amber-400 bg-amber-50 text-amber-950'
-                    : 'border-emerald-300 bg-emerald-50 text-emerald-900'
-                }`}
-              >
-                <div className="flex items-start gap-3 flex-1 min-w-[260px]">
-                  <UserCheck
-                    className={`w-5 h-5 shrink-0 mt-0.5 ${
-                      dossier.sd_resolution.requires_handover ? 'text-amber-700' : 'text-emerald-700'
-                    }`}
-                  />
-                  <div className="space-y-1">
-                    <p className="font-bold">
-                      Çalışma Direktörü (SD) Eşleştirme ve Devir Kontrolü
-                    </p>
-                    <p>{dossier.sd_resolution.message}</p>
-                  </div>
-                </div>
-
-                {dossier.sd_resolution.active_sds?.length > 0 && (
-                  <div className="flex items-center gap-2">
-                    <label htmlFor="dossier-sd-select" className="font-semibold whitespace-nowrap">
-                      Atanacak Aktif SD:
-                    </label>
-                    <select
-                      id="dossier-sd-select"
-                      value={selectedSdId || dossier.sd_resolution.suggested_sd_id || ''}
-                      onChange={(e) => setSelectedSdId(e.target.value)}
-                      className="border border-amber-400 bg-white text-slate-900 font-semibold rounded-md px-3 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-blue-600"
-                    >
-                      {dossier.sd_resolution.active_sds.map((sd) => (
-                        <option key={sd.id} value={sd.id}>
-                          {sd.full_name} ({sd.username})
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* 3) HER ZAMAN AÇIK: GLP Çapraz Kontroller (Hayvan Menşei <-> FM.083 & TIIS <-> Sözleşme) */}
-            {dossier.cross_checks?.length > 0 && (
+            {/* 2) VARSAYILAN GİZLİ / KAPATILABİLİR: GLP Çapraz Kontroller (Hayvan Menşei <-> FM.083) */}
+            {showCrossChecks && dossier.cross_checks?.length > 0 && (
               <div className="space-y-2">
                 {dossier.cross_checks.map((cc) => {
                   const isMatch = cc.status === 'MATCH';
@@ -761,7 +762,7 @@ export default function Upload() {
                   return (
                     <div
                       key={cc.check}
-                      className={`rounded-lg border px-4 py-3 text-xs flex items-start gap-3 ${
+                      className={`rounded-lg border px-4 py-3 text-xs flex flex-wrap items-start justify-between gap-3 ${
                         isMatch
                           ? 'border-emerald-300 bg-emerald-50 text-emerald-900'
                           : isMismatch
@@ -769,17 +770,26 @@ export default function Upload() {
                           : 'border-amber-300 bg-amber-50 text-amber-900'
                       }`}
                     >
-                      {isMatch ? (
-                        <ShieldCheck className="w-5 h-5 text-emerald-700 shrink-0 mt-0.5" />
-                      ) : (
-                        <AlertTriangle
-                          className={`w-5 h-5 shrink-0 mt-0.5 ${isMismatch ? 'text-red-700' : 'text-amber-700'}`}
-                        />
-                      )}
-                      <div className="space-y-1 flex-1">
-                        <p className="font-bold">{cc.title}</p>
-                        <p>{cc.message}</p>
+                      <div className="flex items-start gap-3 flex-1 min-w-[260px]">
+                        {isMatch ? (
+                          <ShieldCheck className="w-5 h-5 text-emerald-700 shrink-0 mt-0.5" />
+                        ) : (
+                          <AlertTriangle
+                            className={`w-5 h-5 shrink-0 mt-0.5 ${isMismatch ? 'text-red-700' : 'text-amber-700'}`}
+                          />
+                        )}
+                        <div className="space-y-1 flex-1">
+                          <p className="font-bold">{cc.title}</p>
+                          <p>{cc.message}</p>
+                        </div>
                       </div>
+                      <button
+                        type="button"
+                        onClick={dismissCrossChecks}
+                        className="inline-flex items-center gap-1 rounded border border-slate-300 bg-white hover:bg-slate-50 px-2.5 py-1 text-[11px] font-semibold text-slate-700 shrink-0"
+                      >
+                        {t('✓ Kontrol Edildi / Kapat', '✓ Reviewed / Dismiss')}
+                      </button>
                     </div>
                   );
                 })}
@@ -950,7 +960,7 @@ export default function Upload() {
                                 disabled={isReparsing}
                                 onClick={() => handleReparseSingle(doc)}
                                 title="Bu PDF'i PyMuPDF + GPT-4o Vision ile yeniden analiz et"
-                                className="inline-flex items-center gap-1 text-xs font-medium text-blue-700 hover:text-blue-900 border border-blue-200 bg-blue-50/70 hover:bg-blue-100 rounded px-2.5 py-1 disabled:opacity-40 transition"
+                                className="nl-blue-btn inline-flex items-center gap-1 text-xs font-semibold text-[#1d4ed8] hover:text-blue-900 border border-[#bfdbfe] bg-[#eff6ff] hover:bg-blue-100 dark:bg-[#1e3a8a] dark:text-[#dbeafe] dark:border-[#3b82f6] rounded px-2.5 py-1 disabled:opacity-40 transition"
                               >
                                 <ScanEye className="w-3.5 h-3.5" />
                                 <span>Yeniden Analiz Et</span>

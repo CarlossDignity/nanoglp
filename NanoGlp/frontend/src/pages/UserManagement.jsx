@@ -28,6 +28,7 @@ import {
   extractError,
 } from '../services/api';
 import { useAuth } from '../state/AuthContext';
+import { usePreferences } from '../state/PreferencesContext';
 import { ROLE_LABEL, ROLE_SHORT } from '../utils/format';
 
 export const MENU_DEFINITIONS = [
@@ -91,6 +92,7 @@ const ROLE_CODE_REGEX = /^[A-Z0-9_]{2,40}$/;
 
 export default function UserManagement({ onChanged }) {
   const { user: currentUser, isSysAdmin, refreshUser } = useAuth();
+  const { t, tr, lang } = usePreferences();
   const [activeTab, setActiveTab] = useState('users'); // 'users' | 'roles'
   const [users, setUsers] = useState([]);
   const [roles, setRoles] = useState([]);

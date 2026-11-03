@@ -59,6 +59,7 @@ class User(Base):
     hashed_password = Column(String(255), nullable=True)
     full_name = Column(String(255), nullable=False)
     role = Column(FlexibleRoleType(), default=UserRole.ANALYST, nullable=False)
+    department = Column(String(120), nullable=True)
     is_active = Column(Boolean, default=True)
 
     # Personel GLP yetkinlik sertifikaları ve yapabileceği test türleri listesi

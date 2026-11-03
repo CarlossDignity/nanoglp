@@ -15,16 +15,36 @@ export const MANAGEMENT_VIEW_ROLES = [...MANAGEMENT_WRITE_ROLES, 'QA', 'EXECUTIV
 export const DEFAULT_ALLOWED_MENUS_BY_ROLE = {
   EXECUTIVE: ['dashboard', 'samples', 'planning', 'personnel', 'studies', 'conflicts'],
   SALES: ['samples'],
-  TRM_KABUL: ['samples'],
+  TRM_KABUL: ['samples', 'upload'],
+  TRM_ACCEPTANCE: ['samples', 'upload'],
   SYSADMIN: ['dashboard', 'samples', 'upload', 'planning', 'personnel', 'studies', 'conflicts', 'my_tasks', 'users', 'settings'],
   ADMIN: ['dashboard', 'samples', 'upload', 'planning', 'personnel', 'studies', 'conflicts', 'my_tasks', 'users', 'settings'],
   TFM: ['dashboard', 'samples', 'upload', 'planning', 'personnel', 'studies', 'conflicts', 'my_tasks', 'users', 'settings'],
-  STUDY_DIRECTOR: ['dashboard', 'samples', 'upload', 'planning', 'personnel', 'studies', 'conflicts', 'my_tasks', 'settings'],
-  PLANNING_COORDINATOR: ['dashboard', 'samples', 'upload', 'planning', 'personnel', 'studies', 'conflicts', 'my_tasks', 'settings'],
-  QA: ['dashboard', 'samples', 'upload', 'planning', 'personnel', 'studies', 'conflicts', 'settings'],
+  STUDY_DIRECTOR: ['samples', 'upload', 'planning', 'personnel', 'studies', 'conflicts', 'my_tasks', 'settings'],
+  PLANNING_COORDINATOR: ['samples', 'upload', 'planning', 'personnel', 'studies', 'conflicts', 'my_tasks', 'settings'],
+  QA: ['samples', 'upload', 'planning', 'personnel', 'studies', 'conflicts', 'settings'],
   TECHNICIAN: ['my_tasks'],
+  TECH: ['my_tasks'],
+  VET: ['my_tasks', 'studies'],
   ANALYST: ['my_tasks'],
 };
+
+export function getDefaultRouteForRole(roleCode, allowedMenus = []) {
+  const r = String(roleCode || '').toUpperCase();
+  if (['SYSADMIN', 'ADMIN', 'EXECUTIVE', 'TFM'].includes(r) && (!Array.isArray(allowedMenus) || allowedMenus.includes('dashboard'))) {
+    return '/';
+  }
+  if (['TECHNICIAN', 'TECH', 'VET', 'ANALYST'].includes(r)) {
+    return '/my-tasks';
+  }
+  if (['STUDY_DIRECTOR', 'PLANNING_COORDINATOR', 'SALES', 'TRM_KABUL', 'TRM_ACCEPTANCE', 'QA'].includes(r)) {
+    return '/samples';
+  }
+  if (Array.isArray(allowedMenus) && allowedMenus.includes('dashboard')) return '/';
+  if (Array.isArray(allowedMenus) && allowedMenus.includes('samples')) return '/samples';
+  if (Array.isArray(allowedMenus) && allowedMenus.includes('my_tasks')) return '/my-tasks';
+  return '/samples';
+}
 
 function readStoredUser() {
   try {
@@ -113,7 +133,8 @@ export function AuthProvider({ children }) {
         : role === 'QA' || role === 'EXECUTIVE';
     const isExecutive = role === 'EXECUTIVE';
     const isSysAdmin = role === 'SYSADMIN' || role === 'ADMIN';
-    const isTechnician = role === 'TECHNICIAN' || (allowedMenus.length === 1 && allowedMenus[0] === 'my_tasks');
+    const isTechnician = ['TECHNICIAN', 'TECH', 'VET', 'ANALYST'].includes(role) || (allowedMenus.length === 1 && allowedMenus[0] === 'my_tasks');
+    const defaultHomeRoute = getDefaultRouteForRole(role, allowedMenus);
     const hasManagementMenu = allowedMenus.some((m) =>
       ['dashboard', 'upload', 'planning', 'personnel', 'studies', 'conflicts', 'settings'].includes(m)
     );
@@ -127,6 +148,7 @@ export function AuthProvider({ children }) {
       role,
       roleLabel: user?.role_label || role,
       allowedMenus,
+      defaultHomeRoute,
       isAuthenticated,
       authChecking,
       isReadOnly,
