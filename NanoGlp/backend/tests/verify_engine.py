@@ -1255,19 +1255,35 @@ def main():
             check(rec92.status_code == 200 and rec92.json().get("status") == "success",
                   "POST /api/v1/planning/recompute-conflicts başarıyla çalıştı")
             j92 = rec92.json()
-            check(j92["reference_date"] == "2026-11-03" and j92["completed_studies_count"] >= 41 and j92["total_completed_steps"] >= 163,
-                  f"Referans tarih 2026-11-03 baz alınarak biten çalışmalar ({j92['completed_studies_count']}) ve geçmiş adımlar ({j92['total_completed_steps']}) COMPLETED yapıldı")
-            # GLP2026-005 içindeki geçmiş adımlar (11.02.2026 ve 12.05.2026) COMPLETED olmalı; GLP2026-030/062'de < 03.11.2026 COMPLETED ve >= 03.11.2026 PENDING olmalı
+            check(j92["reference_date"] == "2026-11-03" and j92["completed_studies_count"] >= 41
+                  and j92["total_completed_steps"] >= 6 and j92.get("historical_excluded_steps", 0) >= 151,
+                  f"Referans tarih 2026-11-03 baz alınarak biten çalışmalar ({j92['completed_studies_count']}) kapatıldı ve devam eden çalışmaların geçmiş adımları ({j92.get('historical_excluded_steps', 0)}) COMPLETED yapılmadan aktif çakışmadan hariç tutuldu")
+            # Açıkça COMPLETED (Biten) olan çalışmaların adımları COMPLETED (actual_start/end=None) olmalı;
+            # GLP2026-005 ve GLP2026-030 (Devam Eden) içindeki < 03.11.2026 geçmiş adımlar otomatik COMPLETED yapılmadan
+            # PENDING kalmalı ve aktif çakışmadan hariç tutulmalı
+            steps_comp = (
+                db.query(StudyStep)
+                .join(StudyStep.study)
+                .filter(Study.status == StudyStatus.COMPLETED)
+                .order_by(StudyStep.id)
+                .all()
+            )
             st005 = db.query(Study).filter(Study.study_code == "GLP2026-005").first()
             steps005 = db.query(StudyStep).filter(StudyStep.study_id == st005.id).order_by(StudyStep.step_order).all()
             st030 = db.query(Study).filter(Study.study_code == "GLP2026-030").first()
             steps030 = db.query(StudyStep).filter(StudyStep.study_id == st030.id).order_by(StudyStep.step_order).all()
             past030 = [s for s in steps030 if s.planned_start.date() < date(2026, 11, 3)]
             fut030 = [s for s in steps030 if s.planned_start.date() >= date(2026, 11, 3)]
-            check(all(s.status == StepStatus.COMPLETED for s in steps005)
-                  and len(past030) >= 2 and all(s.status == StepStatus.COMPLETED for s in past030)
+            past030_confs = db.query(Conflict).filter(
+                Conflict.study_id == st030.id,
+                Conflict.step_id.in_([s.id for s in past030]),
+                Conflict.is_resolved == False,  # noqa: E712
+            ).count()
+            check(len(steps_comp) >= 1 and all(s.status == StepStatus.COMPLETED and s.actual_start is None for s in steps_comp)
+                  and all(s.status == StepStatus.PENDING for s in steps005)
+                  and len(past030) >= 2 and all(s.status == StepStatus.PENDING for s in past030) and past030_confs == 0
                   and len(fut030) >= 2 and all(s.status != StepStatus.COMPLETED for s in fut030),
-                  "GLP2026-005 (11.02.2026 & 12.05.2026) ve GLP2026-030: 03.11.2026 öncesi geçmiş adımlar COMPLETED, sonrası PENDING olarak korundu")
+                  "Biten çalışmaların adımları COMPLETED (uydurma saat yok); GLP2026-005 ve GLP2026-030 (Devam Eden): < 03.11.2026 geçmiş adımlar COMPLETED yapılmadan aktif çakışmadan hariç tutuldu, >= 03.11.2026 gelecekteki adımlar PENDING korundu")
             # Aktif görevler filtresi (active_only=true) yalnızca tamamlanmamış ve >= 2026-11-03 adımları döndürmeli
             act_steps = client.get("/api/v1/planning/steps?biological_only=true&active_only=true", headers=h_tfm).json()
             all_steps = client.get("/api/v1/planning/steps?biological_only=true&include_all=true&active_only=false", headers=h_tfm).json()
@@ -1286,8 +1302,8 @@ def main():
                   "Eksik Bilgi Sebebiyle Çakışmalar (MISSING_INFO) rozet (missing_info_badges) ve açıklama etiketleri içeriyor")
             sum92 = client.get("/api/v1/planning/summary", headers=h_tfm).json()
             check(sum92["confirmed_conflicts"] == len(conf_real) and sum92["missing_info_conflicts"] == len(conf_miss)
-                  and sum92["completed_tasks"] >= 163,
-                  "GET /api/v1/planning/summary: confirmed_conflicts, missing_info_conflicts ve completed_tasks sayıları birebir uyumlu")
+                  and sum92.get("historical_excluded_tasks", 0) >= 151 and sum92.get("historical_completed_tasks", 0) >= 6,
+                  "GET /api/v1/planning/summary: confirmed_conflicts, missing_info_conflicts ve doğrulanmamış geçmiş görev ayrımları (historical_excluded_tasks / historical_completed_tasks) birebir uyumlu")
             # Eksik başlangıç tarihi olan bir çalışmaya (GLP2026-031) tarih girildiğinde 'Başlangıç Tarihi Eksik' rozetinin kalktığını doğrula
             sr031 = db.query(SampleRecord).filter(SampleRecord.study_code == "GLP2026-031").first()
             plan031 = client.post(f"/api/v1/samples/{sr031.id}/plan", headers=h_tfm, json={"start_date": "2026-12-08"})

@@ -12,7 +12,7 @@ import io
 import re
 import unicodedata
 from datetime import date, datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sqlalchemy.orm import Session
 
@@ -1790,12 +1790,26 @@ def import_study_status_workbook(
     excel_codes = {r["study_code"] for r in all_parsed}
 
     if prune_non_excel and len(all_parsed) >= 88:
+        def _is_prunable_demo_or_test_code(c_val: Optional[str], st_obj: Optional[Study] = None) -> bool:
+            c_up = str(c_val or "").strip().upper()
+            if not c_up:
+                return False
+            if c_up.startswith(("T-", "26/", "NDMA", "GADOBUTROL", "GLP-2026-EDR-")) or c_up in ("GLP2026-090", "GLP2026-091"):
+                return True
+            m = re.match(r"^(?:GLP|NGLP)-?\d{4}-(\d+)$", c_up)
+            if m and int(m.group(1)) > 150:
+                return True
+            if st_obj is not None and isinstance(getattr(st_obj, "dossier_metadata", None), dict):
+                if st_obj.dossier_metadata.get("is_historical_demo"):
+                    return True
+            return False
+
         for old_row in db.query(SampleRecord).all():
-            if old_row.study_code not in excel_codes:
+            if old_row.study_code not in excel_codes and _is_prunable_demo_or_test_code(old_row.study_code):
                 db.delete(old_row)
         from app.models.conflict import Conflict
         for old_st in db.query(Study).all():
-            if old_st.study_code not in excel_codes:
+            if old_st.study_code not in excel_codes and _is_prunable_demo_or_test_code(old_st.study_code, old_st):
                 db.query(Conflict).filter((Conflict.study_id == old_st.id) | (Conflict.related_study_id == old_st.id)).delete(synchronize_session=False)
                 for st_step in db.query(StudyStep).filter(StudyStep.study_id == old_st.id).all():
                     st_step.assignees = []
@@ -1879,6 +1893,7 @@ def import_study_status_workbook(
                 acclimatization_start_date=rec["planned_start"] or rec["experiment_start_date"],
                 target_start_date=rec["planned_start"] or rec["experiment_start_date"],
                 target_end_date=rec["planned_end"] or rec["experiment_end_date"],
+                dossier_metadata={"historical_excel_import": True},
             )
             db.add(study)
         elif study is not None:
@@ -1899,16 +1914,23 @@ def import_study_status_workbook(
                 study.target_start_date = rec["planned_start"] or rec["experiment_start_date"]
             if rec["planned_end"] or rec["experiment_end_date"]:
                 study.target_end_date = rec["planned_end"] or rec["experiment_end_date"]
+            meta = dict(study.dossier_metadata or {}) if isinstance(study.dossier_metadata, dict) else {}
+            meta["historical_excel_import"] = True
+            study.dossier_metadata = meta
 
     db.commit()
 
     scheduled_count = 0
     if auto_schedule:
-        sched_res = auto_schedule_excel_studies(db, user)
+        sched_res = auto_schedule_excel_studies(db, user, target_study_codes=excel_codes)
         scheduled_count = sched_res["scheduled"]
         from app.services.scheduling_engine import sync_historical_completion_and_conflicts
 
-        sync_historical_completion_and_conflicts(db, from_excel_import=True)
+        sync_historical_completion_and_conflicts(
+            db,
+            from_excel_import=True,
+            target_study_codes=excel_codes,
+        )
         db.commit()
 
     sync_faz_9_3_sample_fields(db)
@@ -1947,7 +1969,11 @@ def import_study_status_workbook(
     }
 
 
-def auto_schedule_excel_studies(db: Session, user: User) -> Dict[str, Any]:
+def auto_schedule_excel_studies(
+    db: Session,
+    user: User,
+    target_study_codes: Optional[Set[str]] = None,
+) -> Dict[str, Any]:
     """
     FAZ 8.3 Adım 4:
     - `Planlanan/Planning` (14 GLP + 2 Non-GLP)
@@ -1961,11 +1987,14 @@ def auto_schedule_excel_studies(db: Session, user: User) -> Dict[str, Any]:
         .order_by(SampleRecord.serial_no.asc().nullslast(), SampleRecord.study_code.asc())
         .all()
     )
+    normalized_targets = {str(c).strip().upper() for c in target_study_codes if c} if target_study_codes is not None else None
     cursor_by_tpl: Dict[str, date] = {}
     base_cursor = next_business_day(max(date.today() + timedelta(days=2), date(2026, 11, 9)))
     results: List[Dict[str, Any]] = []
 
     for s in samples:
+        if normalized_targets is not None and str(s.study_code or "").strip().upper() not in normalized_targets:
+            continue
         st = (s.stored_status or "").upper()
         needs_schedule = False
         if st in ("PLANNED", "EXPECTED"):

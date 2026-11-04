@@ -57,7 +57,7 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
         reset_schema()
         self.db = SessionLocal()
         self.people = {u.username: u for u in seed_personnel(self.db)}
-        self.client = TestClient(app)
+        self.client = TestClient(app, raise_server_exceptions=False)
         self.h_tfm = _login_headers(self.client, "emine")
         self.h_sd = _login_headers(self.client, "ezgi")
         self.h_tech1 = _login_headers(self.client, "invivo_1")
@@ -175,6 +175,17 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
             app_resp2.status_code,
             409,
             "Onay uç noktası güncel doğrulama çalıştırmalı ve eksik personel varsa 409 dönmeli",
+        )
+
+        # Teknisyen tekrar aktif edilip yeniden planlandığında eksik rol kalmamalı ve onay 200 dönmeli
+        self.people["invivo_1"].is_active = True
+        self.db.commit()
+        schedule_new_study(self.db, s1.id, date(2026, 11, 2))
+        app_resp_ok = self.client.post(f"/api/v1/planning/studies/{s1.id}/approve", headers=self.h_tfm)
+        self.assertEqual(
+            app_resp_ok.status_code,
+            200,
+            "Eksik personel giderildikten sonra plan onayı 200 OK dönmeli",
         )
 
     # ------------------------------------------------------------------
@@ -665,6 +676,862 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
 
         app_ok = self.client.post(f"/api/v1/planning/studies/{s_cap.id}/approve", headers=self.h_tfm)
         self.assertEqual(app_ok.status_code, 200, "Kapasite servisi düzelip doğrulandıktan sonra plan onaylanabilmeli")
+
+    # ------------------------------------------------------------------
+    # 6. Geçmiş demo ve Excel kayıtlarının temizlik kapsamı, devam eden
+    #    çalışmaların korunması ve doğrulanmamış geçmiş istatistiği
+    # ------------------------------------------------------------------
+    def test_6_historical_cleanup_scope_ongoing_preservation_and_unverified_stats(self):
+        sd = self.people["ezgi"]
+        tech1 = self.people["invivo_1"]
+
+        # (a) Canlı devam eden çalışma: geçmişte kalmış açık (tamamlanmamış) adımı ve gelecekteki adımı var
+        sr_live = SampleRecord(
+            study_code="FIX6-LIVE-ONGOING",
+            glp_type="GLP",
+            stored_status="ONGOING",
+            planned_start=date(2026, 10, 12),
+            experiment_start_date=date(2026, 10, 12),
+            experiment_end_date=date(2026, 11, 20),
+        )
+        self.db.add(sr_live)
+        st_live = Study(
+            study_code="FIX6-LIVE-ONGOING",
+            title="Live Ongoing Study",
+            test_item_name="Live Item",
+            study_director_id=sd.id,
+            status=StudyStatus.IN_PROGRESS,
+            acclimatization_start_date=date(2026, 10, 12),
+            extraction_polar=True,
+            extraction_non_polar=False,
+        )
+        self.db.add(st_live)
+        self.db.commit()
+
+        live_past_step = StudyStep(
+            study_id=st_live.id,
+            step_order=1,
+            study_day=4,
+            step_name="72 Saatlik Ekstraksiyon Kurulumu",
+            step_type="Ekstraksiyon",
+            planned_start=datetime(2026, 10, 16, 9, 0),
+            planned_end=datetime(2026, 10, 16, 10, 30),
+            is_biological_fixed_time=True,
+            biological_tolerance_minutes=30,
+            status=StepStatus.PENDING,
+        )
+        # Teknisyen atanmamış -> açık çakışma üretmeli ve korunmalı
+        self.db.add(live_past_step)
+
+        live_future_step = StudyStep(
+            study_id=st_live.id,
+            step_order=2,
+            study_day=14,
+            step_name="14. Gün Gözlem",
+            planned_start=datetime(2026, 11, 18, 10, 0),
+            planned_end=datetime(2026, 11, 18, 11, 0),
+            status=StepStatus.PENDING,
+        )
+        live_future_step.assignees = [tech1]
+        self.db.add(live_future_step)
+        self.db.commit()
+        revalidate_study_conflicts(self.db, st_live)
+        self.db.commit()
+
+        # (b) Excel'den içe aktarılmış devam eden (ONGOING) geçmiş çalışma:
+        #     Excel'de adım detayı bilinmediği için < 2026-11-03 adımı aktif çakışmadan hariç tutulmalı
+        #     AMA otomatik COMPLETED yapılmamalı ve gelecekteki adımı korunmalı!
+        sr_hist_ongoing = SampleRecord(
+            study_code="FIX6-EXCEL-ONGOING",
+            glp_type="GLP",
+            stored_status="ONGOING",
+            planned_start=date(2026, 9, 7),
+            experiment_start_date=date(2026, 9, 7),
+            experiment_end_date=date(2026, 11, 25),
+        )
+        self.db.add(sr_hist_ongoing)
+        st_hist_ongoing = Study(
+            study_code="FIX6-EXCEL-ONGOING",
+            title="Excel Ongoing Study",
+            test_item_name="Excel Ongoing Item",
+            study_director_id=sd.id,
+            status=StudyStatus.IN_PROGRESS,
+            acclimatization_start_date=date(2026, 9, 7),
+            dossier_metadata={"historical_excel_import": True},
+            extraction_polar=True,
+            extraction_non_polar=False,
+        )
+        self.db.add(st_hist_ongoing)
+        self.db.commit()
+
+        hist_past_step = StudyStep(
+            study_id=st_hist_ongoing.id,
+            step_order=1,
+            study_day=4,
+            step_name="72 Saatlik Ekstraksiyon Kurulumu",
+            step_type="Ekstraksiyon",
+            planned_start=datetime(2026, 9, 11, 9, 0),
+            planned_end=datetime(2026, 9, 11, 10, 30),
+            is_biological_fixed_time=True,
+            biological_tolerance_minutes=30,
+            status=StepStatus.PENDING,
+        )
+        self.db.add(hist_past_step)
+
+        hist_future_step = StudyStep(
+            study_id=st_hist_ongoing.id,
+            step_order=2,
+            study_day=60,
+            step_name="Gelecek Gözlem Adımı",
+            planned_start=datetime(2026, 11, 20, 10, 0),
+            planned_end=datetime(2026, 11, 20, 11, 0),
+            status=StepStatus.PENDING,
+        )
+        hist_future_step.assignees = [tech1]
+        self.db.add(hist_future_step)
+        self.db.commit()
+
+        # (c) Excel'de açıkça COMPLETED (Biten) olan çalışma
+        sr_hist_done = SampleRecord(
+            study_code="FIX6-EXCEL-DONE",
+            glp_type="GLP",
+            stored_status="COMPLETED",
+            planned_start=date(2026, 8, 3),
+            experiment_start_date=date(2026, 8, 3),
+            experiment_end_date=date(2026, 8, 13),
+        )
+        self.db.add(sr_hist_done)
+        st_hist_done = Study(
+            study_code="FIX6-EXCEL-DONE",
+            title="Excel Completed Study",
+            test_item_name="Excel Completed Item",
+            study_director_id=sd.id,
+            status=StudyStatus.COMPLETED,
+            dossier_metadata={"historical_excel_import": True},
+        )
+        self.db.add(st_hist_done)
+        self.db.commit()
+
+        hist_done_step = StudyStep(
+            study_id=st_hist_done.id,
+            step_order=1,
+            study_day=0,
+            step_name="Biten Çalışma Adımı",
+            planned_start=datetime(2026, 8, 3, 9, 0),
+            planned_end=datetime(2026, 8, 3, 11, 0),
+            status=StepStatus.PENDING,
+        )
+        self.db.add(hist_done_step)
+        self.db.commit()
+
+        # Excel içe aktarım senkronizasyonu (yalnızca Excel kapsamındaki çalışmaları hedeflemeli)
+        try:
+            sync1 = se.sync_historical_completion_and_conflicts(
+                self.db,
+                from_excel_import=True,
+                target_study_codes={"FIX6-EXCEL-ONGOING", "FIX6-EXCEL-DONE"},
+            )
+        except TypeError:
+            sync1 = se.sync_historical_completion_and_conflicts(self.db, from_excel_import=True)
+        self.db.commit()
+        self.db.expire_all()
+
+        # 1) Canlı devam eden çalışmanın geçmiş açık görevi COMPLETED yapılmamalı ve çakışması açık kalmalı
+        live_past_after = self.db.query(StudyStep).filter(StudyStep.id == live_past_step.id).first()
+        live_future_after = self.db.query(StudyStep).filter(StudyStep.id == live_future_step.id).first()
+        self.assertEqual(live_past_after.status, StepStatus.PENDING)
+        self.assertEqual(live_future_after.status, StepStatus.PENDING)
+        self.assertIsNone(live_past_after.actual_start)
+        self.assertIsNone(live_past_after.actual_end)
+        live_open_confs = (
+            self.db.query(Conflict)
+            .filter(Conflict.study_id == st_live.id, Conflict.is_resolved == False)  # noqa: E712
+            .all()
+        )
+        self.assertGreaterEqual(len(live_open_confs), 1, "Canlı çalışmanın geçmiş açık görevinin çakışması korunmalı")
+
+        # 2) Excel ONGOING çalışmasının geçmiş adımı COMPLETED yapılmamalı, gelecekteki adımı korunmalı,
+        #    ancak geçmiş belirsiz adımı aktif çakışmalardan hariç tutulmalı
+        hist_past_after = self.db.query(StudyStep).filter(StudyStep.id == hist_past_step.id).first()
+        hist_future_after = self.db.query(StudyStep).filter(StudyStep.id == hist_future_step.id).first()
+        self.assertEqual(
+            hist_past_after.status,
+            StepStatus.PENDING,
+            "Tamamlanmamış (ONGOING) Excel çalışmasının geçmiş tarihli adımı otomatik COMPLETED yapılmamalı",
+        )
+        self.assertEqual(hist_future_after.status, StepStatus.PENDING, "Gelecekteki görev korunmalı")
+        self.assertIsNone(hist_past_after.actual_start)
+        self.assertIsNone(hist_past_after.actual_end)
+        revalidate_study_conflicts(self.db, st_hist_ongoing)
+        self.db.commit()
+        hist_ongoing_confs = (
+            self.db.query(Conflict)
+            .filter(
+                Conflict.study_id == st_hist_ongoing.id,
+                Conflict.step_id == hist_past_step.id,
+                Conflict.is_resolved == False,  # noqa: E712
+            )
+            .all()
+        )
+        self.assertEqual(
+            len(hist_ongoing_confs),
+            0,
+            "Ayrıntısı bilinmeyen geçmiş Excel/demo adımı aktif çakışma hesabından hariç tutulmalı",
+        )
+
+        # 3) Excel'de açıkça COMPLETED olan çalışmanın adımı COMPLETED olmalı ama actual_start/end uydurulmamalı
+        hist_done_after = self.db.query(StudyStep).filter(StudyStep.id == hist_done_step.id).first()
+        self.assertEqual(hist_done_after.status, StepStatus.COMPLETED)
+        self.assertIsNone(hist_done_after.actual_start)
+        self.assertIsNone(hist_done_after.actual_end)
+
+        # 4) Geçmiş/doğrulanmamış kayıtların aktif çakışmadan çıkarılması doğrulanmış completed_tasks istatistiğine eklenmemeli
+        sum_resp = self.client.get("/api/v1/planning/summary", headers=self.h_tfm).json()
+        self.assertEqual(
+            sum_resp["completed_tasks"],
+            0,
+            "Doğrulanmış gerçekleşme saati olmayan geçmiş/hariç tutulan kayıtlar completed_tasks istatistiğine eklenmemeli",
+        )
+        self.assertGreaterEqual(sum_resp.get("historical_excluded_tasks", 0), 1)
+        self.assertGreaterEqual(sum_resp.get("historical_completed_tasks", 0), 1)
+
+        # 5) Aynı Excel tekrar içe aktarıldığında sahte yeni tamamlamalar oluşmamalı
+        sync2 = se.sync_historical_completion_and_conflicts(
+            self.db,
+            from_excel_import=True,
+            target_study_codes={"FIX6-EXCEL-ONGOING", "FIX6-EXCEL-DONE"},
+        )
+        self.assertEqual(sync2["newly_completed_steps"], 0, "Tekrar içe aktarımda sahte yeni tamamlama oluşmamalı")
+
+    # ------------------------------------------------------------------
+    # 7. Kaynak adımın ve bağımlı gözlemin toleranslarının ayrılması
+    # ------------------------------------------------------------------
+    def test_7_source_step_and_dependent_observation_tolerances_separated(self):
+        sd = self.people["ezgi"]
+        s_tol = Study(
+            study_code="FIX7-TOL",
+            title="Tolerance Separation Study",
+            test_item_name="Tol Item",
+            study_director_id=sd.id,
+            status=StudyStatus.DRAFT,
+            extraction_polar=True,
+            extraction_non_polar=False,
+        )
+        self.db.add(s_tol)
+        self.db.commit()
+        schedule_new_study(self.db, s_tol.id, date(2026, 12, 7))
+        s_tol.status = StudyStatus.IN_PROGRESS
+        self.db.commit()
+
+        steps = (
+            self.db.query(StudyStep)
+            .filter(StudyStep.study_id == s_tol.id)
+            .order_by(StudyStep.step_order.asc())
+            .all()
+        )
+        day7 = next(s for s in steps if s.study_day == 7)
+        day8 = next(s for s in steps if s.study_day == 8)
+        day9 = next(s for s in steps if s.study_day == 9)
+        day10 = next(s for s in steps if s.study_day == 10)
+
+        # Senaryo A: Kaynak toleransı ±15 dk, bağımlı gözlem toleransı ±120 dk, referans gecikmesi +30 dk
+        day7.biological_tolerance_minutes = 15
+        day8.biological_tolerance_minutes = 120
+        day9.biological_tolerance_minutes = 120
+        day10.biological_tolerance_minutes = 120
+        self.db.commit()
+        planned_ref_dt = datetime.combine(day7.planned_start.date(), time(10, 0))
+
+        # Tam sınır içi / sınır değeri kontrolü (+15 dk: kaynak toleransı sınırında)
+        day7.actual_reference_time = planned_ref_dt + timedelta(minutes=15)
+        self.db.commit()
+        bio_at_boundary = se.compute_biological_dependency_info(s_tol, steps)
+        d7_info_bound = bio_at_boundary["by_step_id"][day7.id]
+        self.assertFalse(d7_info_bound["exceeds_tolerance"], "+15 dk gecikme ±15 dk kaynak toleransı sınırında (aşım değil)")
+        self.assertTrue(all(not d["exceeds_tolerance"] for d in bio_at_boundary["revision_proposals"]))
+
+        # +30 dk gecikme: kaynak toleransını (±15 dk) aşar, ancak gözlem toleransını (±120 dk) AŞMAZ
+        day7.actual_reference_time = planned_ref_dt + timedelta(minutes=30)
+        self.db.commit()
+        bio_30 = se.compute_biological_dependency_info(s_tol, steps)
+        d7_info_30 = bio_30["by_step_id"][day7.id]
+        self.assertTrue(d7_info_30["exceeds_tolerance"], "+30 dk gecikme ±15 dk kaynak toleransını aşmalı")
+        for d in bio_30["revision_proposals"]:
+            self.assertEqual(d["tolerance_minutes"], 120, "Bağımlı gözlem kendi ±120 dk toleransını raporlamalı")
+            self.assertFalse(
+                d["exceeds_tolerance"],
+                "Kaynak adım toleransı (±15 dk) aşıldı diye ±120 dk toleranslı bağımlı gözlem tolerans aşımı sayılmamalı",
+            )
+            self.assertTrue(
+                d["requires_revision"],
+                "Beklenen pencere planlanan pencereden kaydığı için revizyon önerisi yine üretilmeli",
+            )
+
+        # Senaryo B: Kaynak toleransı ±60 dk, bağımlı gözlem toleransı ±15 dk, referans gecikmesi +30 dk
+        day7.biological_tolerance_minutes = 60
+        day8.biological_tolerance_minutes = 15
+        self.db.commit()
+        bio_rev = se.compute_biological_dependency_info(s_tol, steps)
+        self.assertFalse(bio_rev["by_step_id"][day7.id]["exceeds_tolerance"], "+30 dk gecikme ±60 dk kaynak toleransı içinde")
+        dep24 = bio_rev["by_step_id"][day8.id]
+        self.assertTrue(
+            dep24["exceeds_tolerance"],
+            "Bağımlı adımın kendi ±15 dk toleransı kaynak adımın ±60 dk toleransından bağımsız değerlendirilmeli (+30 dk > ±15 dk)",
+        )
+
+    # ------------------------------------------------------------------
+    # 8. Gözlemin gerçek yapılma zamanının (actual_reference_time) denetlenmesi
+    # ------------------------------------------------------------------
+    def test_8_dependent_observation_actual_reference_time_verification(self):
+        sd = self.people["ezgi"]
+        s_obs = Study(
+            study_code="FIX8-OBS",
+            title="Observation Actual Time Verification",
+            test_item_name="Obs Item",
+            study_director_id=sd.id,
+            status=StudyStatus.DRAFT,
+            extraction_polar=True,
+            extraction_non_polar=False,
+        )
+        self.db.add(s_obs)
+        self.db.commit()
+        schedule_new_study(self.db, s_obs.id, date(2026, 12, 7))
+        s_obs.status = StudyStatus.IN_PROGRESS
+        self.db.commit()
+
+        steps = (
+            self.db.query(StudyStep)
+            .filter(StudyStep.study_id == s_obs.id)
+            .order_by(StudyStep.step_order.asc())
+            .all()
+        )
+        day7 = next(s for s in steps if s.study_day == 7)   # 2026-12-14 10:00
+        day8 = next(s for s in steps if s.study_day == 8)   # 2026-12-15 10:00 (+24s, ±120 dk)
+        day9 = next(s for s in steps if s.study_day == 9)   # 2026-12-16 10:00 (+48s, ±120 dk)
+
+        # (a) Referans zamanında (10:00), ancak 24. saat gözlemi gerçekte 12:30'da (+150 dk > ±120 dk) yapıldı
+        resp_ref = self.client.patch(
+            f"/api/v1/planning/steps/{day7.id}/status",
+            headers=self.h_tfm,
+            json={
+                "status": "COMPLETED",
+                "actual_start": "2026-12-14T09:50:00",
+                "actual_reference_time": "2026-12-14T10:00:00",
+                "actual_end": "2026-12-14T11:30:00",
+            },
+        )
+        self.assertEqual(resp_ref.status_code, 200)
+
+        resp_obs_late = self.client.patch(
+            f"/api/v1/planning/steps/{day8.id}/status",
+            headers=self.h_tfm,
+            json={
+                "status": "COMPLETED",
+                "actual_start": "2026-12-15T12:15:00",
+                "actual_reference_time": "2026-12-15T12:30:00",
+                "actual_end": "2026-12-15T13:00:00",
+            },
+        )
+        self.assertEqual(resp_obs_late.status_code, 200)
+        open_confs_a = (
+            self.db.query(Conflict)
+            .filter(Conflict.study_id == s_obs.id, Conflict.step_id == day8.id, Conflict.is_resolved == False)  # noqa: E712
+            .all()
+        )
+        self.assertTrue(
+            any(
+                c.conflict_type == ConflictType.BIOLOGICAL_TIME_VIOLATION
+                and "Gerçekleşen Gözlem Biyolojik Pencere İhlali" in (c.title or "")
+                for c in open_confs_a
+            ),
+            "Referans zamanında olsa bile 24s gözlemi gerçekte tolerans dışında (12:30, +150 dk > ±120 dk) yapıldığında BIOLOGICAL_TIME_VIOLATION yakalanmalı",
+        )
+
+        # (b) Referans gecikmeli (13:00), gözlem yeni beklenen zamanda (13:05, beklenen 13:00'e göre +5 dk <= ±30 dk) yapıldı:
+        #     Gözlem için sahte uygulama/gerçekleşme ihlali üretilmemeli; kaynak sapması korunmalı!
+        self.client.patch(
+            f"/api/v1/planning/steps/{day7.id}/status",
+            headers=self.h_tfm,
+            json={
+                "status": "COMPLETED",
+                "actual_start": "2026-12-14T12:45:00",
+                "actual_reference_time": "2026-12-14T13:00:00",
+                "actual_end": "2026-12-14T14:00:00",
+            },
+        )
+        resp_obs_ontime_shifted = self.client.patch(
+            f"/api/v1/planning/steps/{day8.id}/status",
+            headers=self.h_tfm,
+            json={
+                "status": "COMPLETED",
+                "actual_start": "2026-12-15T12:55:00",
+                "actual_reference_time": "2026-12-15T13:05:00",
+                "actual_end": "2026-12-15T13:35:00",
+            },
+        )
+        self.assertEqual(resp_obs_ontime_shifted.status_code, 200)
+        open_confs_day8_b = (
+            self.db.query(Conflict)
+            .filter(Conflict.study_id == s_obs.id, Conflict.step_id == day8.id, Conflict.is_resolved == False)  # noqa: E712
+            .all()
+        )
+        self.assertFalse(
+            any("Gerçekleşen Gözlem Biyolojik Pencere İhlali" in (c.title or "") for c in open_confs_day8_b),
+            "Referans geciktiğinde gözlem yeni beklenen pencerede (13:05) zamanında yapıldıysa gözlem gerçekleşme ihlali üretilmemeli",
+        )
+        open_confs_day7_b = (
+            self.db.query(Conflict)
+            .filter(Conflict.study_id == s_obs.id, Conflict.step_id == day7.id, Conflict.is_resolved == False)  # noqa: E712
+            .all()
+        )
+        self.assertTrue(
+            any("Biyolojik Referans Saat Sapması" in (c.title or "") for c in open_confs_day7_b),
+            "Kaynak adımın kendi referans sapması korunmalı",
+        )
+
+        # (c) Bağımlı gözlem adımı (Gün 9, +48s) COMPLETED yapılıp actual_reference_time girilmezse:
+        #     actual_start kopyalanmamalı ve 'Eksik Biyolojik Gözlem Saati' uyarısı üretilmeli
+        resp_obs_missing = self.client.patch(
+            f"/api/v1/planning/steps/{day9.id}/status",
+            headers=self.h_tfm,
+            json={
+                "status": "COMPLETED",
+                "actual_start": "2026-12-16T12:50:00",
+                "actual_end": "2026-12-16T13:20:00",
+            },
+        )
+        self.assertEqual(resp_obs_missing.status_code, 200)
+        self.db.expire_all()
+        day9_after = self.db.query(StudyStep).filter(StudyStep.id == day9.id).first()
+        self.assertIsNone(
+            day9_after.actual_reference_time,
+            "Bağımlı gözlem adımında actual_reference_time girilmediğinde actual_start kopyalanmamalı",
+        )
+        open_confs_day9 = (
+            self.db.query(Conflict)
+            .filter(Conflict.study_id == s_obs.id, Conflict.step_id == day9.id, Conflict.is_resolved == False)  # noqa: E712
+            .all()
+        )
+        self.assertTrue(
+            any("Eksik Biyolojik Gözlem Saati" in (c.title or "") for c in open_confs_day9),
+            "Tamamlanan bağımlı gözlemde gerçek gözlem saati eksikse açıkça uyarı üretilmeli",
+        )
+
+    # ------------------------------------------------------------------
+    # 9. Beklenen biyolojik pencerelerin çalışmalar arasında ve çalışma
+    #    içinde sıra bağımsız tutarlı değerlendirilmesi
+    # ------------------------------------------------------------------
+    def test_9_cross_study_and_intra_study_expected_biological_window_consistency(self):
+        sd = self.people["ezgi"]
+        tech1 = self.people["invivo_1"]
+        self.people["invivo_2"].is_active = False
+        self.db.commit()
+
+        # Çalışma B önce oluşturulsun (daha küçük Study.id!) -> 2026-12-15 13:00-13:45 arasında tech1 görevli
+        s_b = Study(
+            study_code="FIX9-STUDY-B",
+            title="Study B Fixed 13:00",
+            test_item_name="Item B",
+            study_director_id=sd.id,
+            status=StudyStatus.DRAFT,
+            extraction_polar=True,
+            extraction_non_polar=False,
+        )
+        self.db.add(s_b)
+        self.db.commit()
+        step_b = StudyStep(
+            study_id=s_b.id,
+            step_order=1,
+            study_day=1,
+            step_name="Study B 13:00 Görevi",
+            planned_start=datetime(2026, 12, 15, 13, 0),
+            planned_end=datetime(2026, 12, 15, 13, 45),
+            status=StepStatus.PENDING,
+        )
+        step_b.assignees = [tech1]
+        self.db.add(step_b)
+        self.db.commit()
+
+        # Çalışma A sonra oluşturulsun (daha büyük Study.id) -> Gün 8 (2026-12-15) gözlemi planlanan 10:00,
+        # ama Gün 7 uygulaması 13:00'te gerçekleştiği için beklenen gözlem penceresi 13:00-13:45'e kayıyor!
+        s_a = Study(
+            study_code="FIX9-STUDY-A",
+            title="Study A Shifted to 13:00",
+            test_item_name="Item A",
+            study_director_id=sd.id,
+            status=StudyStatus.DRAFT,
+            extraction_polar=True,
+            extraction_non_polar=False,
+        )
+        self.db.add(s_a)
+        self.db.commit()
+        schedule_new_study(self.db, s_a.id, date(2026, 12, 7))
+        s_a.status = StudyStatus.IN_PROGRESS
+        self.db.commit()
+
+        day7_a = (
+            self.db.query(StudyStep)
+            .filter(StudyStep.study_id == s_a.id, StudyStep.study_day == 7)
+            .first()
+        )
+        self.client.patch(
+            f"/api/v1/planning/steps/{day7_a.id}/status",
+            headers=self.h_tfm,
+            json={
+                "status": "COMPLETED",
+                "actual_start": "2026-12-14T12:50:00",
+                "actual_reference_time": "2026-12-14T13:00:00",
+                "actual_end": "2026-12-14T14:00:00",
+            },
+        )
+        self.db.expire_all()
+
+        # 1) Çalışma A doğrulandığında B ile 13:00'teki personel çakışmasını görmeli
+        revalidate_study_conflicts(self.db, s_a)
+        self.db.commit()
+        confs_a = (
+            self.db.query(Conflict)
+            .filter(
+                Conflict.study_id == s_a.id,
+                Conflict.conflict_type == ConflictType.PERSONNEL_OVERLAP,
+                Conflict.is_resolved == False,  # noqa: E712
+            )
+            .all()
+        )
+        self.assertGreaterEqual(len(confs_a), 1, "Çalışma A doğrulandığında B ile 13:00'teki beklenen pencere çakışması yakalanmalı")
+
+        # 2) Çalışma B doğrulandığında da A'nın 13:00'e kaymış beklenen penceresiyle çakışma yakalanmalı!
+        revalidate_study_conflicts(self.db, s_b)
+        self.db.commit()
+        confs_b = (
+            self.db.query(Conflict)
+            .filter(
+                Conflict.study_id == s_b.id,
+                Conflict.conflict_type == ConflictType.PERSONNEL_OVERLAP,
+                Conflict.is_resolved == False,  # noqa: E712
+            )
+            .all()
+        )
+        self.assertGreaterEqual(
+            len(confs_b),
+            1,
+            "Çalışma B doğrulandığında A'nın beklenen biyolojik penceresi (13:00) dikkate alınarak çakışma yakalanmalı",
+        )
+
+        # 3) Çalışma B için onay uç noktası (POST /approve) bu beklenen pencere çakışması yüzünden 409 dönmeli
+        app_b = self.client.post(f"/api/v1/planning/studies/{s_b.id}/approve", headers=self.h_tfm)
+        self.assertEqual(app_b.status_code, 409, "Beklenen biyolojik pencere çakışması olan Çalışma B onaylanamamalı (409)")
+
+        # 4) recompute_all_conflicts çalışma ID sırasından bağımsız olarak her iki çalışmada da çakışmayı görmeli
+        recompute_all_conflicts(self.db)
+        open_all = (
+            self.db.query(Conflict)
+            .filter(
+                Conflict.study_id.in_([s_a.id, s_b.id]),
+                Conflict.conflict_type == ConflictType.PERSONNEL_OVERLAP,
+                Conflict.is_resolved == False,  # noqa: E712
+            )
+            .all()
+        )
+        self.assertTrue(
+            any(c.study_id == s_b.id for c in open_all) and any(c.study_id == s_a.id for c in open_all),
+            "recompute_all_conflicts çalışma oluşturma sırasından bağımsız olarak her iki çalışmada da çakışmayı üretmeli",
+        )
+
+        # 5) Çalışma içi (intra-study) çakışma: Çalışma A içinde aynı gün 13:00-13:45'e ek bir adım konulursa
+        #    kaymış beklenen gözlem penceresinin aynı çalışmadaki diğer adımla çakışması da yakalanmalı
+        step_b.status = StepStatus.CANCELLED
+        self.db.commit()
+        intra_step = StudyStep(
+            study_id=s_a.id,
+            step_order=99,
+            study_day=8,
+            step_name="Aynı Çalışma İçi 13:00 Ek Görev",
+            planned_start=datetime(2026, 12, 15, 13, 0),
+            planned_end=datetime(2026, 12, 15, 13, 45),
+            status=StepStatus.PENDING,
+        )
+        intra_step.assignees = [tech1]
+        self.db.add(intra_step)
+        self.db.commit()
+        revalidate_study_conflicts(self.db, s_a)
+        self.db.commit()
+        intra_confs = (
+            self.db.query(Conflict)
+            .filter(
+                Conflict.study_id == s_a.id,
+                Conflict.conflict_type == ConflictType.PERSONNEL_OVERLAP,
+                Conflict.is_resolved == False,  # noqa: E712
+            )
+            .all()
+        )
+        self.assertGreaterEqual(
+            len(intra_confs),
+            1,
+            "Kaymış beklenen gözlem penceresinin aynı çalışma içindeki başka bir adımla personel çakışması da yakalanmalı",
+        )
+
+    # ------------------------------------------------------------------
+    # 10. Zaman girdilerinin anlamı (timezone normalizasyonu) ve 422 doğrulaması
+    # ------------------------------------------------------------------
+    def test_10_datetime_timezone_normalization_and_validation_422(self):
+        sd = self.people["ezgi"]
+        s_dt = Study(
+            study_code="FIX10-DT",
+            title="Datetime Validation Study",
+            test_item_name="DT Item",
+            study_director_id=sd.id,
+            status=StudyStatus.DRAFT,
+            extraction_polar=True,
+            extraction_non_polar=False,
+        )
+        self.db.add(s_dt)
+        self.db.commit()
+        schedule_new_study(self.db, s_dt.id, date(2026, 12, 7))
+        s_dt.status = StudyStatus.IN_PROGRESS
+        self.db.commit()
+
+        day7 = (
+            self.db.query(StudyStep)
+            .filter(StudyStep.study_id == s_dt.id, StudyStep.study_day == 7)
+            .first()
+        )
+        # day7.planned_start = 2026-12-14 10:00:00 (Tesis yerel saati: Europe/Istanbul UTC+03:00)
+
+        # 1) "2026-12-14T07:00:00Z", "2026-12-14T07:00:00+00:00", "2026-12-14T10:00:00+03:00" ve
+        #    yerel "2026-12-14T10:00:00" girdilerinin hepsi yerel 10:00:00 anını temsil etmeli (sapma = 0 dk, 500 hatası yok!)
+        for iso_val in (
+            "2026-12-14T07:00:00Z",
+            "2026-12-14T07:00:00+00:00",
+            "2026-12-14T10:00:00+03:00",
+            "2026-12-14T10:00:00",
+        ):
+            r = self.client.patch(
+                f"/api/v1/planning/steps/{day7.id}/status",
+                headers=self.h_tfm,
+                json={
+                    "status": "COMPLETED",
+                    "actual_start": "2026-12-14T09:30:00+03:00",
+                    "actual_reference_time": iso_val,
+                    "actual_end": "2026-12-14T11:30:00+03:00",
+                },
+            )
+            self.assertEqual(r.status_code, 200, f"Geçerli zaman girdisi ({iso_val}) 200 dönmeli (500 değil): {r.text}")
+            data = r.json()
+            self.assertEqual(
+                data["actual_reference_time"],
+                "2026-12-14T10:00:00",
+                f"{iso_val} tesis yerel saatine (2026-12-14T10:00:00) normalize edilmeli",
+            )
+            self.assertEqual(data["deviation_minutes"], 0, f"{iso_val} için sapma 0 dk olmalı")
+
+        # 2) Bozuk tarih formatı -> 422
+        r_bad_fmt = self.client.patch(
+            f"/api/v1/planning/steps/{day7.id}/status",
+            headers=self.h_tfm,
+            json={"actual_start": "gecersiz-tarih-formati"},
+        )
+        self.assertEqual(r_bad_fmt.status_code, 422, "Geçersiz tarih formatı 422 dönmeli")
+
+        # 3) actual_end < actual_start -> 422
+        r_end_before_start = self.client.patch(
+            f"/api/v1/planning/steps/{day7.id}/status",
+            headers=self.h_tfm,
+            json={
+                "status": "COMPLETED",
+                "actual_start": "2026-12-14T11:00:00",
+                "actual_end": "2026-12-14T10:00:00",
+            },
+        )
+        self.assertEqual(r_end_before_start.status_code, 422, "actual_end < actual_start 422 dönmeli")
+
+        # 4) actual_reference_time [actual_start, actual_end] aralığı dışında -> 422
+        r_ref_outside = self.client.patch(
+            f"/api/v1/planning/steps/{day7.id}/status",
+            headers=self.h_tfm,
+            json={
+                "status": "COMPLETED",
+                "actual_start": "2026-12-14T10:00:00",
+                "actual_reference_time": "2026-12-14T12:30:00",
+                "actual_end": "2026-12-14T11:30:00",
+            },
+        )
+        self.assertEqual(
+            r_ref_outside.status_code,
+            422,
+            "actual_reference_time [actual_start, actual_end] aralığı dışındaysa 422 dönmeli",
+        )
+
+        # 5) Durum ve zaman alanları arasında tutarsızlık (PENDING iken actual_end gönderilmesi) -> 422
+        r_inconsistent_status = self.client.patch(
+            f"/api/v1/planning/steps/{day7.id}/status",
+            headers=self.h_tfm,
+            json={
+                "status": "PENDING",
+                "actual_end": "2026-12-14T11:30:00",
+            },
+        )
+        self.assertEqual(
+            r_inconsistent_status.status_code,
+            422,
+            "PENDING durumundaki adıma actual_end girilmesi tutarsız olduğu için 422 dönmeli",
+        )
+
+    # ------------------------------------------------------------------
+    # 11. Referans saati girişinin görev akışı API sözleşmesi
+    # ------------------------------------------------------------------
+    def test_11_reference_time_api_contract_for_task_workflow(self):
+        sd = self.people["ezgi"]
+        s_ui = Study(
+            study_code="FIX11-UI",
+            title="Task Workflow Reference Time Study",
+            test_item_name="UI Item",
+            study_director_id=sd.id,
+            status=StudyStatus.DRAFT,
+            extraction_polar=True,
+            extraction_non_polar=False,
+        )
+        self.db.add(s_ui)
+        self.db.commit()
+        schedule_new_study(self.db, s_ui.id, date(2026, 12, 7))
+        s_ui.status = StudyStatus.IN_PROGRESS
+        self.db.commit()
+
+        steps_resp = self.client.get(
+            f"/api/v1/planning/steps?study_id={s_ui.id}&include_all=true&active_only=false",
+            headers=self.h_tfm,
+        )
+        self.assertEqual(steps_resp.status_code, 200)
+        steps_list = steps_resp.json()
+        d7 = next(s for s in steps_list if s["study_day"] == 7)
+        d8 = next(s for s in steps_list if s["study_day"] == 8)
+        d0 = next(s for s in steps_list if s["study_day"] == 0)
+
+        self.assertTrue(d7.get("requires_reference_time"), "Kaynak biyolojik adım requires_reference_time=True dönmeli")
+        self.assertEqual(d7.get("reference_time_role"), "SOURCE")
+        self.assertTrue(d8.get("requires_reference_time"), "Bağımlı gözlem adımı requires_reference_time=True dönmeli")
+        self.assertEqual(d8.get("reference_time_role"), "DEPENDENT_OBSERVATION")
+        self.assertFalse(d0.get("requires_reference_time"), "Esnek idari adım requires_reference_time=False dönmeli")
+
+    # ------------------------------------------------------------------
+    # 12. Bilinmeyen ekstraksiyon bilgisinin polar olarak varsayılmaması
+    # ------------------------------------------------------------------
+    def test_12_unknown_extraction_info_not_assumed_polar(self):
+        wb = self.db.query(Equipment).filter(Equipment.code == "EQ-WB-001").first()
+        wb.polar_capacity = 1
+        wb.non_polar_capacity = 1
+        self.db.commit()
+
+        sd = self.people["ezgi"]
+        monday = date(2026, 11, 2)
+
+        # Çalışma 1: Ekstraksiyon bilgisi bilinmiyor (None / None)
+        s_unknown = Study(
+            study_code="FIX12-UNKNOWN",
+            title="Unknown Extraction Study",
+            test_item_name="Unknown Polymer",
+            study_director_id=sd.id,
+            status=StudyStatus.DRAFT,
+            extraction_polar=None,
+            extraction_non_polar=None,
+        )
+        # Çalışma 2: Yalnızca apolar (False / True)
+        s_apolar = Study(
+            study_code="FIX12-APOLAR",
+            title="Apolar Only Study",
+            test_item_name="Apolar Polymer",
+            study_director_id=sd.id,
+            status=StudyStatus.DRAFT,
+            extraction_polar=False,
+            extraction_non_polar=True,
+        )
+        # Çalışma 3: Polar (True / False)
+        s_polar = Study(
+            study_code="FIX12-POLAR",
+            title="Polar Study",
+            test_item_name="Polar Polymer",
+            study_director_id=sd.id,
+            status=StudyStatus.DRAFT,
+            extraction_polar=True,
+            extraction_non_polar=False,
+        )
+        self.db.add_all([s_unknown, s_apolar, s_polar])
+        self.db.commit()
+
+        res_unk = schedule_new_study(self.db, s_unknown.id, monday)
+        res_apo = schedule_new_study(self.db, s_apolar.id, monday)
+        res_pol = schedule_new_study(self.db, s_polar.id, monday)
+
+        # 1) Bilinmeyen (None/None) çalışmaya Su Banyosu (EQ-WB-001) atanmamalı ve eksik bilgi durumu açıkça görünmeli
+        unk_ext_step = (
+            self.db.query(StudyStep)
+            .filter(StudyStep.study_id == s_unknown.id, StudyStep.study_day == 4)
+            .first()
+        )
+        self.assertIsNone(
+            unk_ext_step.equipment_id,
+            "extraction_polar=None iken ekstraksiyon adımına Su Banyosu (equipment_id) varsayılan olarak atanmamalı",
+        )
+        self.assertTrue(
+            res_unk.get("missing_extraction_info"),
+            "extraction_polar=None ve extraction_non_polar=None olduğunda missing_extraction_info=True dönmeli",
+        )
+        self.assertEqual(res_unk.get("extraction_info_status"), "MISSING")
+
+        # 2) Yalnızca apolar (False/True) çalışmaya Su Banyosu atanmamalı
+        apo_ext_step = (
+            self.db.query(StudyStep)
+            .filter(StudyStep.study_id == s_apolar.id, StudyStep.study_day == 4)
+            .first()
+        )
+        self.assertIsNone(apo_ext_step.equipment_id, "Yalnızca apolar çalışmaya Su Banyosu atanmamalı")
+        self.assertFalse(res_apo.get("missing_extraction_info"))
+        self.assertEqual(res_apo.get("extraction_info_status"), "APOLAR_ONLY")
+
+        # 3) Polar (True/False) çalışmaya Su Banyosu atanmalı, ancak s_unknown (None/None) yüzünden kesinleşmiş
+        #    Su Banyosu kapasite aşımı üretilmemeli (kapasite=1 ve yalnızca s_polar kesin polar kullanıyor)
+        pol_ext_step = (
+            self.db.query(StudyStep)
+            .filter(StudyStep.study_id == s_polar.id, StudyStep.study_day == 4)
+            .first()
+        )
+        self.assertEqual(pol_ext_step.equipment_id, wb.id, "Polar çalışmaya Su Banyosu atanmalı")
+        pol_wb_confs = [
+            c for c in res_pol["conflicts"]
+            if c["type"] == "EQUIPMENT_OVERLAP" and "Su Banyosu" in (c["title"] or "")
+        ]
+        self.assertEqual(
+            len(pol_wb_confs),
+            0,
+            "Bilinmeyen (None) ekstraksiyonlu çalışma su banyosunu kesin kullanıyor sayılıp s_polar'da sahte cihaz çakışması üretmemeli",
+        )
+
+        # 4) Eksik bilgi sonradan tamamlandığında (s_unknown -> extraction_polar=True) yeniden doğrulama
+        #    hem cihaz atamasını güncellemeli hem de gerçek Su Banyosu çakışmasını yakalamalı!
+        s_unknown.extraction_polar = True
+        s_unknown.extraction_non_polar = False
+        self.db.commit()
+        revalidate_study_conflicts(self.db, s_unknown)
+        self.db.commit()
+        self.db.refresh(unk_ext_step)
+        self.assertEqual(
+            unk_ext_step.equipment_id,
+            wb.id,
+            "Eksik ekstraksiyon bilgisi polar=True olarak tamamlandığında Su Banyosu atanmalı",
+        )
+        unk_wb_confs = (
+            self.db.query(Conflict)
+            .filter(
+                Conflict.study_id == s_unknown.id,
+                Conflict.conflict_type == ConflictType.EQUIPMENT_OVERLAP,
+                Conflict.is_resolved == False,  # noqa: E712
+            )
+            .all()
+        )
+        self.assertTrue(
+            any("Su Banyosu" in (c.title or "") for c in unk_wb_confs),
+            "Eksik ekstraksiyon bilgisi polar=True olarak tamamlandığında Su Banyosu çakışması tespit edilmeli",
+        )
 
 
 if __name__ == "__main__":

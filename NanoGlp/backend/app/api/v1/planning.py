@@ -1,4 +1,4 @@
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, model_validator
@@ -17,6 +17,7 @@ from app.schemas.conflict import ConflictOut
 from app.seed import seed_default_equipment
 from app.services.document_parser import CANONICAL_STUDY_CODE_MAPPINGS
 from app.services.scheduling_engine import (
+    COMPARED_STUDY_STATUSES,
     EXCLUDED_WORKLOAD_ROLES,
     REFERENCE_DATE,
     _safe_capacity_report,
@@ -27,8 +28,10 @@ from app.services.scheduling_engine import (
     compute_biological_dependency_info,
     enrich_conflicts_with_category,
     get_all_studies_calendar_details,
+    get_study_extraction_usage,
     get_study_schedule_detail,
     is_eligible_lab_personnel,
+    is_historical_unverified_step,
     recompute_all_conflicts,
     revalidate_study_conflicts,
     schedule_new_study,
@@ -108,29 +111,68 @@ class ApplyResolutionRequest(BaseModel):
     target_user_id: Optional[int] = None
 
 
+FACILITY_TZ = timezone(timedelta(hours=3))
+
+
 class UpdateStepStatusRequest(BaseModel):
     status: Optional[StepStatus] = None
     notes: Optional[str] = None
-    actual_start: Optional[str | datetime] = None
-    actual_end: Optional[str | datetime] = None
-    actual_reference_time: Optional[str | datetime] = None
-    biological_reference_time: Optional[str | datetime] = None
-    reference_time: Optional[str | datetime] = None
+    actual_start: Optional[str] = None
+    actual_end: Optional[str] = None
+    actual_reference_time: Optional[str] = None
+    biological_reference_time: Optional[str] = None
+    reference_time: Optional[str] = None
     deviation_notes: Optional[str] = None
 
 
-def _parse_step_dt(val: Optional[str | datetime], fallback_date: date) -> Optional[datetime]:
+def _parse_step_dt(
+    val: Optional[str | datetime],
+    fallback_date: date,
+    field_name: str = "tarih/saat",
+) -> Optional[datetime]:
+    """
+    Gelen zaman damgasını tesis yerel saatine (Europe/Istanbul, UTC+03:00 naive datetime) normalize eder.
+    - '2026-11-11T07:00:00Z' ve '2026-11-11T07:00:00+00:00' -> 2026-11-11 10:00:00 (yerel)
+    - '2026-11-11T10:00:00+03:00' -> 2026-11-11 10:00:00 (yerel)
+    - '2026-11-11T10:00:00' (naive) -> 2026-11-11 10:00:00 (yerel)
+    Bozuk formatlarda HTTP 422 fırlatır.
+    """
     if val is None:
         return None
     if isinstance(val, datetime):
+        if val.tzinfo is not None and val.tzinfo.utcoffset(val) is not None:
+            return val.astimezone(FACILITY_TZ).replace(tzinfo=None)
         return val
     raw = str(val).strip()
     if not raw:
         return None
-    if len(raw) in (5, 8) and ":" in raw and "T" not in raw and "-" not in raw:
-        parts = [int(x) for x in raw.split(":")]
-        return datetime.combine(fallback_date, time(parts[0], parts[1], parts[2] if len(parts) > 2 else 0))
-    return datetime.fromisoformat(raw.replace("Z", ""))
+    if ":" in raw and "T" not in raw and "t" not in raw and "-" not in raw and " " not in raw:
+        try:
+            parts = [int(x) for x in raw.split(":")]
+            if len(parts) not in (2, 3):
+                raise ValueError("Geçersiz saat parçası")
+            return datetime.combine(
+                fallback_date,
+                time(parts[0], parts[1], parts[2] if len(parts) > 2 else 0),
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Geçersiz {field_name} formatı: '{val}'.",
+            ) from exc
+
+    iso_str = raw[:-1] + "+00:00" if raw.endswith(("Z", "z")) else raw
+    try:
+        dt = datetime.fromisoformat(iso_str)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Geçersiz {field_name} formatı: '{val}'. ISO-8601 (YYYY-AA-GGTHH:DD:SS) formatı bekleniyor.",
+        ) from exc
+
+    if dt.tzinfo is not None and dt.tzinfo.utcoffset(dt) is not None:
+        dt = dt.astimezone(FACILITY_TZ).replace(tzinfo=None)
+    return dt
 
 
 def _serialize_step(s: StudyStep, study_steps: Optional[List[StudyStep]] = None) -> dict:
@@ -144,6 +186,7 @@ def _serialize_step(s: StudyStep, study_steps: Optional[List[StudyStep]] = None)
         dep_steps = bio_info["dependent_by_ref_order"].get(s.step_order, [])
         rev_proposals = bio_info["revision_proposals"]
 
+    dev_min = bio_item.get("deviation_minutes", 0)
     return {
         "id": s.id,
         "study_id": s.study_id,
@@ -162,13 +205,21 @@ def _serialize_step(s: StudyStep, study_steps: Optional[List[StudyStep]] = None)
             s.actual_reference_time.isoformat() if getattr(s, "actual_reference_time", None) else None
         ),
         "planned_reference_time": bio_item.get("planned_reference_time"),
+        "requires_reference_time": bio_item.get("requires_reference_time", False),
+        "reference_time_role": bio_item.get("reference_time_role"),
+        "reference_time_label": bio_item.get("reference_time_label"),
         "expected_start": bio_item.get("expected_start", s.planned_start.isoformat()),
         "expected_end": bio_item.get("expected_end", s.planned_end.isoformat()),
         "expected_reference_time": bio_item.get("expected_reference_time"),
-        "reference_deviation_minutes": bio_item.get("deviation_minutes", 0),
+        "deviation_minutes": dev_min,
+        "reference_deviation_minutes": dev_min,
+        "schedule_deviation_minutes": bio_item.get("schedule_deviation_minutes", 0),
+        "actual_observation_deviation_minutes": bio_item.get("actual_observation_deviation_minutes"),
+        "tolerance_minutes": bio_item.get("tolerance_minutes", s.biological_tolerance_minutes or 0),
         "exceeds_biological_tolerance": bio_item.get("exceeds_tolerance", False),
         "requires_plan_revision": bio_item.get("requires_revision", False),
         "revision_suggestion": bio_item.get("revision_suggestion"),
+        "deviation_notes": s.deviation_notes,
         "dependent_steps": dep_steps,
         "revision_proposals": rev_proposals,
         "duration_minutes": s.duration_minutes,
@@ -950,6 +1001,7 @@ def api_get_templates(
 def api_get_steps(
     start: Optional[datetime] = Query(None, description="Başlangıç (varsayılan: şimdi)"),
     days: int = Query(14, ge=1, le=180),
+    study_id: Optional[int] = Query(None, description="Belirli bir çalışmanın adımlarını filtreler"),
     biological_only: bool = Query(False),
     include_all: bool = Query(False, description="True ise tarih filtresi uygulamadan tüm planlı adımları döner"),
     active_only: bool = Query(False, description="True ise tamamlanmış (COMPLETED) ve geçmiş (< 2026-11-03) adımları gizler"),
@@ -965,6 +1017,8 @@ def api_get_steps(
             Study.status != StudyStatus.CANCELLED,
         )
     )
+    if study_id is not None:
+        q = q.filter(StudyStep.study_id == study_id)
     if active_only:
         q = q.filter(
             StudyStep.status != StepStatus.COMPLETED,
@@ -1066,17 +1120,69 @@ def api_update_step_status(
     old_status = step.status.value
     now = datetime.utcnow()
     fallback_date = step.planned_start.date()
-    parsed_start = _parse_step_dt(payload.actual_start, fallback_date)
-    parsed_end = _parse_step_dt(payload.actual_end, fallback_date)
+    parsed_start = _parse_step_dt(payload.actual_start, fallback_date, field_name="actual_start")
+    parsed_end = _parse_step_dt(payload.actual_end, fallback_date, field_name="actual_end")
     raw_ref = (
         payload.actual_reference_time
         if payload.actual_reference_time is not None
         else (payload.biological_reference_time if payload.biological_reference_time is not None else payload.reference_time)
     )
-    parsed_ref = _parse_step_dt(raw_ref, fallback_date)
+    parsed_ref = _parse_step_dt(raw_ref, fallback_date, field_name="actual_reference_time")
+
+    target_status = payload.status if payload.status is not None else step.status
+
+    # Durum ve zaman alanları arasında tutarlılık doğrulaması (422)
+    if target_status == StepStatus.PENDING and (
+        parsed_start is not None or parsed_end is not None or parsed_ref is not None
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="PENDING (Bekliyor) durumundaki bir görev için gerçekleşen başlangıç, bitiş veya referans saati girilemez.",
+        )
+    if target_status == StepStatus.IN_PROGRESS and parsed_end is not None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="IN_PROGRESS (Devam Ediyor) durumundaki bir görev için gerçekleşen bitiş saati (actual_end) girilemez.",
+        )
+
+    check_start = parsed_start if parsed_start is not None else step.actual_start
+    check_end = parsed_end if parsed_end is not None else step.actual_end
+    check_ref = parsed_ref if parsed_ref is not None else getattr(step, "actual_reference_time", None)
+
+    if check_start is not None and check_end is not None and check_end < check_start:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"Gerçekleşen bitiş saati ({check_end.isoformat()}), "
+                f"gerçekleşen başlangıç saatinden ({check_start.isoformat()}) önce olamaz."
+            ),
+        )
+
+    if check_ref is not None and check_start is not None and check_end is not None:
+        if check_ref < check_start or check_ref > check_end:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    f"Gerçekleşen biyolojik referans/gözlem saati ({check_ref.isoformat()}), "
+                    f"görevin gerçekleşen başlangıç ({check_start.isoformat()}) ve bitiş ({check_end.isoformat()}) "
+                    f"aralığı içinde olmalıdır."
+                ),
+            )
+    elif check_ref is not None and parsed_start is not None and check_ref < parsed_start:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"Gerçekleşen biyolojik referans/gözlem saati ({check_ref.isoformat()}), "
+                f"gerçekleşen başlangıç saatinden ({parsed_start.isoformat()}) önce olamaz."
+            ),
+        )
 
     if payload.status is not None:
         step.status = payload.status
+        if payload.status == StepStatus.PENDING:
+            step.actual_start = None
+            step.actual_end = None
+            step.actual_reference_time = None
     if parsed_start is not None:
         step.actual_start = parsed_start
     if parsed_end is not None:
@@ -1089,16 +1195,28 @@ def api_update_step_status(
         step.deviation_notes = payload.notes
 
     if step.status == StepStatus.IN_PROGRESS and not step.actual_start:
-        step.actual_start = now
+        step.actual_start = step.actual_reference_time or now
     elif step.status == StepStatus.COMPLETED:
         if not step.actual_start:
-            step.actual_start = now
+            step.actual_start = step.actual_reference_time or step.actual_end or now
         if not step.actual_end:
-            step.actual_end = now
+            step.actual_end = (
+                step.actual_reference_time
+                if (step.actual_reference_time and step.actual_reference_time >= step.actual_start)
+                else max(step.actual_start, now)
+            )
 
     db.flush()
     if step.study is not None:
         revalidate_study_conflicts(db, step.study, preserve_weekend_approvals=True)
+        if parsed_ref is not None:
+            other_studies = (
+                db.query(Study)
+                .filter(Study.id != step.study.id, Study.status.in_(COMPARED_STUDY_STATUSES))
+                .all()
+            )
+            for other_st in other_studies:
+                revalidate_study_conflicts(db, other_st, preserve_weekend_approvals=True)
 
     db.add(AuditLog(
         user_id=current_user.id,
@@ -1169,37 +1287,50 @@ def api_get_summary(
         StudyStep.planned_start <= day_end,
         StudyStep.planned_end >= day_start,
     ).count()
-    total_planned_tasks = (
-        db.query(StudyStep)
-        .join(StudyStep.study)
-        .filter(
-            StudyStep.status != StepStatus.CANCELLED,
-            Study.status != StudyStatus.CANCELLED,
-        )
-        .count()
-    )
-    active_pending_tasks = (
-        db.query(StudyStep)
-        .join(StudyStep.study)
-        .filter(
-            StudyStep.status != StepStatus.CANCELLED,
-            StudyStep.status != StepStatus.COMPLETED,
-            Study.status != StudyStatus.CANCELLED,
-            Study.status != StudyStatus.COMPLETED,
-        )
-        .count()
-    )
-    completed_tasks = (
-        db.query(StudyStep)
-        .join(StudyStep.study)
-        .filter(
-            StudyStep.status == StepStatus.COMPLETED,
-            Study.status != StudyStatus.CANCELLED,
-        )
-        .count()
-    )
 
     from app.models.sample import SampleRecord
+
+    samples_by_code = {
+        (sr.study_code or "").strip().upper(): sr
+        for sr in db.query(SampleRecord).all()
+    }
+    all_non_cancelled_steps = (
+        db.query(StudyStep)
+        .join(StudyStep.study)
+        .options(selectinload(StudyStep.study))
+        .filter(
+            StudyStep.status != StepStatus.CANCELLED,
+            Study.status != StudyStatus.CANCELLED,
+        )
+        .all()
+    )
+    total_planned_tasks = len(all_non_cancelled_steps)
+    verified_completed_tasks = 0
+    historical_completed_tasks = 0
+    historical_excluded_tasks = 0
+    active_pending_tasks = 0
+    for st_step in all_non_cancelled_steps:
+        st_parent = st_step.study
+        sr_row = samples_by_code.get((st_parent.study_code or "").strip().upper()) if st_parent else None
+        if st_step.status == StepStatus.COMPLETED:
+            has_verified_actual = (
+                st_step.actual_start is not None
+                or st_step.actual_end is not None
+                or getattr(st_step, "actual_reference_time", None) is not None
+            )
+            is_hist_marker = "[HISTORICAL_IMPORT_COMPLETED]" in (st_step.deviation_notes or "")
+            if has_verified_actual and not is_hist_marker:
+                verified_completed_tasks += 1
+            else:
+                historical_completed_tasks += 1
+        else:
+            if st_parent and st_parent.status != StudyStatus.COMPLETED:
+                if is_historical_unverified_step(st_step, st_parent, sr_row, REFERENCE_DATE):
+                    historical_excluded_tasks += 1
+                else:
+                    active_pending_tasks += 1
+
+    completed_tasks = verified_completed_tasks
 
     ongoing_rows = db.query(SampleRecord).filter(SampleRecord.stored_status == "ONGOING").all()
     ongoing_in_experiment = 0
@@ -1230,6 +1361,8 @@ def api_get_summary(
         "total_planned_tasks": total_planned_tasks,
         "active_pending_tasks": active_pending_tasks,
         "completed_tasks": completed_tasks,
+        "historical_completed_tasks": historical_completed_tasks,
+        "historical_excluded_tasks": historical_excluded_tasks,
     }
 
 

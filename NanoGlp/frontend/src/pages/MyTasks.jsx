@@ -9,6 +9,7 @@ import {
   RefreshCw,
   AlertTriangle,
   FlaskConical,
+  Save,
 } from 'lucide-react';
 import { getMyTasks, updateStepStatus, extractError } from '../services/api';
 import { useAuth } from '../state/AuthContext';
@@ -22,6 +23,27 @@ const STATUS_BADGE = {
   DELAYED: { label: 'Gecikti', cls: 'bg-red-50 text-red-700 border-red-200' },
 };
 
+function toLocalInputValue(isoStr) {
+  if (!isoStr) return '';
+  return String(isoStr).slice(0, 16);
+}
+
+function buildCompatibleBounds(task, refIso, targetStatus) {
+  if (!refIso) return {};
+  const refNorm = refIso.length === 16 ? `${refIso}:00` : refIso;
+  const pStart = task.actual_start || task.planned_start || refNorm;
+  const pEnd = task.actual_end || task.planned_end || refNorm;
+  const effStart = refNorm < pStart ? refNorm : pStart;
+  const effEnd = refNorm > pEnd ? refNorm : pEnd;
+  if (targetStatus === 'IN_PROGRESS') {
+    return { actual_start: effStart };
+  }
+  return {
+    actual_start: effStart,
+    actual_end: effEnd < effStart ? effStart : effEnd,
+  };
+}
+
 export default function MyTasks() {
   const { user, isReadOnly } = useAuth();
   const { t, tr, lang, formatStatusBadge } = usePreferences();
@@ -30,13 +52,40 @@ export default function MyTasks() {
   const [loading, setLoading] = useState(true);
   const [updatingId, setUpdatingId] = useState(null);
   const [error, setError] = useState(null);
+  const [refInputs, setRefInputs] = useState({});
+  const [noteInputs, setNoteInputs] = useState({});
+  const [savedNoticeId, setSavedNoticeId] = useState(null);
 
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
       const res = await getMyTasks(targetDate);
-      setData(res.data);
+      const payload = res.data;
+      setData(payload);
+      const all = payload?.all_assigned_tasks || [];
+      setRefInputs((prev) => {
+        const next = { ...prev };
+        for (const step of all) {
+          if (step.actual_reference_time) {
+            next[step.id] = toLocalInputValue(step.actual_reference_time);
+          } else if (!next[step.id]) {
+            next[step.id] = toLocalInputValue(
+              step.expected_reference_time || step.planned_reference_time || step.planned_start
+            );
+          }
+        }
+        return next;
+      });
+      setNoteInputs((prev) => {
+        const next = { ...prev };
+        for (const step of all) {
+          if (step.deviation_notes != null) {
+            next[step.id] = step.deviation_notes;
+          }
+        }
+        return next;
+      });
     } catch (err) {
       setError(extractError(err, 'Görev listesi alınamadı.'));
     } finally {
@@ -48,15 +97,64 @@ export default function MyTasks() {
     load();
   }, [load]);
 
-  const handleStatusChange = async (stepId, nextStatus) => {
+  const handleStatusChange = async (taskOrId, nextStatus) => {
     if (isReadOnly) return;
+    const taskObj =
+      typeof taskOrId === 'object' && taskOrId !== null
+        ? taskOrId
+        : (data?.all_assigned_tasks || []).find((x) => x.id === taskOrId) || { id: taskOrId };
+    const stepId = taskObj.id;
     setUpdatingId(stepId);
     setError(null);
     try {
-      await updateStepStatus(stepId, { status: nextStatus });
+      const body = { status: nextStatus };
+      const refVal = (refInputs[stepId] || '').trim();
+      const noteVal = (noteInputs[stepId] || '').trim();
+      if (taskObj.requires_reference_time && refVal && nextStatus !== 'PENDING') {
+        const refIso = refVal.length === 16 ? `${refVal}:00` : refVal;
+        body.actual_reference_time = refIso;
+        Object.assign(body, buildCompatibleBounds(taskObj, refIso, nextStatus));
+      }
+      if (noteVal) {
+        body.deviation_notes = noteVal;
+      }
+      await updateStepStatus(stepId, body);
+      setSavedNoticeId(stepId);
       await load();
     } catch (err) {
       setError(extractError(err, 'Görev durumu güncellenemedi.'));
+    } finally {
+      setUpdatingId(null);
+    }
+  };
+
+  const handleSaveReferenceTime = async (task) => {
+    if (isReadOnly) return;
+    const stepId = task.id;
+    const refVal = (refInputs[stepId] || '').trim();
+    if (!refVal) {
+      setError('Lütfen geçerli bir biyolojik referans / gözlem saati girin.');
+      return;
+    }
+    setUpdatingId(stepId);
+    setError(null);
+    try {
+      const refIso = refVal.length === 16 ? `${refVal}:00` : refVal;
+      const effectiveStatus = task.status === 'PENDING' ? 'COMPLETED' : task.status;
+      const body = {
+        status: effectiveStatus,
+        actual_reference_time: refIso,
+        ...buildCompatibleBounds(task, refIso, effectiveStatus),
+      };
+      const noteVal = (noteInputs[stepId] || '').trim();
+      if (noteVal) {
+        body.deviation_notes = noteVal;
+      }
+      await updateStepStatus(stepId, body);
+      setSavedNoticeId(stepId);
+      await load();
+    } catch (err) {
+      setError(extractError(err, 'Biyolojik referans saati kaydedilemedi.'));
     } finally {
       setUpdatingId(null);
     }
@@ -75,6 +173,123 @@ export default function MyTasks() {
   }, [allAssignedTasks]);
 
   const lockedCount = allAssignedTasks.filter((t) => t.is_biological_fixed_time).length;
+
+  const renderReferenceTimePanel = (task) => {
+    if (!task.requires_reference_time) return null;
+    const busy = updatingId === task.id;
+    const devMin = task.deviation_minutes ?? task.reference_deviation_minutes ?? 0;
+    const exceedsTol = Boolean(task.exceeds_biological_tolerance);
+    const roleLabel =
+      task.reference_time_label ||
+      (task.reference_time_role === 'SOURCE'
+        ? 'Uygulama / Enjeksiyon Referans Saati'
+        : 'Gerçekleşen Gözlem / Ölçüm Saati');
+
+    return (
+      <div
+        data-testid={`ref-time-panel-${task.id}`}
+        className="mt-2.5 p-3 rounded-md bg-slate-50 border border-slate-200 space-y-2 text-xs"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="font-semibold text-slate-800">{roleLabel}</span>
+            {task.planned_reference_time && (
+              <span className="text-slate-500">
+                Planlanan: <strong className="font-mono text-slate-700">{fmtDateTime(task.planned_reference_time)}</strong>
+              </span>
+            )}
+            {task.expected_start && task.expected_start !== task.planned_start && (
+              <span className="px-2 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-200 font-medium">
+                Beklenen Pencere: {fmtDateTime(task.expected_start)} – {fmtTime(task.expected_end)}
+              </span>
+            )}
+          </div>
+
+          {task.actual_reference_time ? (
+            <div className="flex flex-wrap items-center gap-1.5" data-testid={`recorded-ref-time-${task.id}`}>
+              <span className="px-2 py-0.5 rounded bg-emerald-50 text-emerald-800 border border-emerald-200 font-mono font-semibold">
+                Kaydedilen: {fmtDateTime(task.actual_reference_time)}
+              </span>
+              <span
+                data-testid={`ref-deviation-badge-${task.id}`}
+                className={`px-2 py-0.5 rounded font-semibold border ${
+                  exceedsTol
+                    ? 'bg-red-50 text-red-700 border-red-200'
+                    : devMin !== 0
+                    ? 'bg-amber-50 text-amber-800 border-amber-200'
+                    : 'bg-blue-50 text-blue-700 border-blue-200'
+                }`}
+              >
+                Sapma: {devMin > 0 ? `+${devMin}` : devMin} dk{' '}
+                {exceedsTol ? '(Tolerans Aşımı!)' : `(±${task.biological_tolerance_minutes} dk içinde)`}
+              </span>
+            </div>
+          ) : (
+            <span className="text-amber-700 font-medium">
+              Henüz gerçekleşen biyolojik referans / gözlem saati girilmedi
+            </span>
+          )}
+        </div>
+
+        {task.deviation_notes && (
+          <p className="text-[11px] text-slate-600">
+            <strong>Sapma / GLP Notu:</strong> {task.deviation_notes}
+          </p>
+        )}
+
+        {task.revision_suggestion && (
+          <p className="text-[11px] text-amber-800 bg-amber-50/70 px-2 py-1 rounded border border-amber-200">
+            {task.revision_suggestion}
+          </p>
+        )}
+
+        {!isReadOnly && (
+          <div className="flex flex-wrap items-center gap-2 pt-1">
+            <label className="text-[11px] font-medium text-slate-600">
+              Gerçekleşen Saat:
+              <input
+                type="datetime-local"
+                data-testid={`ref-time-input-${task.id}`}
+                value={refInputs[task.id] || ''}
+                onChange={(e) =>
+                  setRefInputs((prev) => ({
+                    ...prev,
+                    [task.id]: e.target.value,
+                  }))
+                }
+                className="ml-1.5 border border-slate-300 rounded px-2 py-1 text-xs font-mono bg-white"
+              />
+            </label>
+            <input
+              type="text"
+              data-testid={`deviation-note-input-${task.id}`}
+              placeholder="Sapma / GLP açıklama notu (opsiyonel)"
+              value={noteInputs[task.id] || ''}
+              onChange={(e) =>
+                setNoteInputs((prev) => ({
+                  ...prev,
+                  [task.id]: e.target.value,
+                }))
+              }
+              className="border border-slate-300 rounded px-2.5 py-1 text-xs bg-white min-w-[220px] flex-1"
+            />
+            <button
+              type="button"
+              disabled={busy}
+              data-testid={`save-ref-time-btn-${task.id}`}
+              onClick={() => handleSaveReferenceTime(task)}
+              className="inline-flex items-center gap-1 text-xs font-semibold px-3 py-1.5 rounded bg-blue-600 hover:bg-blue-700 text-white disabled:opacity-50"
+            >
+              <Save className="w-3.5 h-3.5" /> Referans Saatini Kaydet
+            </button>
+            {savedNoticeId === task.id && (
+              <span className="text-[11px] font-semibold text-emerald-700">✓ Kaydedildi</span>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  };
 
   return (
     <div className="space-y-6">
@@ -231,61 +446,64 @@ export default function MyTasks() {
               const badge = STATUS_BADGE[task.status] || STATUS_BADGE.PENDING;
               const busy = updatingId === task.id;
               return (
-                <li key={task.id} className="px-5 py-4 flex flex-wrap items-center justify-between gap-4 hover:bg-slate-50">
-                  <div className="space-y-1">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="font-mono text-xs font-bold px-2 py-0.5 rounded bg-blue-50 text-blue-800 border border-blue-200">
-                        {task.study_code}
-                      </span>
-                      <span className="font-mono text-xs px-1.5 py-0.5 rounded bg-slate-100 text-slate-700">
-                        Gün {task.study_day}
-                      </span>
-                      {task.study_status === 'DRAFT' && (
-                        <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-200">
-                          TASLAK PLAN
+                <li key={task.id} className="px-5 py-4 hover:bg-slate-50">
+                  <div className="flex flex-wrap items-center justify-between gap-4">
+                    <div className="space-y-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-mono text-xs font-bold px-2 py-0.5 rounded bg-blue-50 text-blue-800 border border-blue-200">
+                          {task.study_code}
                         </span>
-                      )}
-                      {task.is_biological_fixed_time && (
-                        <span className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded bg-indigo-50 text-indigo-800 border border-indigo-200">
-                          <Lock className="w-3 h-3" /> Biyolojik Kilitli (±{task.biological_tolerance_minutes} dk)
+                        <span className="font-mono text-xs px-1.5 py-0.5 rounded bg-slate-100 text-slate-700">
+                          Gün {task.study_day}
                         </span>
-                      )}
-                      <span className={`text-[11px] font-semibold px-2 py-0.5 rounded border ${badge.cls}`}>
-                        {badge.label}
-                      </span>
+                        {task.study_status === 'DRAFT' && (
+                          <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-200">
+                            TASLAK PLAN
+                          </span>
+                        )}
+                        {task.is_biological_fixed_time && (
+                          <span className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded bg-indigo-50 text-indigo-800 border border-indigo-200">
+                            <Lock className="w-3 h-3" /> Biyolojik Kilitli (±{task.biological_tolerance_minutes} dk)
+                          </span>
+                        )}
+                        <span className={`text-[11px] font-semibold px-2 py-0.5 rounded border ${badge.cls}`}>
+                          {badge.label}
+                        </span>
+                      </div>
+                      <p className="text-sm font-semibold text-slate-900">{task.step_name}</p>
+                      <p className="text-xs text-slate-500">
+                        Saat: <strong className="text-slate-700">{fmtTime(task.planned_start)} – {fmtTime(task.planned_end)}</strong>
+                        {' · '}Süre: {fmtMinutes(task.duration_minutes)}
+                        {' · '}Görevliler: {task.assignee_names?.join(', ')}
+                      </p>
                     </div>
-                    <p className="text-sm font-semibold text-slate-900">{task.step_name}</p>
-                    <p className="text-xs text-slate-500">
-                      Saat: <strong className="text-slate-700">{fmtTime(task.planned_start)} – {fmtTime(task.planned_end)}</strong>
-                      {' · '}Süre: {fmtMinutes(task.duration_minutes)}
-                      {' · '}Görevliler: {task.assignee_names?.join(', ')}
-                    </p>
-                  </div>
 
-                  {!isReadOnly && (
-                    <div className="flex items-center gap-2">
-                      {task.status === 'PENDING' && (
-                        <button
-                          type="button"
-                          disabled={busy}
-                          onClick={() => handleStatusChange(task.id, 'IN_PROGRESS')}
-                          className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-md bg-slate-900 hover:bg-slate-800 text-white disabled:opacity-50"
-                        >
-                          <Play className="w-3.5 h-3.5" /> Başlat
-                        </button>
-                      )}
-                      {task.status !== 'COMPLETED' && (
-                        <button
-                          type="button"
-                          disabled={busy}
-                          onClick={() => handleStatusChange(task.id, 'COMPLETED')}
-                          className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-md bg-emerald-600 hover:bg-emerald-700 text-white disabled:opacity-50"
-                        >
-                          <CheckCircle2 className="w-3.5 h-3.5" /> Tamamla
-                        </button>
-                      )}
-                    </div>
-                  )}
+                    {!isReadOnly && (
+                      <div className="flex items-center gap-2">
+                        {task.status === 'PENDING' && (
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() => handleStatusChange(task, 'IN_PROGRESS')}
+                            className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-md bg-slate-900 hover:bg-slate-800 text-white disabled:opacity-50"
+                          >
+                            <Play className="w-3.5 h-3.5" /> Başlat
+                          </button>
+                        )}
+                        {task.status !== 'COMPLETED' && (
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() => handleStatusChange(task, 'COMPLETED')}
+                            className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-md bg-emerald-600 hover:bg-emerald-700 text-white disabled:opacity-50"
+                          >
+                            <CheckCircle2 className="w-3.5 h-3.5" /> Tamamla
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                  {renderReferenceTimePanel(task)}
                 </li>
               );
             })}
@@ -325,6 +543,7 @@ export default function MyTasks() {
                   const badge = STATUS_BADGE[t.status] || STATUS_BADGE.PENDING;
                   const busy = updatingId === t.id;
                   const stepDate = t.planned_start.slice(0, 10);
+                  const devMin = t.deviation_minutes ?? t.reference_deviation_minutes ?? 0;
                   return (
                     <tr key={t.id} className="hover:bg-slate-50">
                       <td className="px-5 py-3 whitespace-nowrap">
@@ -335,6 +554,11 @@ export default function MyTasks() {
                         >
                           {fmtDateTime(t.planned_start)}
                         </button>
+                        {t.actual_reference_time && (
+                          <div className="text-[11px] font-mono text-emerald-700 mt-0.5">
+                            Ref: {fmtDateTime(t.actual_reference_time)} ({devMin > 0 ? `+${devMin}` : devMin} dk)
+                          </div>
+                        )}
                       </td>
                       <td className="px-5 py-3 font-mono text-xs text-slate-700">
                         {t.study_code}
@@ -370,7 +594,7 @@ export default function MyTasks() {
                               type="button"
                               disabled={busy}
                               onClick={() =>
-                                handleStatusChange(t.id, t.status === 'PENDING' ? 'IN_PROGRESS' : 'COMPLETED')
+                                handleStatusChange(t, t.status === 'PENDING' ? 'IN_PROGRESS' : 'COMPLETED')
                               }
                               className="text-xs font-medium text-blue-700 hover:text-blue-900 disabled:opacity-40"
                             >

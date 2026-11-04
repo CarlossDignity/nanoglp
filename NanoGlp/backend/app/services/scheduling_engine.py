@@ -425,6 +425,57 @@ def compute_friday_alignment_offset(acclimatization_start_date: date, min_offset
     return start_offset + ((4 - base_ex_date.weekday()) % 7)
 
 
+def get_study_extraction_usage(study: Optional[Study]) -> Dict[str, Any]:
+    """
+    Bir çalışmanın Polar (Su Banyosu) ve Apolar (Kabin) ekstraksiyon kullanım durumunu tek merkezden hesaplar.
+    `None` (henüz girilmemiş / bilinmeyen bilgi) ASLA `True` (kesin polar kullanımı) olarak varsayılmaz:
+      * extraction_polar is True     -> Su Banyosu kullanılır
+      * extraction_non_polar is True -> Apolar Kabin kullanılır
+      * False                        -> İlgili cihaz kullanılmaz
+      * None                         -> Ekstraksiyon bilgisi eksik/belirsizdir
+    """
+    if study is None:
+        return {
+            "uses_polar": False,
+            "uses_apolar": False,
+            "uses_water_bath": False,
+            "uses_apolar_cabinet": False,
+            "missing_extraction_info": True,
+            "status": "MISSING",
+            "message": "Çalışmanın polar/apolar ekstraksiyon çözücü bilgisi henüz girilmedi.",
+        }
+    polar = getattr(study, "extraction_polar", None)
+    apolar = getattr(study, "extraction_non_polar", None)
+    uses_polar = polar is True
+    uses_apolar = apolar is True
+    missing = polar is None and apolar is None
+    if missing:
+        status_code = "MISSING"
+        msg = "Ekstraksiyon çözücü bilgisi (Polar / Apolar) eksik; cihaz kullanımı varsayılmadı."
+    elif uses_polar and uses_apolar:
+        status_code = "POLAR_AND_APOLAR"
+        msg = "Polar (Su Banyosu) ve Apolar (Kabin) ekstraksiyon birlikte kullanılıyor."
+    elif uses_polar:
+        status_code = "POLAR_ONLY"
+        msg = "Yalnızca Polar (Su Banyosu) ekstraksiyon kullanılıyor."
+    elif uses_apolar:
+        status_code = "APOLAR_ONLY"
+        msg = "Yalnızca Apolar (Kabin) ekstraksiyon kullanılıyor (Su Banyosu kullanılmaz)."
+    else:
+        status_code = "NO_EXTRACTION_EQUIPMENT"
+        msg = "Polar veya Apolar ekstraksiyon cihazı kullanılmıyor."
+
+    return {
+        "uses_polar": uses_polar,
+        "uses_apolar": uses_apolar,
+        "uses_water_bath": uses_polar,
+        "uses_apolar_cabinet": uses_apolar,
+        "missing_extraction_info": missing,
+        "status": status_code,
+        "message": msg,
+    }
+
+
 def _find_next_available_water_bath_offset(
     db: Session,
     study: Study,
@@ -439,6 +490,7 @@ def _find_next_available_water_bath_offset(
     """
     max_polar = water_bath.polar_capacity or 3
     max_apolar = water_bath.non_polar_capacity or 1
+    study_ext = get_study_extraction_usage(study)
     ex_steps = [ex for ex in existing_steps if ex.step_type == "Ekstraksiyon" or "Ekstraksiyon" in ex.step_name]
 
     for candidate_offset in range(max(0, current_offset) + 1, max(0, current_offset) + 60):
@@ -452,13 +504,14 @@ def _find_next_available_water_bath_offset(
             other_start = ex.planned_start
             other_end = other_start + timedelta(hours=72)
             if _overlap_minutes(wb_start, wb_end, other_start, other_end) > 0:
-                if ex.study.extraction_non_polar is True:
+                ex_ext = get_study_extraction_usage(getattr(ex, "study", None))
+                if ex_ext["uses_apolar"]:
                     apolar_busy += 1
-                if ex.study.extraction_polar is True:
+                if ex_ext["uses_polar"]:
                     polar_busy += 1
 
-        apolar_ok = (study.extraction_non_polar is not True) or (1 + apolar_busy <= max_apolar)
-        polar_ok = (study.extraction_polar is not True) or (1 + polar_busy <= max_polar)
+        apolar_ok = (not study_ext["uses_apolar"]) or (1 + apolar_busy <= max_apolar)
+        polar_ok = (not study_ext["uses_polar"]) or (1 + polar_busy <= max_polar)
         if apolar_ok and polar_ok:
             return candidate_offset, cand_ex_date
 
@@ -635,6 +688,43 @@ def build_conflict_resolutions(
     return resolutions
 
 
+def is_historical_unverified_step(
+    step: StudyStep,
+    study: Optional[Study] = None,
+    sample: Optional[Any] = None,
+    ref_date: date = REFERENCE_DATE,
+) -> bool:
+    """
+    Excel/demo geçmiş içe aktarımından gelen ve referans tarihten (2026-11-03) önceye
+    planlanmış olup gerçekleşme detayı bilinmeyen (tamamlanmamış, actual_start/end/ref girilmemiş)
+    adımları tespit eder. Bu adımlar COMPLETED yapılmaz ve tamamlanan görev istatistiğine
+    eklenmez; ancak aktif çakışma ekranını eski belirsiz kayıtlarla doldurmamak için aktif
+    çakışma hesabından hariç tutulur.
+    Normal (canlı) çalışmaların gecikmiş/açık geçmiş adımları buraya GİRMEZ.
+    """
+    if step is None or step.status in (StepStatus.COMPLETED, StepStatus.CANCELLED):
+        return False
+    if (
+        getattr(step, "actual_start", None) is not None
+        or getattr(step, "actual_end", None) is not None
+        or getattr(step, "actual_reference_time", None) is not None
+    ):
+        return False
+    st = study or getattr(step, "study", None)
+    if st is None:
+        return False
+    meta = st.dossier_metadata if isinstance(getattr(st, "dossier_metadata", None), dict) else {}
+    if not (meta.get("historical_excel_import") or meta.get("is_historical_demo")):
+        return False
+    if step.planned_start and step.planned_start.date() < ref_date:
+        return True
+    if sample is not None:
+        exp_end = getattr(sample, "experiment_end_date", None)
+        if exp_end is not None and exp_end < ref_date:
+            return True
+    return False
+
+
 def compute_biological_dependency_info(
     study: Study,
     steps: List[StudyStep],
@@ -643,8 +733,9 @@ def compute_biological_dependency_info(
     """
     Biyolojik referans adımı (örn. Gün 7 Uygulama / Enjeksiyon) ile ona bağlı 24/48/72. saat
     gözlem adımları arasındaki ilişkiyi hesaplar.
-    Onaylanmış plan saatlerini (planned_start / planned_end) DEĞİŞTİRMEZ; beklenen saatleri ve
-    revizyon önerilerini hesaplayıp döner.
+    Onaylanmış plan saatlerini (planned_start / planned_end) DEĞİŞTİRMEZ; beklenen saatleri,
+    kaynak adım sapmasını, bağımlı gözlem toleransını ve gerçekleşen gözlem zamanı denetimini
+    birbirinden ayrı hesaplayıp döner.
     """
     if template is None:
         try:
@@ -659,6 +750,7 @@ def compute_biological_dependency_info(
     by_step_id: Dict[int, Dict[str, Any]] = {}
     dependent_by_ref_order: Dict[int, List[Dict[str, Any]]] = {}
     revision_proposals: List[Dict[str, Any]] = []
+    ref_exceeds_any = False
 
     for s in steps:
         ts = ts_by_order.get(s.step_order)
@@ -671,63 +763,123 @@ def compute_biological_dependency_info(
         actual_ref_dt: Optional[datetime] = getattr(s, "actual_reference_time", None)
         ref_order = getattr(ts, "reference_step_order", None) if ts else None
         offset_hours = getattr(ts, "reference_offset_hours", None) if ts else None
+        is_dep_obs = bool(ref_order is not None and offset_hours is not None)
+        requires_ref_time = bool(is_ref or is_dep_obs)
+        ref_time_role = "SOURCE" if is_ref else ("DEPENDENT_OBSERVATION" if is_dep_obs else None)
+        ref_time_label = (
+            "Uygulama / Enjeksiyon Referans Saati"
+            if is_ref
+            else ("Gerçekleşen Gözlem / Ölçüm Saati" if is_dep_obs else None)
+        )
 
         expected_start = s.planned_start
         expected_end = s.planned_end
         deviation_minutes = 0
+        schedule_deviation_minutes = 0
         exceeds_tol = False
+        source_exceeds_tol = False
+        schedule_exceeds_dep_tol = False
+        actual_obs_dev_min: Optional[int] = None
+        actual_obs_exceeds_tol = False
+        missing_actual_obs_time = False
         requires_revision = False
         revision_suggestion: Optional[str] = None
 
         if is_ref:
             if actual_ref_dt is not None and planned_ref_dt is not None:
                 deviation_minutes = int(round((actual_ref_dt - planned_ref_dt).total_seconds() / 60.0))
-                exceeds_tol = abs(deviation_minutes) > (s.biological_tolerance_minutes or 0)
-        elif ref_order is not None and offset_hours is not None:
+                schedule_deviation_minutes = deviation_minutes
+                ref_tol = s.biological_tolerance_minutes or 0
+                exceeds_tol = abs(deviation_minutes) > ref_tol
+                source_exceeds_tol = exceeds_tol
+                if exceeds_tol:
+                    ref_exceeds_any = True
+        elif is_dep_obs:
+            dep_tol = s.biological_tolerance_minutes or 0
             ref_step = step_by_order.get(ref_order)
             ts_ref = ts_by_order.get(ref_order)
-            if ref_step is not None:
-                ref_actual = getattr(ref_step, "actual_reference_time", None)
-                if ref_actual is not None:
-                    expected_start = ref_actual + timedelta(hours=float(offset_hours))
-                    expected_end = expected_start + timedelta(minutes=s.duration_minutes)
-                    deviation_minutes = int(round((expected_start - s.planned_start).total_seconds() / 60.0))
-                    ref_tol = ref_step.biological_tolerance_minutes or 0
-                    dep_tol = s.biological_tolerance_minutes or 0
-                    exceeds_tol = abs(deviation_minutes) > dep_tol or abs(deviation_minutes) > ref_tol
-                    requires_revision = deviation_minutes != 0 and (exceeds_tol or s.is_biological_fixed_time)
-                    if deviation_minutes != 0:
-                        revision_suggestion = (
-                            f"Referans adım ({_fmt(ref_actual)}) baz alınarak +{int(offset_hours)}. saat "
-                            f"'{s.step_name}' adımının {_fmt(expected_start)}–{expected_end:%H:%M} aralığına "
-                            f"revize edilmesi önerilir (mevcut plan: {_fmt(s.planned_start)}–{s.planned_end:%H:%M}, "
-                            f"sapma: {deviation_minutes:+d} dk)."
-                        )
-                    dep_entry = {
-                        "step_id": s.id,
-                        "step_order": s.step_order,
-                        "study_day": s.study_day,
-                        "step_name": s.step_name,
-                        "reference_step_order": ref_order,
-                        "offset_hours": offset_hours,
-                        "planned_start": s.planned_start.isoformat(),
-                        "planned_end": s.planned_end.isoformat(),
-                        "expected_start": expected_start.isoformat(),
-                        "expected_end": expected_end.isoformat(),
-                        "expected_reference_time": expected_start.isoformat(),
-                        "deviation_minutes": deviation_minutes,
-                        "tolerance_minutes": s.biological_tolerance_minutes,
-                        "exceeds_tolerance": exceeds_tol,
-                        "requires_revision": requires_revision,
-                        "revision_suggestion": revision_suggestion,
-                    }
-                    dependent_by_ref_order.setdefault(ref_order, []).append(dep_entry)
-                    if requires_revision:
-                        revision_proposals.append(dep_entry)
+            ref_actual = getattr(ref_step, "actual_reference_time", None) if ref_step is not None else None
+            if ref_step is not None and ref_actual is not None:
+                ref_planned_tod = getattr(ts_ref, "reference_event_time", None) if ts_ref else None
+                ref_planned_dt = (
+                    datetime.combine(ref_step.planned_start.date(), ref_planned_tod or ref_step.planned_start.time())
+                    if ref_step.planned_start
+                    else None
+                )
+                ref_tol = ref_step.biological_tolerance_minutes or 0
+                if ref_planned_dt is not None:
+                    ref_dev_min = int(round((ref_actual - ref_planned_dt).total_seconds() / 60.0))
+                    source_exceeds_tol = abs(ref_dev_min) > ref_tol
+
+                expected_start = ref_actual + timedelta(hours=float(offset_hours))
+                expected_end = expected_start + timedelta(minutes=s.duration_minutes)
+                schedule_deviation_minutes = int(round((expected_start - s.planned_start).total_seconds() / 60.0))
+                # Bağımlı gözlemin planlanan saatten kayması YALNIZCA gözlemin kendi toleransına (dep_tol) göre değerlendirilir
+                schedule_exceeds_dep_tol = abs(schedule_deviation_minutes) > dep_tol
+
+            # Gözlemin gerçek yapılma zamanı (actual_reference_time) beklenen biyolojik saate (expected_start) göre denetlenir
+            if actual_ref_dt is not None and expected_start is not None:
+                actual_obs_dev_min = int(round((actual_ref_dt - expected_start).total_seconds() / 60.0))
+                actual_obs_exceeds_tol = abs(actual_obs_dev_min) > dep_tol
+                deviation_minutes = actual_obs_dev_min
+                exceeds_tol = actual_obs_exceeds_tol
+            else:
+                deviation_minutes = schedule_deviation_minutes
+                exceeds_tol = schedule_exceeds_dep_tol
+                if s.status == StepStatus.COMPLETED and actual_ref_dt is None:
+                    missing_actual_obs_time = True
+
+            if ref_step is not None and ref_actual is not None:
+                requires_revision = schedule_deviation_minutes != 0 and (
+                    schedule_exceeds_dep_tol or s.is_biological_fixed_time
+                )
+                if schedule_deviation_minutes != 0:
+                    revision_suggestion = (
+                        f"Referans adım ({_fmt(ref_actual)}) baz alınarak +{int(offset_hours)}. saat "
+                        f"'{s.step_name}' adımının {_fmt(expected_start)}–{expected_end:%H:%M} aralığına "
+                        f"revize edilmesi önerilir (mevcut plan: {_fmt(s.planned_start)}–{s.planned_end:%H:%M}, "
+                        f"sapma: {schedule_deviation_minutes:+d} dk)."
+                    )
+                dep_entry = {
+                    "step_id": s.id,
+                    "step_order": s.step_order,
+                    "study_day": s.study_day,
+                    "step_name": s.step_name,
+                    "reference_step_order": ref_order,
+                    "offset_hours": offset_hours,
+                    "planned_start": s.planned_start.isoformat(),
+                    "planned_end": s.planned_end.isoformat(),
+                    "expected_start": expected_start.isoformat(),
+                    "expected_end": expected_end.isoformat(),
+                    "expected_reference_time": expected_start.isoformat(),
+                    "actual_reference_time": actual_ref_dt.isoformat() if actual_ref_dt else None,
+                    "deviation_minutes": deviation_minutes,
+                    "schedule_deviation_minutes": schedule_deviation_minutes,
+                    "actual_observation_deviation_minutes": actual_obs_dev_min,
+                    "tolerance_minutes": s.biological_tolerance_minutes,
+                    "exceeds_tolerance": exceeds_tol,
+                    "source_exceeds_tolerance": source_exceeds_tol,
+                    "schedule_exceeds_dependent_tolerance": schedule_exceeds_dep_tol,
+                    "actual_observation_exceeds_tolerance": actual_obs_exceeds_tol,
+                    "missing_actual_observation_time": missing_actual_obs_time,
+                    "requires_revision": requires_revision,
+                    "revision_suggestion": revision_suggestion,
+                }
+                dependent_by_ref_order.setdefault(ref_order, []).append(dep_entry)
+                if requires_revision:
+                    revision_proposals.append(dep_entry)
 
         by_step_id[s.id] = {
             "is_biological_reference": is_ref,
-            "planned_reference_time": planned_ref_dt.isoformat() if planned_ref_dt else None,
+            "is_dependent_observation": is_dep_obs,
+            "requires_reference_time": requires_ref_time,
+            "reference_time_role": ref_time_role,
+            "reference_time_label": ref_time_label,
+            "planned_reference_time": (
+                planned_ref_dt.isoformat()
+                if planned_ref_dt
+                else (s.planned_start.isoformat() if (is_dep_obs and s.planned_start) else None)
+            ),
             "actual_reference_time": actual_ref_dt.isoformat() if actual_ref_dt else None,
             "reference_step_order": ref_order,
             "offset_hours": offset_hours,
@@ -739,16 +891,66 @@ def compute_biological_dependency_info(
                 else (planned_ref_dt.isoformat() if (is_ref and planned_ref_dt) else (expected_start.isoformat() if expected_start else None))
             ),
             "deviation_minutes": deviation_minutes,
+            "schedule_deviation_minutes": schedule_deviation_minutes,
+            "actual_observation_deviation_minutes": actual_obs_dev_min,
             "exceeds_tolerance": exceeds_tol,
+            "source_exceeds_tolerance": source_exceeds_tol,
+            "schedule_exceeds_dependent_tolerance": schedule_exceeds_dep_tol,
+            "actual_observation_exceeds_tolerance": actual_obs_exceeds_tol,
+            "missing_actual_observation_time": missing_actual_obs_time,
             "requires_revision": requires_revision,
             "revision_suggestion": revision_suggestion,
         }
 
+    all_dep_steps = [item for sub in dependent_by_ref_order.values() for item in sub]
     return {
         "by_step_id": by_step_id,
         "dependent_by_ref_order": dependent_by_ref_order,
+        "dependent_steps": all_dep_steps,
         "revision_proposals": revision_proposals,
+        "ref_exceeds_tolerance": ref_exceeds_any,
     }
+
+
+def _build_other_studies_expected_windows(
+    existing_steps: List[StudyStep],
+) -> Dict[int, Tuple[datetime, datetime]]:
+    """
+    Diğer çalışmalardaki referans saat gecikmeleri nedeniyle kaymış beklenen biyolojik
+    gözlem pencerelerini (`step_id -> (expected_start, expected_end)`) hesaplar.
+    Böylece çalışmalar arası çakışma kontrolü her iki yönde ve oluşturma sırasından
+    bağımsız olarak tutarlı çalışır.
+    """
+    steps_by_study: Dict[int, List[StudyStep]] = {}
+    study_obj_by_id: Dict[int, Study] = {}
+    for ex in existing_steps:
+        if ex.status == StepStatus.CANCELLED:
+            continue
+        steps_by_study.setdefault(ex.study_id, []).append(ex)
+        if getattr(ex, "study", None) is not None:
+            study_obj_by_id[ex.study_id] = ex.study
+
+    shifted_windows: Dict[int, Tuple[datetime, datetime]] = {}
+    for st_id, st_steps in steps_by_study.items():
+        if not any(getattr(s, "actual_reference_time", None) is not None for s in st_steps):
+            continue
+        st_obj = study_obj_by_id.get(st_id)
+        if st_obj is None:
+            continue
+        ordered = sorted(st_steps, key=lambda x: x.step_order)
+        info = compute_biological_dependency_info(st_obj, ordered)
+        for s in ordered:
+            if s.status in (StepStatus.COMPLETED, StepStatus.CANCELLED):
+                continue
+            b = info["by_step_id"].get(s.id) or {}
+            exp_s_str = b.get("expected_start")
+            exp_e_str = b.get("expected_end")
+            if exp_s_str and exp_e_str:
+                exp_s = datetime.fromisoformat(exp_s_str)
+                exp_e = datetime.fromisoformat(exp_e_str)
+                if exp_s != s.planned_start or exp_e != s.planned_end:
+                    shifted_windows[s.id] = (exp_s, exp_e)
+    return shifted_windows
 
 
 def evaluate_study_conflicts(
@@ -775,11 +977,12 @@ def evaluate_study_conflicts(
         except Exception:
             template = None
 
-    # Personel aktif görev çakışması için yalnızca tamamlanmamış (aktif) adımlar dikkate alınır
+    # Personel aktif görev çakışması için yalnızca tamamlanmamış ve tarihsel-belirsiz olmayan aktif adımlar dikkate alınır
     active_personnel_steps = [
         ex for ex in existing_steps
         if ex.status != StepStatus.COMPLETED
         and ex.status != StepStatus.CANCELLED
+        and not is_historical_unverified_step(ex, getattr(ex, "study", None))
         and (not getattr(ex, "study", None) or ex.study.status not in (StudyStatus.COMPLETED, StudyStatus.CANCELLED))
     ]
     # 72 saatlik Su Banyosu ve uzun süreli cihaz rezervasyonları için kurulum adımı COMPLETED olsa dahi
@@ -787,8 +990,11 @@ def evaluate_study_conflicts(
     active_equipment_steps = [
         ex for ex in existing_steps
         if ex.status != StepStatus.CANCELLED
+        and not is_historical_unverified_step(ex, getattr(ex, "study", None))
         and (not getattr(ex, "study", None) or ex.study.status not in (StudyStatus.COMPLETED, StudyStatus.CANCELLED))
     ]
+    other_shifted_windows = _build_other_studies_expected_windows(existing_steps)
+    recorded_overlap_keys: set = set()
 
     def record(conflict: Conflict, step_ids: List[int]):
         db.add(conflict)
@@ -802,12 +1008,13 @@ def evaluate_study_conflicts(
             missing_role_steps[role] = [
                 s.id for s in steps
                 if s.status not in (StepStatus.COMPLETED, StepStatus.CANCELLED)
+                and not is_historical_unverified_step(s, study)
                 and s.step_order in ts_by_order
                 and role in ts_by_order[s.step_order].roles
             ]
 
     for s in steps:
-        if s.status in (StepStatus.COMPLETED, StepStatus.CANCELLED):
+        if s.status in (StepStatus.COMPLETED, StepStatus.CANCELLED) or is_historical_unverified_step(s, study):
             continue
         ts = ts_by_order.get(s.step_order)
         # Mevcut atanan personelin aktiflik ve uygunluk kontrolü
@@ -858,8 +1065,10 @@ def evaluate_study_conflicts(
             affected,
         )
 
+    study_ext_usage = get_study_extraction_usage(study)
+
     for step in steps:
-        if step.status == StepStatus.CANCELLED:
+        if step.status == StepStatus.CANCELLED or is_historical_unverified_step(step, study):
             continue
 
         if step.status != StepStatus.COMPLETED:
@@ -876,56 +1085,89 @@ def evaluate_study_conflicts(
                 )
                 findings.append((conflict, [step.id]))
 
-            # 6b) Aynı kişinin başka bir çalışmada (onaylı veya taslak) eşzamanlı görevi
+            # 6b) Aynı kişinin başka bir çalışmada (onaylı veya taslak) eşzamanlı görevi (planlanan VE beklenen biyolojik pencereler)
             for person in step.assignees:
                 for ex in active_personnel_steps:
                     if person.id not in existing_assignees.get(ex.id, set()):
                         continue
-                    ov = _overlap_minutes(step.planned_start, step.planned_end, ex.planned_start, ex.planned_end)
-                    if ov <= 0:
-                        continue
                     other = ex.study
-                    context = (
-                        f"{person.full_name}, {other.study_code} ({other.status.value}) çalışmasının "
-                        f"'{ex.step_name}' görevinde ({_fmt(ex.planned_start)}–{ex.planned_end:%H:%M}) zaten "
-                        f"görevli; {ov} dk örtüşme."
-                    )
-                    if step.is_biological_fixed_time:
-                        record(
-                            Conflict(
-                                conflict_type=ConflictType.PERSONNEL_OVERLAP,
-                                severity=ConflictSeverity.CRITICAL,
-                                title=f"Personel Çakışması (Biyolojik Kilitli Adım): Gün {step.study_day} — {person.full_name}",
-                                description=(
-                                    f"'{step.step_name}' biyolojik kilitli (planlanan: {_fmt(step.planned_start)}, "
-                                    f"tolerans ±{step.biological_tolerance_minutes} dk). {context} "
-                                    f"Bu rolde o saatte boşta başka yetkin personel bulunamadı."
-                                ),
-                                study_id=study.id,
-                                step_id=step.id,
-                                related_study_id=other.id,
-                            ),
-                            [step.id],
-                        )
-                    else:
-                        record(
-                            Conflict(
-                                conflict_type=ConflictType.PERSONNEL_OVERLAP,
-                                severity=ConflictSeverity.CRITICAL,
-                                title=f"Personel Çakışması: Gün {step.study_day} — {person.full_name}",
-                                description=context + " Gün içinde boş saat dilimi bulunamadı; planlayıcı/SD kararı gereklidir.",
-                                study_id=study.id,
-                                step_id=step.id,
-                                related_study_id=other.id,
-                            ),
-                            [step.id],
-                        )
+                    ov = _overlap_minutes(step.planned_start, step.planned_end, ex.planned_start, ex.planned_end)
+                    if ov > 0:
+                        pair_key = ("PLANNED", step.id, ex.id, person.id)
+                        if pair_key not in recorded_overlap_keys:
+                            recorded_overlap_keys.add(pair_key)
+                            context = (
+                                f"{person.full_name}, {other.study_code} ({other.status.value}) çalışmasının "
+                                f"'{ex.step_name}' görevinde ({_fmt(ex.planned_start)}–{ex.planned_end:%H:%M}) zaten "
+                                f"görevli; {ov} dk örtüşme."
+                            )
+                            if step.is_biological_fixed_time:
+                                record(
+                                    Conflict(
+                                        conflict_type=ConflictType.PERSONNEL_OVERLAP,
+                                        severity=ConflictSeverity.CRITICAL,
+                                        title=f"Personel Çakışması (Biyolojik Kilitli Adım): Gün {step.study_day} — {person.full_name}",
+                                        description=(
+                                            f"'{step.step_name}' biyolojik kilitli (planlanan: {_fmt(step.planned_start)}, "
+                                            f"tolerans ±{step.biological_tolerance_minutes} dk). {context} "
+                                            f"Bu rolde o saatte boşta başka yetkin personel bulunamadı."
+                                        ),
+                                        study_id=study.id,
+                                        step_id=step.id,
+                                        related_study_id=other.id,
+                                    ),
+                                    [step.id],
+                                )
+                            else:
+                                record(
+                                    Conflict(
+                                        conflict_type=ConflictType.PERSONNEL_OVERLAP,
+                                        severity=ConflictSeverity.CRITICAL,
+                                        title=f"Personel Çakışması: Gün {step.study_day} — {person.full_name}",
+                                        description=context + " Gün içinde boş saat dilimi bulunamadı; planlayıcı/SD kararı gereklidir.",
+                                        study_id=study.id,
+                                        step_id=step.id,
+                                        related_study_id=other.id,
+                                    ),
+                                    [step.id],
+                                )
+
+                    # Karşı çalışmanın referans gecikmesi nedeniyle kaymış beklenen biyolojik penceresi varsa onu da denetle
+                    ex_shifted = other_shifted_windows.get(ex.id)
+                    if ex_shifted is not None:
+                        ex_exp_start, ex_exp_end = ex_shifted
+                        ov_exp = _overlap_minutes(step.planned_start, step.planned_end, ex_exp_start, ex_exp_end)
+                        if ov_exp > 0:
+                            pair_key_exp = ("EXPECTED_OTHER", step.id, ex.id, person.id)
+                            if pair_key_exp not in recorded_overlap_keys:
+                                recorded_overlap_keys.add(pair_key_exp)
+                                record(
+                                    Conflict(
+                                        conflict_type=ConflictType.PERSONNEL_OVERLAP,
+                                        severity=ConflictSeverity.CRITICAL,
+                                        title=(
+                                            f"Personel Çakışması (Beklenen Biyolojik Pencere): "
+                                            f"Gün {step.study_day} — {person.full_name}"
+                                        ),
+                                        description=(
+                                            f"'{step.step_name}' görevi ({_fmt(step.planned_start)}–{step.planned_end:%H:%M}), "
+                                            f"{person.full_name} personelinin {other.study_code} ({other.status.value}) "
+                                            f"çalışmasındaki '{ex.step_name}' adımının referans gecikmesi sonrası beklenen "
+                                            f"biyolojik penceresiyle ({_fmt(ex_exp_start)}–{ex_exp_end:%H:%M}) {ov_exp} dk çakışıyor."
+                                        ),
+                                        study_id=study.id,
+                                        step_id=step.id,
+                                        related_study_id=other.id,
+                                    ),
+                                    [step.id],
+                                )
 
         # 6c) Cihaz çakışması — Çalkalamalı Su Banyosu 1 (EQ-WB-001) Polar & Apolar 72s Kapasite Kilidi
         # Kurulum adımı (90 dk) COMPLETED olsa bile 72 saatlik su banyosu rezervasyonu devam eder.
+        # Bilinmeyen (None) ekstraksiyon bilgisi ASLA True (kesin polar kullanımı) olarak varsayılmaz.
         is_extraction = step.step_type == "Ekstraksiyon" or "Ekstraksiyon" in step.step_name
-        study_uses_polar = (study.extraction_polar is True) or (study.extraction_polar is None and study.extraction_non_polar is not True)
-        study_uses_apolar = study.extraction_non_polar is True
+        study_uses_polar = study_ext_usage["uses_polar"]
+        study_uses_apolar = study_ext_usage["uses_apolar"]
         if is_extraction and (study_uses_polar or study_uses_apolar):
             wb_start = step.planned_start
             wb_end = step.planned_start + timedelta(hours=72)
@@ -939,10 +1181,9 @@ def evaluate_study_conflicts(
                 other_wb_start = ex.planned_start
                 other_wb_end = ex.planned_start + timedelta(hours=72)
                 if _overlap_minutes(wb_start, wb_end, other_wb_start, other_wb_end) > 0:
-                    ex_uses_apolar = ex.study.extraction_non_polar is True
-                    ex_uses_polar = (ex.study.extraction_polar is True) or (
-                        ex.study.extraction_polar is None and ex.study.extraction_non_polar is not True
-                    )
+                    ex_usage = get_study_extraction_usage(getattr(ex, "study", None))
+                    ex_uses_apolar = ex_usage["uses_apolar"]
+                    ex_uses_polar = ex_usage["uses_polar"]
                     if ex_uses_apolar and ex.study not in overlapping_apolar:
                         overlapping_apolar.append(ex.study)
                     if ex_uses_polar and ex.study not in overlapping_polar:
@@ -1008,10 +1249,62 @@ def evaluate_study_conflicts(
                         [step.id],
                     )
 
-    # 6f) Biyolojik referans adımının gerçekleşen saati ve bağımlı (24/48/72s) adımlara etkisi
+    # 6f) Biyolojik referans adımının gerçekleşen saati ve bağımlı (24/48/72s) gözlem adımlarının denetimi
     bio_info = compute_biological_dependency_info(study, steps, template)
     step_by_id = {s.id: s for s in steps}
+
+    # Bağımlı gözlem adımlarında tamamlanma sonrası gerçek gözlem saati (actual_reference_time) denetimi
+    # (Kaynak adım tamamlanmış olsun veya olmasın, gözlem adımı COMPLETED ise gerçek gözlem saati kontrol edilir)
     for s in steps:
+        if s.status == StepStatus.CANCELLED or is_historical_unverified_step(s, study):
+            continue
+        s_bio = bio_info["by_step_id"].get(s.id) or {}
+        if s_bio.get("is_dependent_observation"):
+            obs_offset = int(s_bio.get("offset_hours") or 0)
+            exp_start_str = s_bio.get("expected_start") or s.planned_start.isoformat()
+            exp_start_dt = datetime.fromisoformat(exp_start_str)
+            if s.status == StepStatus.COMPLETED and getattr(s, "actual_reference_time", None) is None:
+                record(
+                    Conflict(
+                        conflict_type=ConflictType.BIOLOGICAL_TIME_VIOLATION,
+                        severity=ConflictSeverity.CRITICAL,
+                        title=f"Eksik Biyolojik Gözlem Saati: Gün {s.study_day} — {s.step_name}",
+                        description=(
+                            f"'{s.step_name}' (+{obs_offset}s bağımlı biyolojik gözlem) adımı tamamlandı olarak "
+                            f"işaretlendi ancak gözlemin gerçek yapılma saati (actual_reference_time) girilmedi. "
+                            f"Görev başlangıç saati (actual_start) gözlem saati olarak varsayılamaz; +{obs_offset}. saat "
+                            f"biyolojik pencere doğrulaması için gerçek gözlem saati girilmelidir."
+                        ),
+                        study_id=study.id,
+                        step_id=s.id,
+                    ),
+                    [s.id],
+                )
+            elif getattr(s, "actual_reference_time", None) is not None and s_bio.get("actual_observation_exceeds_tolerance"):
+                obs_dev = s_bio.get("actual_observation_deviation_minutes") or 0
+                record(
+                    Conflict(
+                        conflict_type=ConflictType.BIOLOGICAL_TIME_VIOLATION,
+                        severity=ConflictSeverity.CRITICAL,
+                        title=(
+                            f"Gerçekleşen Gözlem Biyolojik Pencere İhlali (+{obs_offset}s): "
+                            f"Gün {s.study_day} — {s.step_name}"
+                        ),
+                        description=(
+                            f"+{obs_offset}. saat '{s.step_name}' gözleminin beklenen biyolojik saati "
+                            f"{_fmt(exp_start_dt)} (tolerans ±{s.biological_tolerance_minutes} dk) iken "
+                            f"gerçekleşen gözlem saati {_fmt(s.actual_reference_time)} olarak kaydedildi "
+                            f"({obs_dev:+d} dk sapma). Gözlemin kendi biyolojik tolerans penceresi aşıldı."
+                        ),
+                        study_id=study.id,
+                        step_id=s.id,
+                    ),
+                    [s.id],
+                )
+
+    for s in steps:
+        if s.status == StepStatus.CANCELLED or is_historical_unverified_step(s, study):
+            continue
         s_bio = bio_info["by_step_id"].get(s.id) or {}
         if not s_bio.get("is_biological_reference"):
             continue
@@ -1061,9 +1354,14 @@ def evaluate_study_conflicts(
                     continue
                 exp_start = datetime.fromisoformat(dep_item["expected_start"])
                 exp_end = datetime.fromisoformat(dep_item["expected_end"])
-                dep_dev = dep_item["deviation_minutes"]
+                dep_sched_dev = dep_item.get("schedule_deviation_minutes", dep_item["deviation_minutes"])
 
-                if dep_item["exceeds_tolerance"]:
+                # Henüz gerçekleşmemiş bağımlı adımda beklenen pencere kayması gözlemin kendi toleransını aşıyorsa
+                if (
+                    dep_step.status != StepStatus.COMPLETED
+                    and getattr(dep_step, "actual_reference_time", None) is None
+                    and dep_item.get("schedule_exceeds_dependent_tolerance")
+                ):
                     record(
                         Conflict(
                             conflict_type=ConflictType.BIOLOGICAL_TIME_VIOLATION,
@@ -1076,7 +1374,7 @@ def evaluate_study_conflicts(
                                 f"Referans adım {_fmt(s.actual_reference_time)} saatinde gerçekleştiği için "
                                 f"+{int(dep_item['offset_hours'])}. saat bağımlı adımın beklenen biyolojik penceresi "
                                 f"{_fmt(exp_start)}–{exp_end:%H:%M} oldu (planlanan: {_fmt(dep_step.planned_start)}–"
-                                f"{dep_step.planned_end:%H:%M}, sapma: {dep_dev:+d} dk, tolerans: "
+                                f"{dep_step.planned_end:%H:%M}, sapma: {dep_sched_dev:+d} dk, tolerans: "
                                 f"±{dep_step.biological_tolerance_minutes} dk). {dep_item['revision_suggestion'] or ''}"
                             ),
                             study_id=study.id,
@@ -1085,67 +1383,137 @@ def evaluate_study_conflicts(
                         [dep_step.id],
                     )
 
-                if dep_dev != 0 and dep_step.status != StepStatus.COMPLETED:
-                    # Beklenen yeni pencerede oluşan personel çakışmalarını denetle
+                if dep_sched_dev != 0 and dep_step.status != StepStatus.COMPLETED:
+                    # 1) Beklenen yeni pencerede diğer çalışmalarla (planlanan ve beklenen) oluşan personel çakışmalarını denetle
                     for person in dep_step.assignees:
                         for ex in active_personnel_steps:
                             if person.id not in existing_assignees.get(ex.id, set()):
                                 continue
-                            ov = _overlap_minutes(exp_start, exp_end, ex.planned_start, ex.planned_end)
-                            if ov <= 0:
-                                continue
                             other = ex.study
+                            cand_windows = [(ex.planned_start, ex.planned_end)]
+                            if ex.id in other_shifted_windows:
+                                cand_windows.append(other_shifted_windows[ex.id])
+                            for w_start, w_end in cand_windows:
+                                ov = _overlap_minutes(exp_start, exp_end, w_start, w_end)
+                                if ov <= 0:
+                                    continue
+                                pair_key = ("EXPECTED_SELF_OTHER", dep_step.id, ex.id, person.id, w_start)
+                                if pair_key in recorded_overlap_keys:
+                                    continue
+                                recorded_overlap_keys.add(pair_key)
+                                record(
+                                    Conflict(
+                                        conflict_type=ConflictType.PERSONNEL_OVERLAP,
+                                        severity=ConflictSeverity.CRITICAL,
+                                        title=(
+                                            f"Personel Çakışması (Beklenen Biyolojik Pencere): "
+                                            f"Gün {dep_step.study_day} — {person.full_name}"
+                                        ),
+                                        description=(
+                                            f"Referans adım gecikmesi sonrası '{dep_step.step_name}' adımının beklenen "
+                                            f"biyolojik penceresi ({_fmt(exp_start)}–{exp_end:%H:%M}), {person.full_name} "
+                                            f"personelinin {other.study_code} ({other.status.value}) çalışmasındaki "
+                                            f"'{ex.step_name}' göreviyle ({_fmt(w_start)}–{w_end:%H:%M}) "
+                                            f"{ov} dk çakışıyor."
+                                        ),
+                                        study_id=study.id,
+                                        step_id=dep_step.id,
+                                        related_study_id=other.id,
+                                    ),
+                                    [dep_step.id],
+                                )
+
+                        # 2) Aynı çalışma içindeki (intra-study) diğer aktif adımlarla oluşan personel çakışmalarını denetle
+                        for own_other in steps:
+                            if (
+                                own_other.id == dep_step.id
+                                or own_other.status in (StepStatus.COMPLETED, StepStatus.CANCELLED)
+                                or is_historical_unverified_step(own_other, study)
+                            ):
+                                continue
+                            if not any(u.id == person.id for u in own_other.assignees):
+                                continue
+                            own_b = bio_info["by_step_id"].get(own_other.id) or {}
+                            own_w_start = (
+                                datetime.fromisoformat(own_b["expected_start"])
+                                if own_b.get("expected_start")
+                                else own_other.planned_start
+                            )
+                            own_w_end = (
+                                datetime.fromisoformat(own_b["expected_end"])
+                                if own_b.get("expected_end")
+                                else own_other.planned_end
+                            )
+                            ov_intra = max(
+                                _overlap_minutes(exp_start, exp_end, own_other.planned_start, own_other.planned_end),
+                                _overlap_minutes(exp_start, exp_end, own_w_start, own_w_end),
+                            )
+                            if ov_intra <= 0:
+                                continue
+                            intra_key = (
+                                "INTRA_STUDY",
+                                min(dep_step.id, own_other.id),
+                                max(dep_step.id, own_other.id),
+                                person.id,
+                            )
+                            if intra_key in recorded_overlap_keys:
+                                continue
+                            recorded_overlap_keys.add(intra_key)
                             record(
                                 Conflict(
                                     conflict_type=ConflictType.PERSONNEL_OVERLAP,
                                     severity=ConflictSeverity.CRITICAL,
                                     title=(
-                                        f"Personel Çakışması (Beklenen Biyolojik Pencere): "
+                                        f"Personel Çakışması (Çalışma İçi Beklenen Pencere): "
                                         f"Gün {dep_step.study_day} — {person.full_name}"
                                     ),
                                     description=(
                                         f"Referans adım gecikmesi sonrası '{dep_step.step_name}' adımının beklenen "
-                                        f"biyolojik penceresi ({_fmt(exp_start)}–{exp_end:%H:%M}), {person.full_name} "
-                                        f"personelinin {other.study_code} ({other.status.value}) çalışmasındaki "
-                                        f"'{ex.step_name}' göreviyle ({_fmt(ex.planned_start)}–{ex.planned_end:%H:%M}) "
-                                        f"{ov} dk çakışıyor."
+                                        f"biyolojik penceresi ({_fmt(exp_start)}–{exp_end:%H:%M}), aynı çalışmadaki "
+                                        f"'{own_other.step_name}' adımıyla ({_fmt(own_other.planned_start)}–"
+                                        f"{own_other.planned_end:%H:%M}) {ov_intra} dk çakışıyor."
                                     ),
                                     study_id=study.id,
                                     step_id=dep_step.id,
-                                    related_study_id=other.id,
+                                    related_study_id=study.id,
                                 ),
-                                [dep_step.id],
+                                [dep_step.id, own_other.id],
                             )
 
     # 6e) FAZ 8.1: Kafes kapasitesi (Fiziksel + Dr. Anoop esneklik) ve 24-72s uzun süreli cihaz (CO2 inkübatör / etüv) kapasitesi
-    try:
-        _ = build_capacity_report(db, study, template)
-        for cap_conflict, cap_step_ids in evaluate_capacity_conflicts(db, study, steps, template):
-            record(cap_conflict, cap_step_ids)
-    except Exception as exc:
-        anchor_id = steps[0].id if steps else None
-        record(
-            Conflict(
-                conflict_type=ConflictType.ROOM_CAPACITY_EXCEEDED,
-                severity=ConflictSeverity.CRITICAL,
-                title="Kapasite Doğrulanamadı: Oda ve Cihaz Kapasite Kontrolü Hatası",
-                description=(
-                    f"Kafes veya uzun süreli cihaz kapasitesi kontrol edilirken teknik bir hata oluştuğu için "
-                    f"kapasite uygunluğu doğrulanamadı ({exc}). Kapasite doğrulanmadan çalışma planı temiz "
-                    f"(SCHEDULED_CLEAN) sayılamaz ve onaylanamaz."
+    has_non_historical_step = (not steps) or any(
+        s.status != StepStatus.COMPLETED and not is_historical_unverified_step(s, study)
+        for s in steps
+    )
+    if has_non_historical_step:
+        try:
+            _ = build_capacity_report(db, study, template)
+            for cap_conflict, cap_step_ids in evaluate_capacity_conflicts(db, study, steps, template):
+                record(cap_conflict, cap_step_ids)
+        except Exception as exc:
+            anchor_id = steps[0].id if steps else None
+            record(
+                Conflict(
+                    conflict_type=ConflictType.ROOM_CAPACITY_EXCEEDED,
+                    severity=ConflictSeverity.CRITICAL,
+                    title="Kapasite Doğrulanamadı: Oda ve Cihaz Kapasite Kontrolü Hatası",
+                    description=(
+                        f"Kafes veya uzun süreli cihaz kapasitesi kontrol edilirken teknik bir hata oluştuğu için "
+                        f"kapasite uygunluğu doğrulanamadı ({exc}). Kapasite doğrulanmadan çalışma planı temiz "
+                        f"(SCHEDULED_CLEAN) sayılamaz ve onaylanamaz."
+                    ),
+                    study_id=study.id,
+                    step_id=anchor_id,
                 ),
-                study_id=study.id,
-                step_id=anchor_id,
-            ),
-            [anchor_id] if anchor_id else [],
-        )
+                [anchor_id] if anchor_id else [],
+            )
 
     db.flush()
 
     # 6d) KURAL 1: kişi-gün bazında 9 saat kontrolü (tüm çalışmalar dahil)
     person_days: Dict[Tuple[int, date], Tuple[User, List[int]]] = {}
     for step in steps:
-        if step.status == StepStatus.COMPLETED:
+        if step.status == StepStatus.COMPLETED or is_historical_unverified_step(step, study):
             continue
         for person in step.assignees:
             person_days.setdefault((person.id, step.planned_start.date()), (person, []))[1].append(step.id)
@@ -1217,11 +1585,15 @@ def revalidate_study_conflicts(
         .order_by(StudyStep.step_order)
         .all()
     )
-    if study.status == StudyStatus.DRAFT:
-        for st in steps:
+    ext_usage = get_study_extraction_usage(study)
+    for st in steps:
+        is_ext = st.step_type == "Ekstraksiyon" or "Ekstraksiyon" in st.step_name
+        if is_ext and (st.equipment_id is None or st.equipment_id == water_bath.id):
+            st.equipment_id = water_bath.id if ext_usage["uses_water_bath"] else None
+        if study.status == StudyStatus.DRAFT:
             st.study_day = (st.planned_start.date() - base_day0).days
-        if steps:
-            study.target_end_date = max(s.planned_end for s in steps).date()
+    if study.status == StudyStatus.DRAFT and steps:
+        study.target_end_date = max(s.planned_end for s in steps).date()
 
     others = db.query(Study).filter(Study.id != study.id, Study.status.in_(COMPARED_STUDY_STATUSES)).all()
     other_ids = [s.id for s in others]
@@ -1336,6 +1708,7 @@ def schedule_new_study(
     assignment, unfilled_roles = _assign_roles(db, study, planned_3, existing_steps, existing_assignees)
 
     # 5) Adımları oluştur (Esnek adımlarda boş saat dilimi arama + Biyolojik kilitli adımlarda yedek yetkin personel kontrolü)
+    ext_usage = get_study_extraction_usage(study)
     new_steps: List[Tuple[TemplateStep, StudyStep]] = []
     for ts, start, end, _effective_day in planned:
         step_assignees: List[User] = []
@@ -1388,11 +1761,7 @@ def schedule_new_study(
         # FAZ 6.4 (Madde 6): G etiketi her zaman (step_date - g0_date).days ile birebir uyumlu
         computed_day = (start.date() - acclimatization_start_date).days
         is_extraction = ts.step_type == "Ekstraksiyon" or "Ekstraksiyon" in ts.name
-        eq_id = (
-            water_bath.id
-            if is_extraction and (study.extraction_polar is True or study.extraction_non_polar is True)
-            else None
-        )
+        eq_id = water_bath.id if (is_extraction and ext_usage["uses_water_bath"]) else None
         step = StudyStep(
             study_id=study.id,
             step_order=ts.order,
@@ -1522,6 +1891,7 @@ def _format_schedule_response(
     }
     bio_info = compute_biological_dependency_info(study, steps, template)
     bio_by_step = bio_info["by_step_id"]
+    ext_usage = get_study_extraction_usage(study)
 
     return {
         "study_id": study.id,
@@ -1535,6 +1905,10 @@ def _format_schedule_response(
         "extraction_polar_solvent": study.extraction_polar_solvent,
         "extraction_non_polar": study.extraction_non_polar,
         "extraction_non_polar_solvent": study.extraction_non_polar_solvent,
+        "extraction_info": ext_usage,
+        "missing_extraction_info": ext_usage["missing_extraction_info"],
+        "extraction_info_status": ext_usage["status"],
+        "extraction_info_message": ext_usage["message"],
         "study_director_id": study.study_director_id,
         "study_director_name": study.study_director.full_name if study.study_director else None,
         "template": {"code": template.code, "standard": template.standard, "title": template.title},
@@ -1598,6 +1972,9 @@ def _format_schedule_response(
                 "actual_end": s.actual_end.isoformat() if s.actual_end else None,
                 "actual_reference_time": s.actual_reference_time.isoformat() if getattr(s, "actual_reference_time", None) else None,
                 "planned_reference_time": (bio_by_step.get(s.id) or {}).get("planned_reference_time"),
+                "requires_reference_time": (bio_by_step.get(s.id) or {}).get("requires_reference_time", False),
+                "reference_time_role": (bio_by_step.get(s.id) or {}).get("reference_time_role"),
+                "reference_time_label": (bio_by_step.get(s.id) or {}).get("reference_time_label"),
                 "expected_start": (bio_by_step.get(s.id) or {}).get("expected_start", s.planned_start.isoformat()),
                 "expected_end": (bio_by_step.get(s.id) or {}).get("expected_end", s.planned_end.isoformat()),
                 "expected_reference_time": (bio_by_step.get(s.id) or {}).get("expected_reference_time"),
@@ -2128,16 +2505,22 @@ def sync_historical_completion_and_conflicts(
     db: Session,
     ref_date: date = REFERENCE_DATE,
     from_excel_import: bool = False,
+    target_study_codes: Optional[set] = None,
 ) -> Dict[str, Any]:
     """
-    Tarihsel tamamlanma senkronizasyonu:
-      - Genel çakışma yeniden hesaplamasında (`from_excel_import=False`) planlanan tarihi geçmiş
-        tamamlanmamış adımlar ASLA otomatik `COMPLETED` yapılmaz ve açık çakışmaları kapatılmaz.
+    Tarihsel tamamlanma ve geçmiş/demo kayıt kapsamı senkronizasyonu:
+      - Devam eden (IN_PROGRESS / ONGOING) çalışmaların geçmiş tarihli tamamlanmamış görevleri
+        ASLA otomatik olarak `StepStatus.COMPLETED` yapılmaz; gelecekteki görevleri korunur.
       - Bilinmeyen `actual_start` ve `actual_end` saatleri için `planned_start` / `planned_end`
         değerlerinden sahte gerçekleşme saati ASLA uydurulmaz.
-      - Yalnızca tarihsel Excel içe aktarım akışında (`from_excel_import=True`) veya açıkça `COMPLETED`
-        olarak işaretlenmiş çalışmalarda ilgili adımlar `COMPLETED` olarak senkronize edilir.
+      - Yalnızca açıkça `COMPLETED` olan çalışmalarda (ve ilk Excel içe aktarımında) ilgili adımlar
+        tarihsel tamamlanmış (`[HISTORICAL_IMPORT_COMPLETED]`) olarak işaretlenir; aynı Excel tekrar
+        içe aktarıldığında sahte yeni tamamlama üretilmez (`newly_completed_steps == 0`).
+      - Geçmiş Excel/demo içe aktarımına ait olup ayrıntısı bilinmeyen (`< 2026-11-03`) adımlar
+        `PENDING` olarak kalır, aktif çakışma hesabından hariç tutulur (`historical_excluded_steps`)
+        ve doğrulanmış tamamlanan görev istatistiğine (`verified_completed_steps`) eklenmez.
     """
+    import copy
     from app.models.sample import SampleRecord
 
     now = datetime.utcnow()
@@ -2151,40 +2534,62 @@ def sync_historical_completion_and_conflicts(
 
     for st in studies:
         sr = sample_by_code.get(st.study_code)
+        meta = copy.deepcopy(st.dossier_metadata) if isinstance(st.dossier_metadata, dict) else {}
+        in_import_scope = bool(
+            from_excel_import and (target_study_codes is None or st.study_code in target_study_codes)
+        )
+        if in_import_scope and target_study_codes is not None:
+            meta["historical_excel_import"] = True
+
         steps = (
             db.query(StudyStep)
             .filter(StudyStep.study_id == st.id, StudyStep.status != StepStatus.CANCELLED)
             .all()
         )
         is_explicit_completed = st.status == StudyStatus.COMPLETED or (
-            from_excel_import and sr is not None and (sr.stored_status or "").upper() == "COMPLETED"
+            in_import_scope and sr is not None and (sr.stored_status or "").upper() == "COMPLETED"
         )
         if is_explicit_completed:
             if st.status != StudyStatus.COMPLETED:
                 st.status = StudyStatus.COMPLETED
             completed_studies_count += 1
-            for step in steps:
-                if step.status != StepStatus.COMPLETED:
-                    step.status = StepStatus.COMPLETED
-                    newly_completed_steps += 1
-        elif from_excel_import and sr is not None:
-            if (sr.stored_status or "").upper() == "ONGOING" and sr.experiment_end_date and sr.experiment_end_date < ref_date:
+            if not meta.get("historical_sync_done"):
                 for step in steps:
                     if step.status != StepStatus.COMPLETED:
                         step.status = StepStatus.COMPLETED
+                        if step.actual_start is None and step.actual_end is None:
+                            notes = step.deviation_notes or ""
+                            if "[HISTORICAL_IMPORT_COMPLETED]" not in notes:
+                                step.deviation_notes = (notes + " [HISTORICAL_IMPORT_COMPLETED]").strip()
                         newly_completed_steps += 1
-            else:
-                for step in steps:
-                    if step.planned_start and step.planned_start.date() < ref_date and step.status != StepStatus.COMPLETED:
-                        step.status = StepStatus.COMPLETED
-                        newly_completed_steps += 1
+                meta["historical_sync_done"] = True
+                meta["historical_excel_import"] = True
+                st.dossier_metadata = meta
+        elif in_import_scope and (
+            target_study_codes is not None or meta.get("historical_excel_import") or meta.get("is_historical_demo")
+        ):
+            meta["historical_excel_import"] = True
+            meta["historical_sync_done"] = True
+            st.dossier_metadata = meta
 
     db.flush()
 
-    step_by_id = {s.id: s for s in db.query(StudyStep).all()}
+    all_non_cancelled_steps = (
+        db.query(StudyStep)
+        .options(selectinload(StudyStep.study))
+        .filter(StudyStep.status != StepStatus.CANCELLED)
+        .all()
+    )
+    step_by_id = {s.id: s for s in all_non_cancelled_steps}
     open_conflicts = db.query(Conflict).filter(Conflict.is_resolved == False).all()  # noqa: E712
     resolved_past_conflicts = 0
-    note = f"Geçmiş tarihte tamamlandı (Referans: {ref_date:%d.%m.%Y})"
+    note = f"Tarihsel/demo kayıt (Referans: {ref_date:%d.%m.%Y}) — aktif çakışma kapsamı dışında kapatıldı"
+
+    def _is_hist_study(st_obj: Optional[Study]) -> bool:
+        if st_obj is None:
+            return False
+        m = st_obj.dossier_metadata if isinstance(st_obj.dossier_metadata, dict) else {}
+        return bool(m.get("historical_excel_import") or m.get("is_historical_demo"))
 
     for c in open_conflicts:
         st = study_by_id.get(c.study_id)
@@ -2198,22 +2603,26 @@ def sync_historical_completion_and_conflicts(
             should_close = True
         elif rel_st and rel_st.status == StudyStatus.COMPLETED:
             should_close = True
-        elif from_excel_import and (
-            (
-                sr
-                and (
-                    (sr.stored_status or "").upper() == "COMPLETED"
-                    or ((sr.stored_status or "").upper() == "ONGOING" and sr.experiment_end_date and sr.experiment_end_date < ref_date)
-                )
-            )
-            or (step and step.status == StepStatus.COMPLETED)
-            or (
-                rel_sr
-                and (
-                    (rel_sr.stored_status or "").upper() == "COMPLETED"
-                    or ((rel_sr.stored_status or "").upper() == "ONGOING" and rel_sr.experiment_end_date and rel_sr.experiment_end_date < ref_date)
-                )
-            )
+        elif step is not None and (
+            step.status == StepStatus.COMPLETED or is_historical_unverified_step(step, st, sr, ref_date)
+        ):
+            should_close = True
+        elif (
+            st is not None
+            and _is_hist_study(st)
+            and sr is not None
+            and (sr.stored_status or "").upper() == "ONGOING"
+            and sr.experiment_end_date
+            and sr.experiment_end_date < ref_date
+        ):
+            should_close = True
+        elif (
+            rel_st is not None
+            and _is_hist_study(rel_st)
+            and rel_sr is not None
+            and (rel_sr.stored_status or "").upper() == "ONGOING"
+            and rel_sr.experiment_end_date
+            and rel_sr.experiment_end_date < ref_date
         ):
             should_close = True
 
@@ -2224,11 +2633,34 @@ def sync_historical_completion_and_conflicts(
             resolved_past_conflicts += 1
 
     db.flush()
+
+    verified_completed_steps = 0
+    historical_completed_steps = 0
+    historical_excluded_steps = 0
+    for s in all_non_cancelled_steps:
+        st = study_by_id.get(s.study_id) or getattr(s, "study", None)
+        sr = sample_by_code.get(st.study_code) if st else None
+        if s.status == StepStatus.COMPLETED:
+            is_unverified_hist_comp = (
+                s.actual_start is None
+                and s.actual_end is None
+                and ("[HISTORICAL_IMPORT_COMPLETED]" in (s.deviation_notes or "") or _is_hist_study(st))
+            )
+            if is_unverified_hist_comp:
+                historical_completed_steps += 1
+            else:
+                verified_completed_steps += 1
+        elif is_historical_unverified_step(s, st, sr, ref_date):
+            historical_excluded_steps += 1
+
     return {
         "reference_date": ref_date.isoformat(),
         "completed_studies_count": db.query(Study).filter(Study.status == StudyStatus.COMPLETED).count(),
         "newly_completed_steps": newly_completed_steps,
-        "total_completed_steps": db.query(StudyStep).filter(StudyStep.status == StepStatus.COMPLETED).count(),
+        "verified_completed_steps": verified_completed_steps,
+        "historical_completed_steps": historical_completed_steps,
+        "historical_excluded_steps": historical_excluded_steps,
+        "total_completed_steps": verified_completed_steps + historical_completed_steps,
         "total_pending_steps": db.query(StudyStep).filter(StudyStep.status == StepStatus.PENDING).count(),
         "resolved_past_conflicts": resolved_past_conflicts,
     }
@@ -2252,12 +2684,12 @@ def classify_conflict_record(
     rel_meta = (related_study.dossier_metadata or {}) if related_study else {}
     title_str = conflict.title or ""
 
-    if "Eksik Biyolojik Referans Saati" in title_str:
+    if "Eksik Biyolojik Referans Saati" in title_str or "Eksik Biyolojik Gözlem Saati" in title_str:
         reasons.append(
             {
                 "code": "MISSING_BIOLOGICAL_REFERENCE_TIME",
-                "badge": "Biyolojik Referans Saati Eksik",
-                "tag": "Eksik Bilgi: Biyolojik Referans Olay Saati Girilmedi",
+                "badge": "Biyolojik Referans / Gözlem Saati Eksik",
+                "tag": "Eksik Bilgi: Biyolojik Referans veya Gözlem Saati Girilmedi",
             }
         )
 
@@ -2306,6 +2738,8 @@ def classify_conflict_record(
         not has_docs
         and "Biyolojik Referans Saat Sapması" not in title_str
         and "Bağımlı Biyolojik Adım Sapması" not in title_str
+        and "Gerçekleşen Gözlem Biyolojik Pencere İhlali" not in title_str
+        and "Eksik Biyolojik" not in title_str
         and (
             conflict.conflict_type == ConflictType.BIOLOGICAL_TIME_VIOLATION
             or (
@@ -2438,8 +2872,11 @@ def recompute_all_conflicts(
       - Tamamlanmamış geçmiş görevleri otomatik olarak COMPLETED yapmaz ve sahte actual_start/actual_end üretmez.
       - Devam eden 72 saatlik cihaz rezervasyonlarını (kurulum adımı COMPLETED olsa bile) korur.
       - Eksik personel atamalarını, biyolojik referans gecikmelerini ve kapasite hatalarını denetler.
+      - Kaymış beklenen biyolojik pencereleri çalışma oluşturma / ID sırasından bağımsız olarak her iki yönde değerlendirir.
       - Açık çakışmaları `CONFIRMED_CONFLICT` ve `MISSING_INFO` olarak sınıflandırıp özet döner.
     """
+    from app.models.sample import SampleRecord
+
     sync_stats = sync_historical_completion_and_conflicts(db, ref_date=ref_date, from_excel_import=False)
     now = datetime.utcnow()
 
@@ -2471,13 +2908,15 @@ def recompute_all_conflicts(
         .order_by(Study.id.asc())
         .all()
     )
+    sample_by_code = {s.study_code: s for s in db.query(SampleRecord).all() if s.study_code}
 
-    prior_steps: List[StudyStep] = []
-    prior_assignees: Dict[int, set] = {}
-    seen_workload_titles: set = set()
+    steps_by_study_id: Dict[int, List[StudyStep]] = {}
+    all_study_steps_flat: List[StudyStep] = []
+    all_assignees_map: Dict[int, set] = {}
+    studies_with_shifted_bio: set = set()
 
     for st in studies:
-        study_steps = (
+        st_steps = (
             db.query(StudyStep)
             .options(selectinload(StudyStep.assignees), selectinload(StudyStep.study))
             .filter(
@@ -2487,20 +2926,42 @@ def recompute_all_conflicts(
             .order_by(StudyStep.step_order.asc())
             .all()
         )
+        steps_by_study_id[st.id] = st_steps
+        for s in st_steps:
+            all_study_steps_flat.append(s)
+            all_assignees_map[s.id] = {u.id for u in s.assignees}
+            if getattr(s, "actual_reference_time", None) is not None:
+                studies_with_shifted_bio.add(st.id)
+
+    prior_steps: List[StudyStep] = []
+    prior_study_ids: set = set()
+    seen_workload_titles: set = set()
+
+    for st in studies:
+        study_steps = steps_by_study_id.get(st.id, [])
         if not study_steps:
             continue
+        sr = sample_by_code.get(st.study_code)
         has_active_or_ref = any(
-            s.status != StepStatus.COMPLETED or getattr(s, "actual_reference_time", None) is not None
+            (s.status != StepStatus.COMPLETED and not is_historical_unverified_step(s, st, sr, ref_date))
+            or getattr(s, "actual_reference_time", None) is not None
             for s in study_steps
         )
         if has_active_or_ref:
             tpl = get_template(getattr(st, "template_code", None) or DEFAULT_TEMPLATE_CODE, db=db)
+            extra_shifted_steps = [
+                s for s in all_study_steps_flat
+                if s.study_id != st.id
+                and s.study_id in studies_with_shifted_bio
+                and s.study_id not in prior_study_ids
+            ]
+            eval_existing_steps = prior_steps + extra_shifted_steps
             findings = evaluate_study_conflicts(
                 db=db,
                 study=st,
                 steps=study_steps,
-                existing_steps=prior_steps,
-                existing_assignees=prior_assignees,
+                existing_steps=eval_existing_steps,
+                existing_assignees=all_assignees_map,
                 water_bath=water_bath,
                 template=tpl,
                 preserve_approved_weekend_step_ids=approved_wk_steps,
@@ -2517,7 +2978,7 @@ def recompute_all_conflicts(
 
         for ps in study_steps:
             prior_steps.append(ps)
-            prior_assignees[ps.id] = {u.id for u in ps.assignees}
+        prior_study_ids.add(st.id)
 
     db.flush()
     open_conflicts = db.query(Conflict).filter(Conflict.is_resolved == False).order_by(Conflict.id.asc()).all()  # noqa: E712
