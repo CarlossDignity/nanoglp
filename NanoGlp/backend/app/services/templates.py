@@ -26,6 +26,11 @@ class TemplateStep:
     is_biological_fixed_time: bool = False
     tolerance_minutes: int = 0
     note: str = ""
+    # Biyolojik referans olay ve bağımlı gözlem modellemesi
+    is_biological_reference: bool = False
+    reference_event_time: Optional[time] = None
+    reference_step_order: Optional[int] = None
+    reference_offset_hours: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -94,6 +99,10 @@ class StudyTemplate:
                     "is_biological_fixed_time": s.is_biological_fixed_time,
                     "tolerance_minutes": s.tolerance_minutes,
                     "note": s.note,
+                    "is_biological_reference": s.is_biological_reference,
+                    "reference_event_time": s.reference_event_time.strftime("%H:%M") if s.reference_event_time else None,
+                    "reference_step_order": s.reference_step_order,
+                    "reference_offset_hours": s.reference_offset_hours,
                 }
                 for s in self.steps
             ],
@@ -133,6 +142,8 @@ ISO_10993_23_IC = StudyTemplate(
             roles=(UserRole.STUDY_DIRECTOR, UserRole.TECHNICIAN),
             is_biological_fixed_time=True, tolerance_minutes=15,
             note="Enjeksiyon referans saati ≈10:00; 24/48/72. saat gözlemleri bu saate sabitlenir.",
+            is_biological_reference=True,
+            reference_event_time=time(10, 0),
         ),
         TemplateStep(
             order=4, day=8,
@@ -141,6 +152,8 @@ ISO_10993_23_IC = StudyTemplate(
             start=time(10, 0), duration_minutes=60,
             roles=(UserRole.TECHNICIAN,),
             is_biological_fixed_time=True, tolerance_minutes=120,
+            reference_step_order=3,
+            reference_offset_hours=24,
         ),
         TemplateStep(
             order=5, day=9,
@@ -149,6 +162,8 @@ ISO_10993_23_IC = StudyTemplate(
             start=time(10, 0), duration_minutes=60,
             roles=(UserRole.TECHNICIAN,),
             is_biological_fixed_time=True, tolerance_minutes=120,
+            reference_step_order=3,
+            reference_offset_hours=48,
         ),
         TemplateStep(
             order=6, day=10,
@@ -157,6 +172,8 @@ ISO_10993_23_IC = StudyTemplate(
             start=time(10, 0), duration_minutes=120,
             roles=(UserRole.TECHNICIAN,),
             is_biological_fixed_time=True, tolerance_minutes=120,
+            reference_step_order=3,
+            reference_offset_hours=72,
         ),
     ),
 )
@@ -193,6 +210,8 @@ ISO_10993_5_CYTO = StudyTemplate(
             start=time(9, 30), duration_minutes=120,
             roles=(UserRole.STUDY_DIRECTOR, UserRole.TECHNICIAN),
             is_biological_fixed_time=True, tolerance_minutes=15,
+            is_biological_reference=True,
+            reference_event_time=time(10, 0),
         ),
         TemplateStep(
             order=4, day=8,
@@ -201,6 +220,8 @@ ISO_10993_5_CYTO = StudyTemplate(
             start=time(10, 0), duration_minutes=120,
             roles=(UserRole.STUDY_DIRECTOR, UserRole.TECHNICIAN),
             is_biological_fixed_time=True, tolerance_minutes=30,
+            reference_step_order=3,
+            reference_offset_hours=24,
         ),
     ),
 )
@@ -236,6 +257,8 @@ ISO_10993_10_SENS = StudyTemplate(
             start=time(9, 0), duration_minutes=180,
             roles=(UserRole.STUDY_DIRECTOR, UserRole.TECHNICIAN),
             is_biological_fixed_time=True, tolerance_minutes=15,
+            is_biological_reference=True,
+            reference_event_time=time(10, 0),
         ),
         TemplateStep(
             order=4, day=8,
@@ -244,6 +267,8 @@ ISO_10993_10_SENS = StudyTemplate(
             start=time(10, 0), duration_minutes=60,
             roles=(UserRole.TECHNICIAN,),
             is_biological_fixed_time=True, tolerance_minutes=60,
+            reference_step_order=3,
+            reference_offset_hours=24,
         ),
         TemplateStep(
             order=5, day=9,
@@ -252,6 +277,8 @@ ISO_10993_10_SENS = StudyTemplate(
             start=time(10, 0), duration_minutes=90,
             roles=(UserRole.TECHNICIAN,),
             is_biological_fixed_time=True, tolerance_minutes=60,
+            reference_step_order=3,
+            reference_offset_hours=48,
         ),
     ),
 )
@@ -287,6 +314,8 @@ ISO_10993_11_ACUTE = StudyTemplate(
             start=time(9, 0), duration_minutes=180,
             roles=(UserRole.STUDY_DIRECTOR, UserRole.TECHNICIAN),
             is_biological_fixed_time=True, tolerance_minutes=15,
+            is_biological_reference=True,
+            reference_event_time=time(10, 0),
         ),
         TemplateStep(
             order=4, day=8,
@@ -295,6 +324,8 @@ ISO_10993_11_ACUTE = StudyTemplate(
             start=time(10, 0), duration_minutes=60,
             roles=(UserRole.TECHNICIAN,),
             is_biological_fixed_time=True, tolerance_minutes=60,
+            reference_step_order=3,
+            reference_offset_hours=24,
         ),
         TemplateStep(
             order=5, day=9,
@@ -303,6 +334,8 @@ ISO_10993_11_ACUTE = StudyTemplate(
             start=time(10, 0), duration_minutes=60,
             roles=(UserRole.TECHNICIAN,),
             is_biological_fixed_time=True, tolerance_minutes=60,
+            reference_step_order=3,
+            reference_offset_hours=48,
         ),
         TemplateStep(
             order=6, day=10,
@@ -311,6 +344,8 @@ ISO_10993_11_ACUTE = StudyTemplate(
             start=time(10, 0), duration_minutes=120,
             roles=(UserRole.TECHNICIAN,),
             is_biological_fixed_time=True, tolerance_minutes=60,
+            reference_step_order=3,
+            reference_offset_hours=72,
         ),
     ),
 )
@@ -349,6 +384,8 @@ ISO_10993_6_IMP = StudyTemplate(
             roles=(UserRole.STUDY_DIRECTOR, UserRole.TECHNICIAN),
             is_biological_fixed_time=True, tolerance_minutes=15,
             note="İmplantasyon referans saati ≈10:00; 24/48/72. saat gözlemleri bu saate sabitlenir.",
+            is_biological_reference=True,
+            reference_event_time=time(10, 0),
         ),
         TemplateStep(
             order=4, day=8,
@@ -357,6 +394,8 @@ ISO_10993_6_IMP = StudyTemplate(
             start=time(10, 0), duration_minutes=60,
             roles=(UserRole.TECHNICIAN,),
             is_biological_fixed_time=True, tolerance_minutes=120,
+            reference_step_order=3,
+            reference_offset_hours=24,
         ),
         TemplateStep(
             order=5, day=9,
@@ -365,6 +404,8 @@ ISO_10993_6_IMP = StudyTemplate(
             start=time(10, 0), duration_minutes=60,
             roles=(UserRole.TECHNICIAN,),
             is_biological_fixed_time=True, tolerance_minutes=120,
+            reference_step_order=3,
+            reference_offset_hours=48,
         ),
         TemplateStep(
             order=6, day=10,
@@ -373,6 +414,8 @@ ISO_10993_6_IMP = StudyTemplate(
             start=time(10, 0), duration_minutes=60,
             roles=(UserRole.TECHNICIAN,),
             is_biological_fixed_time=True, tolerance_minutes=120,
+            reference_step_order=3,
+            reference_offset_hours=72,
         ),
         TemplateStep(
             order=7, day=14,

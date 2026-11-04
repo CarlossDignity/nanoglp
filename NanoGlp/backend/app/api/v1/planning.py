@@ -19,15 +19,18 @@ from app.services.document_parser import CANONICAL_STUDY_CODE_MAPPINGS
 from app.services.scheduling_engine import (
     EXCLUDED_WORKLOAD_ROLES,
     REFERENCE_DATE,
+    _safe_capacity_report,
     apply_conflict_resolution,
     build_conflict_resolutions,
     check_personnel_workload,
     calculate_personnel_workload,
+    compute_biological_dependency_info,
     enrich_conflicts_with_category,
     get_all_studies_calendar_details,
     get_study_schedule_detail,
     is_eligible_lab_personnel,
     recompute_all_conflicts,
+    revalidate_study_conflicts,
     schedule_new_study,
     sync_historical_completion_and_conflicts,
     MAX_DAILY_WORKLOAD_MINUTES,
@@ -106,11 +109,41 @@ class ApplyResolutionRequest(BaseModel):
 
 
 class UpdateStepStatusRequest(BaseModel):
-    status: StepStatus
+    status: Optional[StepStatus] = None
     notes: Optional[str] = None
+    actual_start: Optional[str | datetime] = None
+    actual_end: Optional[str | datetime] = None
+    actual_reference_time: Optional[str | datetime] = None
+    biological_reference_time: Optional[str | datetime] = None
+    reference_time: Optional[str | datetime] = None
+    deviation_notes: Optional[str] = None
 
 
-def _serialize_step(s: StudyStep) -> dict:
+def _parse_step_dt(val: Optional[str | datetime], fallback_date: date) -> Optional[datetime]:
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val
+    raw = str(val).strip()
+    if not raw:
+        return None
+    if len(raw) in (5, 8) and ":" in raw and "T" not in raw and "-" not in raw:
+        parts = [int(x) for x in raw.split(":")]
+        return datetime.combine(fallback_date, time(parts[0], parts[1], parts[2] if len(parts) > 2 else 0))
+    return datetime.fromisoformat(raw.replace("Z", ""))
+
+
+def _serialize_step(s: StudyStep, study_steps: Optional[List[StudyStep]] = None) -> dict:
+    bio_item: dict = {}
+    dep_steps: list = []
+    rev_proposals: list = []
+    if s.study is not None:
+        steps_list = study_steps if study_steps is not None else list(getattr(s.study, "steps", None) or [s])
+        bio_info = compute_biological_dependency_info(s.study, steps_list)
+        bio_item = bio_info["by_step_id"].get(s.id) or {}
+        dep_steps = bio_info["dependent_by_ref_order"].get(s.step_order, [])
+        rev_proposals = bio_info["revision_proposals"]
+
     return {
         "id": s.id,
         "study_id": s.study_id,
@@ -125,6 +158,19 @@ def _serialize_step(s: StudyStep) -> dict:
         "planned_end": s.planned_end.isoformat(),
         "actual_start": s.actual_start.isoformat() if s.actual_start else None,
         "actual_end": s.actual_end.isoformat() if s.actual_end else None,
+        "actual_reference_time": (
+            s.actual_reference_time.isoformat() if getattr(s, "actual_reference_time", None) else None
+        ),
+        "planned_reference_time": bio_item.get("planned_reference_time"),
+        "expected_start": bio_item.get("expected_start", s.planned_start.isoformat()),
+        "expected_end": bio_item.get("expected_end", s.planned_end.isoformat()),
+        "expected_reference_time": bio_item.get("expected_reference_time"),
+        "reference_deviation_minutes": bio_item.get("deviation_minutes", 0),
+        "exceeds_biological_tolerance": bio_item.get("exceeds_tolerance", False),
+        "requires_plan_revision": bio_item.get("requires_revision", False),
+        "revision_suggestion": bio_item.get("revision_suggestion"),
+        "dependent_steps": dep_steps,
+        "revision_proposals": rev_proposals,
         "duration_minutes": s.duration_minutes,
         "is_biological_fixed_time": s.is_biological_fixed_time,
         "biological_tolerance_minutes": s.biological_tolerance_minutes,
@@ -571,6 +617,20 @@ def api_approve_study_plan(
             detail=f"'{study.study_code}' çalışması için henüz takvim adımları oluşturulmamış. Önce planlama yapın.",
         )
 
+    revalidate_study_conflicts(db, study, preserve_weekend_approvals=True)
+    db.commit()
+
+    template = get_template(study.template_code or DEFAULT_TEMPLATE_CODE, db=db)
+    cap_info = _safe_capacity_report(db, study, template)
+    if not cap_info.get("verified", False):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"'{study.study_code}' çalışması için oda ve cihaz kapasitesi doğrulanamadı "
+                f"({cap_info.get('error', 'kapasite servisi hatası')}). Kapasite doğrulanmadan çalışma onaylanamaz."
+            ),
+        )
+
     unresolved_critical = (
         db.query(Conflict)
         .filter(
@@ -1005,13 +1065,40 @@ def api_update_step_status(
 
     old_status = step.status.value
     now = datetime.utcnow()
-    step.status = payload.status
-    if payload.status == StepStatus.IN_PROGRESS and not step.actual_start:
+    fallback_date = step.planned_start.date()
+    parsed_start = _parse_step_dt(payload.actual_start, fallback_date)
+    parsed_end = _parse_step_dt(payload.actual_end, fallback_date)
+    raw_ref = (
+        payload.actual_reference_time
+        if payload.actual_reference_time is not None
+        else (payload.biological_reference_time if payload.biological_reference_time is not None else payload.reference_time)
+    )
+    parsed_ref = _parse_step_dt(raw_ref, fallback_date)
+
+    if payload.status is not None:
+        step.status = payload.status
+    if parsed_start is not None:
+        step.actual_start = parsed_start
+    if parsed_end is not None:
+        step.actual_end = parsed_end
+    if parsed_ref is not None:
+        step.actual_reference_time = parsed_ref
+    if payload.deviation_notes is not None:
+        step.deviation_notes = payload.deviation_notes
+    elif payload.notes and not step.deviation_notes:
+        step.deviation_notes = payload.notes
+
+    if step.status == StepStatus.IN_PROGRESS and not step.actual_start:
         step.actual_start = now
-    elif payload.status == StepStatus.COMPLETED:
+    elif step.status == StepStatus.COMPLETED:
         if not step.actual_start:
             step.actual_start = now
-        step.actual_end = now
+        if not step.actual_end:
+            step.actual_end = now
+
+    db.flush()
+    if step.study is not None:
+        revalidate_study_conflicts(db, step.study, preserve_weekend_approvals=True)
 
     db.add(AuditLog(
         user_id=current_user.id,
@@ -1019,12 +1106,42 @@ def api_update_step_status(
         entity_id=step.id,
         action="UPDATE_STEP_STATUS",
         old_values={"status": old_status},
-        new_values={"status": payload.status.value},
-        reason=payload.notes or f"{current_user.full_name} görev durumunu {old_status} -> {payload.status.value} olarak güncelledi.",
+        new_values={
+            "status": step.status.value,
+            "actual_start": step.actual_start.isoformat() if step.actual_start else None,
+            "actual_end": step.actual_end.isoformat() if step.actual_end else None,
+            "actual_reference_time": step.actual_reference_time.isoformat() if step.actual_reference_time else None,
+        },
+        reason=payload.notes or payload.deviation_notes or f"{current_user.full_name} görev durumunu {old_status} -> {step.status.value} olarak güncelledi.",
     ))
     db.commit()
     db.refresh(step)
-    return _serialize_step(step)
+    study_steps = (
+        db.query(StudyStep)
+        .options(selectinload(StudyStep.assignees), selectinload(StudyStep.study))
+        .filter(StudyStep.study_id == step.study_id, StudyStep.status != StepStatus.CANCELLED)
+        .order_by(StudyStep.step_order.asc())
+        .all()
+    )
+    open_conflicts = (
+        db.query(Conflict)
+        .filter(Conflict.study_id == step.study_id, Conflict.is_resolved == False)  # noqa: E712
+        .order_by(Conflict.id.asc())
+        .all()
+    )
+    serialized = _serialize_step(step, study_steps=study_steps)
+    serialized["conflicts"] = [
+        {
+            "id": c.id,
+            "conflict_type": c.conflict_type.value,
+            "severity": c.severity.value,
+            "title": c.title,
+            "description": c.description,
+            "is_resolved": c.is_resolved,
+        }
+        for c in open_conflicts
+    ]
+    return serialized
 
 
 @router.get("/summary", summary="Yönetici Dashboard Özeti")

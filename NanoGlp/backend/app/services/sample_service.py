@@ -1908,7 +1908,7 @@ def import_study_status_workbook(
         scheduled_count = sched_res["scheduled"]
         from app.services.scheduling_engine import sync_historical_completion_and_conflicts
 
-        sync_historical_completion_and_conflicts(db)
+        sync_historical_completion_and_conflicts(db, from_excel_import=True)
         db.commit()
 
     sync_faz_9_3_sample_fields(db)

@@ -51,6 +51,7 @@ class StudyStep(Base):
     status = Column(Enum(StepStatus), default=StepStatus.PENDING, nullable=False)
     actual_start = Column(DateTime, nullable=True)
     actual_end = Column(DateTime, nullable=True)
+    actual_reference_time = Column(DateTime, nullable=True)  # Biyolojik referans olay (enjeksiyon/uygulama) gerçekleşme zamanı
     deviation_notes = Column(Text, nullable=True) # GLP Sapma Kaydı (Planlanan saatten farklı ise zorunlu açıklama)
     completed_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
 
