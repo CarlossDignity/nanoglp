@@ -1181,6 +1181,18 @@ def main():
             rc_res = client.get("/api/v1/room-capacities", headers=h_tfm).json()
             check(rc_res.get("available_animals") == {"Guinea pig": 152, "Rabbit": 98, "Mouse": 20, "Rat": 19},
                   "Tesiste mevcut hayvan stok bilgisi (Guinea pig: 152, Rabbit: 98, Mouse: 20, Rat: 19) doğrulandı")
+            # [1]..[14] bölümlerinde oluşturulan geçici test kayıtlarını açıkça is_historical_demo=True olarak işaretle
+            from app.models.sample import SampleRecord as _SR83
+            for _sr_tmp in db.query(_SR83).filter(_SR83.study_code.in_(["GLP2026-090", "GLP2026-091"])).all():
+                _wf_tmp = dict(_sr_tmp.workflow or {})
+                _wf_tmp["is_historical_demo"] = True
+                _sr_tmp.workflow = _wf_tmp
+            for _st_tmp in db.query(Study).all():
+                if (_st_tmp.study_code or "").startswith(("T-", "26/", "GLP-2026-EDR-")) or _st_tmp.study_code in ("GLP2026-090", "GLP2026-091"):
+                    _md_tmp = dict(_st_tmp.dossier_metadata or {})
+                    _md_tmp["is_historical_demo"] = True
+                    _st_tmp.dossier_metadata = _md_tmp
+            db.commit()
             xlsx_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "Study Status last version (2).xlsx"))
             with open(xlsx_path, "rb") as _xf:
                 xlsx_bytes = _xf.read()

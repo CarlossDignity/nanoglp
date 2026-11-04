@@ -1414,7 +1414,7 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
         self.assertFalse(d0.get("requires_reference_time"), "Esnek idari adım requires_reference_time=False dönmeli")
 
     # ------------------------------------------------------------------
-    # 12. Bilinmeyen ekstraksiyon bilgisinin polar olarak varsayılmaması
+    # 12. Ekstraksiyon kaynak tanımının 9 kombinasyonun tamamında tutarlılığı
     # ------------------------------------------------------------------
     def test_12_unknown_extraction_info_not_assumed_polar(self):
         wb = self.db.query(Equipment).filter(Equipment.code == "EQ-WB-001").first()
@@ -1425,7 +1425,57 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
         sd = self.people["ezgi"]
         monday = date(2026, 11, 2)
 
-        # Çalışma 1: Ekstraksiyon bilgisi bilinmiyor (None / None)
+        # (A) 9 kombinasyonun tamamı: {True, False, None} x {True, False, None}
+        expected_matrix = [
+            (True, True, True, True, True, False, [], "POLAR_AND_APOLAR"),
+            (True, False, True, False, True, False, [], "POLAR_ONLY"),
+            (False, True, False, True, True, False, [], "APOLAR_ONLY"),
+            (False, False, False, False, False, False, [], "NONE"),
+            (True, None, True, False, True, True, ["apolar"], "PARTIAL_MISSING"),
+            (False, None, False, False, False, True, ["apolar"], "PARTIAL_MISSING"),
+            (None, True, False, True, True, True, ["polar"], "PARTIAL_MISSING"),
+            (None, False, False, False, False, True, ["polar"], "PARTIAL_MISSING"),
+            (None, None, False, False, False, True, ["polar", "apolar"], "MISSING"),
+        ]
+        for idx, (pol, apo, exp_u_pol, exp_u_apo, exp_wb, exp_miss, exp_comp, exp_status) in enumerate(expected_matrix, start=1):
+            st_cand = Study(
+                study_code=f"FIX12-MAT-{idx}",
+                title=f"Matrix {pol}/{apo}",
+                test_item_name="Polymer",
+                study_director_id=sd.id,
+                status=StudyStatus.DRAFT,
+                extraction_polar=pol,
+                extraction_non_polar=apo,
+            )
+            self.db.add(st_cand)
+            self.db.commit()
+            usage = se.get_study_extraction_usage(st_cand)
+            self.assertEqual(usage["uses_polar"], exp_u_pol, f"({pol}, {apo}) uses_polar uyumsuz")
+            self.assertEqual(usage["uses_apolar"], exp_u_apo, f"({pol}, {apo}) uses_apolar uyumsuz")
+            self.assertEqual(usage["uses_water_bath"], exp_wb, f"({pol}, {apo}) uses_water_bath uyumsuz")
+            self.assertEqual(usage["polar_known"], pol is not None, f"({pol}, {apo}) polar_known uyumsuz")
+            self.assertEqual(usage["apolar_known"], apo is not None, f"({pol}, {apo}) apolar_known uyumsuz")
+            self.assertEqual(usage["missing_extraction_info"], exp_miss, f"({pol}, {apo}) missing_extraction_info uyumsuz")
+            self.assertEqual(usage["missing_components"], exp_comp, f"({pol}, {apo}) missing_components uyumsuz")
+            self.assertEqual(usage["status"], exp_status, f"({pol}, {apo}) status uyumsuz")
+
+            # Planlama motorunda cihaz atamasının aynı kaynak tanımını kullandığını doğrula
+            sched_date = monday + timedelta(days=idx * 14)
+            res_m = schedule_new_study(self.db, st_cand.id, sched_date)
+            ext_step_m = (
+                self.db.query(StudyStep)
+                .filter(StudyStep.study_id == st_cand.id, StudyStep.study_day == 4)
+                .first()
+            )
+            self.assertEqual(
+                ext_step_m.equipment_id,
+                wb.id if exp_wb else None,
+                f"({pol}, {apo}) için ekstraksiyon adımı equipment_id ataması uses_water_bath ile aynı olmalı",
+            )
+            self.assertEqual(res_m.get("missing_extraction_info"), exp_miss)
+            self.assertEqual(res_m.get("extraction_info_status"), exp_status)
+
+        # (B) Aynı tarihte (monday) çakışma, rezervasyon ve alternatif tarih önerisi tutarlılığı
         s_unknown = Study(
             study_code="FIX12-UNKNOWN",
             title="Unknown Extraction Study",
@@ -1435,7 +1485,6 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
             extraction_polar=None,
             extraction_non_polar=None,
         )
-        # Çalışma 2: Yalnızca apolar (False / True)
         s_apolar = Study(
             study_code="FIX12-APOLAR",
             title="Apolar Only Study",
@@ -1445,7 +1494,6 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
             extraction_polar=False,
             extraction_non_polar=True,
         )
-        # Çalışma 3: Polar (True / False)
         s_polar = Study(
             study_code="FIX12-POLAR",
             title="Polar Study",
@@ -1462,63 +1510,68 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
         res_apo = schedule_new_study(self.db, s_apolar.id, monday)
         res_pol = schedule_new_study(self.db, s_polar.id, monday)
 
-        # 1) Bilinmeyen (None/None) çalışmaya Su Banyosu (EQ-WB-001) atanmamalı ve eksik bilgi durumu açıkça görünmeli
         unk_ext_step = (
             self.db.query(StudyStep)
             .filter(StudyStep.study_id == s_unknown.id, StudyStep.study_day == 4)
             .first()
         )
-        self.assertIsNone(
-            unk_ext_step.equipment_id,
-            "extraction_polar=None iken ekstraksiyon adımına Su Banyosu (equipment_id) varsayılan olarak atanmamalı",
-        )
-        self.assertTrue(
-            res_unk.get("missing_extraction_info"),
-            "extraction_polar=None ve extraction_non_polar=None olduğunda missing_extraction_info=True dönmeli",
-        )
-        self.assertEqual(res_unk.get("extraction_info_status"), "MISSING")
-
-        # 2) Yalnızca apolar (False/True) çalışmaya Su Banyosu atanmamalı
         apo_ext_step = (
             self.db.query(StudyStep)
             .filter(StudyStep.study_id == s_apolar.id, StudyStep.study_day == 4)
             .first()
         )
-        self.assertIsNone(apo_ext_step.equipment_id, "Yalnızca apolar çalışmaya Su Banyosu atanmamalı")
-        self.assertFalse(res_apo.get("missing_extraction_info"))
-        self.assertEqual(res_apo.get("extraction_info_status"), "APOLAR_ONLY")
-
-        # 3) Polar (True/False) çalışmaya Su Banyosu atanmalı, ancak s_unknown (None/None) yüzünden kesinleşmiş
-        #    Su Banyosu kapasite aşımı üretilmemeli (kapasite=1 ve yalnızca s_polar kesin polar kullanıyor)
         pol_ext_step = (
             self.db.query(StudyStep)
             .filter(StudyStep.study_id == s_polar.id, StudyStep.study_day == 4)
             .first()
         )
-        self.assertEqual(pol_ext_step.equipment_id, wb.id, "Polar çalışmaya Su Banyosu atanmalı")
+        self.assertIsNone(unk_ext_step.equipment_id, "None/None çalışmaya Su Banyosu atanmamalı")
+        self.assertEqual(apo_ext_step.equipment_id, wb.id, "Apolar (False/True) çalışmaya Su Banyosu (EQ-WB-001) atanmalı")
+        self.assertEqual(pol_ext_step.equipment_id, wb.id, "Polar (True/False) çalışmaya Su Banyosu (EQ-WB-001) atanmalı")
+
+        # Polar=1 ve Apolar=1 kapasitede: 1 Polar (s_polar) + 1 Apolar (s_apolar) + 1 Bilinmeyen (s_unknown)
+        # hiçbirinde Su Banyosu kapasite aşımı üretmemeli
         pol_wb_confs = [
             c for c in res_pol["conflicts"]
             if c["type"] == "EQUIPMENT_OVERLAP" and "Su Banyosu" in (c["title"] or "")
         ]
-        self.assertEqual(
-            len(pol_wb_confs),
-            0,
-            "Bilinmeyen (None) ekstraksiyonlu çalışma su banyosunu kesin kullanıyor sayılıp s_polar'da sahte cihaz çakışması üretmemeli",
+        self.assertEqual(len(pol_wb_confs), 0, "None/None çalışma polar kapasiteyi tüketmemeli")
+
+        # İkinci bir Apolar (None/True -> apolar=True, polar=bilinmeyen) eklendiğinde:
+        # Apolar kapasite (Max: 1) aşımı yakalanmalı ve alternatif tarih önerisi aynı kaynağı kullanmalı
+        s_apolar_partial = Study(
+            study_code="FIX12-APOLAR-PARTIAL",
+            title="Partial Unknown Apolar Study",
+            test_item_name="Apolar Partial",
+            study_director_id=sd.id,
+            status=StudyStatus.DRAFT,
+            extraction_polar=None,
+            extraction_non_polar=True,
+        )
+        self.db.add(s_apolar_partial)
+        self.db.commit()
+        res_apo2 = schedule_new_study(self.db, s_apolar_partial.id, monday)
+        self.assertTrue(res_apo2.get("missing_extraction_info"), "polar=None olduğu için kısmi eksik bilgi korunmalı")
+        self.assertEqual(res_apo2.get("extraction_info_status"), "PARTIAL_MISSING")
+        apo2_confs = [
+            c for c in res_apo2["conflicts"]
+            if c["type"] == "EQUIPMENT_OVERLAP" and "Apolar Kapasite Aşımı" in (c["title"] or "")
+        ]
+        self.assertEqual(len(apo2_confs), 1, "Apolar=True olan ikinci çalışma Apolar Kapasite Aşımı üretmeli")
+        self.assertTrue(
+            any(r["action"] == "SHIFT_TO_NEXT_AVAILABLE_EQUIPMENT_DATE" for r in apo2_confs[0].get("resolutions", [])),
+            "Alternatif cihaz tarihi önerisi Apolar çakışmasında da üretilmeli",
         )
 
-        # 4) Eksik bilgi sonradan tamamlandığında (s_unknown -> extraction_polar=True) yeniden doğrulama
-        #    hem cihaz atamasını güncellemeli hem de gerçek Su Banyosu çakışmasını yakalamalı!
+        # Eksik bilgi sonradan tamamlandığında (s_unknown -> extraction_polar=True, extraction_non_polar=False)
+        # yeniden doğrulama hem cihaz atamasını güncellemeli hem de Polar Su Banyosu çakışmasını yakalamalı
         s_unknown.extraction_polar = True
         s_unknown.extraction_non_polar = False
         self.db.commit()
         revalidate_study_conflicts(self.db, s_unknown)
         self.db.commit()
         self.db.refresh(unk_ext_step)
-        self.assertEqual(
-            unk_ext_step.equipment_id,
-            wb.id,
-            "Eksik ekstraksiyon bilgisi polar=True olarak tamamlandığında Su Banyosu atanmalı",
-        )
+        self.assertEqual(unk_ext_step.equipment_id, wb.id)
         unk_wb_confs = (
             self.db.query(Conflict)
             .filter(
@@ -1528,10 +1581,661 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
             )
             .all()
         )
-        self.assertTrue(
-            any("Su Banyosu" in (c.title or "") for c in unk_wb_confs),
-            "Eksik ekstraksiyon bilgisi polar=True olarak tamamlandığında Su Banyosu çakışması tespit edilmeli",
+        self.assertTrue(any("Polar Kapasite Aşımı" in (c.title or "") for c in unk_wb_confs))
+
+    # ------------------------------------------------------------------
+    # 13. MyTasks ekranında gerçekleşen veri üretilmemesi ve aksiyonların ayrımı
+    # ------------------------------------------------------------------
+    def test_13_mytasks_no_fabricated_actuals_and_separate_action_semantics(self):
+        sd = self.people["ezgi"]
+        tech = self.people["invivo_1"]
+        s_mt = Study(
+            study_code="FIX13-MYTASKS",
+            title="MyTasks Non-Fabrication Study",
+            test_item_name="Gel Sample",
+            study_director_id=sd.id,
+            status=StudyStatus.DRAFT,
+            extraction_polar=True,
+            extraction_non_polar=False,
         )
+        self.db.add(s_mt)
+        self.db.commit()
+        schedule_new_study(self.db, s_mt.id, date(2026, 12, 7))
+        s_mt.status = StudyStatus.IN_PROGRESS
+        self.db.commit()
+
+        steps = (
+            self.db.query(StudyStep)
+            .filter(StudyStep.study_id == s_mt.id)
+            .order_by(StudyStep.step_order.asc())
+            .all()
+        )
+        day7 = next(s for s in steps if s.study_day == 7)  # Plan: 2026-12-14 09:00 - 12:00, Ref: 10:00
+        day8 = next(s for s in steps if s.study_day == 8)  # Plan: 2026-12-15 10:00 - 10:45, Ref: 10:00
+        day7.assignees = [tech]
+        day8.assignees = [tech]
+        self.db.commit()
+
+        h_tech = self.h_tech1
+
+        # 1) Yalnızca 10:45 referansı kaydedildiğinde:
+        #    - 09:00 / 12:00 plan saatleri actual_start / actual_end alanlarına YAZILMAMALI
+        #    - Görev kendiliğinden COMPLETED olmamalı (PENDING kalmalı)
+        r_save_ref = self.client.patch(
+            f"/api/v1/planning/steps/{day7.id}/status",
+            headers=h_tech,
+            json={"actual_reference_time": "2026-12-14T10:45:00"},
+        )
+        self.assertEqual(r_save_ref.status_code, 200, r_save_ref.text)
+        d7_after_ref = r_save_ref.json()
+        self.assertEqual(d7_after_ref["status"], "PENDING", "Referans kaydetmek bekleyen görevi otomatik COMPLETED yapmamalı")
+        self.assertEqual(d7_after_ref["actual_reference_time"], "2026-12-14T10:45:00")
+        self.assertIsNone(d7_after_ref["actual_start"], "Planlanan 09:00 veya 10:45 actual_start alanına yazılmamalı")
+        self.assertIsNone(d7_after_ref["actual_end"], "Planlanan 12:00 veya 10:45 actual_end alanına yazılmamalı")
+
+        # 2) 'Başlat' henüz gerçekleşmemiş planlanan referansı kaydetmemeli
+        r_start = self.client.patch(
+            f"/api/v1/planning/steps/{day8.id}/status",
+            headers=h_tech,
+            json={"status": "IN_PROGRESS"},
+        )
+        self.assertEqual(r_start.status_code, 200, r_start.text)
+        d8_after_start = r_start.json()
+        self.assertEqual(d8_after_start["status"], "IN_PROGRESS")
+        self.assertIsNotNone(d8_after_start["actual_start"])
+        self.assertIsNone(d8_after_start["actual_end"])
+        self.assertIsNone(
+            d8_after_start["actual_reference_time"],
+            "Başlat aksiyonu henüz girilmemiş/planlanan referans saatini actual_reference_time olarak kaydetmemeli",
+        )
+
+        # 3) Girilmiş gerçek başlangıç/bitiş bilgileri referansı değiştirmek için sessizce genişletilmemeli (422 dönmeli)
+        day7.status = StepStatus.COMPLETED
+        day7.actual_start = datetime(2026, 12, 14, 9, 0)
+        day7.actual_end = datetime(2026, 12, 14, 12, 0)
+        self.db.commit()
+        r_out_of_bounds = self.client.patch(
+            f"/api/v1/planning/steps/{day7.id}/status",
+            headers=h_tech,
+            json={"actual_reference_time": "2026-12-14T12:30:00"},
+        )
+        self.assertEqual(
+            r_out_of_bounds.status_code,
+            422,
+            "Mevcut actual_start/actual_end aralığı dışındaki referans saati sessizce genişletilmeyip 422 ile reddedilmeli",
+        )
+        self.db.expire_all()
+        d7_db = self.db.query(StudyStep).filter(StudyStep.id == day7.id).first()
+        self.assertEqual(d7_db.actual_start, datetime(2026, 12, 14, 9, 0))
+        self.assertEqual(d7_db.actual_end, datetime(2026, 12, 14, 12, 0))
+
+        # 4) MyTasks.jsx kaynak kodunda buildCompatibleBounds kaldırılmış ve başlangıç referans girişi boş olmalı
+        mytasks_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "frontend", "src", "pages", "MyTasks.jsx")
+        )
+        with open(mytasks_path, "r", encoding="utf-8") as f:
+            mytasks_src = f.read()
+        self.assertNotIn("buildCompatibleBounds", mytasks_src, "buildCompatibleBounds tamamen kaldırılmış olmalı")
+
+    # ------------------------------------------------------------------
+    # 14. Demo temizliğinde çalışma kodundan tahmin ederek silmenin kaldırılması
+    # ------------------------------------------------------------------
+    def test_14_excel_import_preserves_non_excel_records_without_code_guessing(self):
+        from app.services.sample_service import import_study_status_workbook, sync_faz_9_3_sample_fields
+
+        sd = self.people["ezgi"]
+        tech = self.people["invivo_1"]
+        tfm_user = self.people["emine"]
+
+        # Excel dosyasında OLMAYAN gerçek kayıtlar: GLP2026-090, GLP2026-151, GLP2027-151 ve T-REAL-001
+        preserved_codes = ["GLP2026-090", "GLP2026-151", "GLP2027-151", "T-REAL-001"]
+        step_ids_by_code = {}
+        for idx, code in enumerate(preserved_codes, start=1):
+            sr = SampleRecord(
+                study_code=code,
+                glp_type="GLP",
+                stored_status="ONGOING",
+                test_item_name=f"Real Test Item {code}",
+                sponsor_name="Real Sponsor",
+                planned_start=date(2026, 11, 10 + idx),
+            )
+            st = Study(
+                study_code=code,
+                title=f"Real Study {code}",
+                test_item_name=f"Real Test Item {code}",
+                study_director_id=sd.id,
+                status=StudyStatus.IN_PROGRESS,
+                acclimatization_start_date=date(2026, 11, 10 + idx),
+            )
+            self.db.add_all([sr, st])
+            self.db.flush()
+            st_step = StudyStep(
+                study_id=st.id,
+                step_order=1,
+                study_day=0,
+                step_name=f"Gerçek Adım {code}",
+                planned_start=datetime(2026, 11, 10 + idx, 9, 0),
+                planned_end=datetime(2026, 11, 10 + idx, 11, 0),
+                status=StepStatus.IN_PROGRESS,
+                actual_start=datetime(2026, 11, 10 + idx, 9, 5),
+            )
+            st_step.assignees = [tech]
+            self.db.add(st_step)
+            self.db.flush()
+            step_ids_by_code[code] = st_step.id
+
+        # Açıkça demo olarak işaretlenmiş bir kayıt (yalnızca bu silinebilir)
+        sr_demo = SampleRecord(
+            study_code="DEMO-EXPLICIT-001",
+            glp_type="GLP",
+            stored_status="PLANNED",
+            workflow={"is_historical_demo": True},
+        )
+        st_demo = Study(
+            study_code="DEMO-EXPLICIT-001",
+            title="Explicit Demo Study",
+            test_item_name="Demo",
+            study_director_id=sd.id,
+            status=StudyStatus.DRAFT,
+            dossier_metadata={"is_historical_demo": True},
+        )
+        self.db.add_all([sr_demo, st_demo])
+        self.db.commit()
+
+        xlsx_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "Study Status last version (2).xlsx")
+        )
+        with open(xlsx_path, "rb") as xf:
+            xlsx_bytes = xf.read()
+
+        import_study_status_workbook(self.db, xlsx_bytes, tfm_user, auto_schedule=False, prune_non_excel=True)
+        sync_faz_9_3_sample_fields(self.db)
+        self.db.expire_all()
+
+        for code in preserved_codes:
+            sr_after = self.db.query(SampleRecord).filter(SampleRecord.study_code == code).first()
+            st_after = self.db.query(Study).filter(Study.study_code == code).first()
+            step_after = self.db.query(StudyStep).filter(StudyStep.id == step_ids_by_code[code]).first()
+            self.assertIsNotNone(sr_after, f"Excel'de olmayan gerçek SampleRecord ({code}) silinmemeli")
+            self.assertIsNotNone(st_after, f"Excel'de olmayan gerçek Study ({code}) silinmemeli")
+            self.assertIsNotNone(step_after, f"Excel'de olmayan gerçek çalışmanın adımı ({code}) silinmemeli")
+            self.assertEqual(step_after.status, StepStatus.IN_PROGRESS)
+            self.assertEqual([u.id for u in step_after.assignees], [tech.id])
+
+        self.assertIsNone(
+            self.db.query(Study).filter(Study.study_code == "DEMO-EXPLICIT-001").first(),
+            "Açıkça is_historical_demo=True işaretli demo kaydı temizlenebilmeli",
+        )
+
+    # ------------------------------------------------------------------
+    # 15. Otomatik operasyon saatlerinin tesis yerel saat standardını kullanması
+    # ------------------------------------------------------------------
+    def test_15_auto_operational_timestamps_use_facility_local_time_standard(self):
+        sd = self.people["ezgi"]
+        s_tz = Study(
+            study_code="FIX15-TZ",
+            title="Facility Local Time Study",
+            test_item_name="TZ Item",
+            study_director_id=sd.id,
+            status=StudyStatus.IN_PROGRESS,
+        )
+        self.db.add(s_tz)
+        self.db.commit()
+        step_tz = StudyStep(
+            study_id=s_tz.id,
+            step_order=1,
+            study_day=0,
+            step_name="Saat Standardı Test Adımı",
+            planned_start=datetime(2026, 12, 14, 9, 0),
+            planned_end=datetime(2026, 12, 14, 15, 0),
+            status=StepStatus.PENDING,
+        )
+        self.db.add(step_tz)
+        self.db.commit()
+
+        # Türkiye saati 12:00:00 (UTC 09:00:00) olarak sabitlendiğinde 'Başlat' actual_start=12:00 üretmeli
+        frozen_local_noon = datetime(2026, 12, 14, 12, 0, 0)
+        with patch("app.api.v1.planning._facility_now", return_value=frozen_local_noon):
+            r_start = self.client.patch(
+                f"/api/v1/planning/steps/{step_tz.id}/status",
+                headers=self.h_tfm,
+                json={"status": "IN_PROGRESS"},
+            )
+            self.assertEqual(r_start.status_code, 200, r_start.text)
+            self.assertEqual(
+                r_start.json()["actual_start"],
+                "2026-12-14T12:00:00",
+                "Türkiye saati 12:00'ye sabitlendiğinde Başlat aksiyonu actual_start alanını 12:00 üretmeli (UTC 09:00 değil)",
+            )
+
+        # Açık Z (09:00Z) ve +03:00 (12:00+03:00) girişleri aynı yerel sonucu (12:00:00) vermeli
+        r_z = self.client.patch(
+            f"/api/v1/planning/steps/{step_tz.id}/status",
+            headers=self.h_tfm,
+            json={"actual_start": "2026-12-14T09:00:00Z"},
+        )
+        r_plus3 = self.client.patch(
+            f"/api/v1/planning/steps/{step_tz.id}/status",
+            headers=self.h_tfm,
+            json={"actual_start": "2026-12-14T12:00:00+03:00"},
+        )
+        self.assertEqual(r_z.status_code, 200)
+        self.assertEqual(r_plus3.status_code, 200)
+        self.assertEqual(r_z.json()["actual_start"], "2026-12-14T12:00:00")
+        self.assertEqual(r_plus3.json()["actual_start"], "2026-12-14T12:00:00")
+        self.assertEqual(r_z.json()["actual_start"], r_plus3.json()["actual_start"])
+
+    # ------------------------------------------------------------------
+    # 16. Tarihsel Excel aktarımında ONGOING -> COMPLETED geçişi
+    # ------------------------------------------------------------------
+    def test_16_historical_excel_import_ongoing_to_completed_transition(self):
+        import io
+        from openpyxl import Workbook
+        from app.services.sample_service import import_study_status_workbook
+
+        tfm_user = self.people["emine"]
+
+        def _make_workbook_bytes(status_label: str) -> bytes:
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "GLP Medikal"
+            for _ in range(7):
+                ws.append([])
+            row = [None] * 27
+            row[0] = 1
+            row[1] = "İntrakütanöz Reaktivite Testi (ISO 10993-23)"
+            row[2] = "Geçiş Test Ürünü"
+            row[3] = "Ezgi Nur AKIN"
+            row[4] = "ACME Medikal"
+            row[5] = "ACME Medikal"
+            row[6] = "veli@acme.com"
+            row[7] = "GLP2026-082"
+            row[8] = "İlknur TOKLU"
+            row[9] = "TKL-2026-082"
+            row[10] = date(2026, 9, 1)
+            row[11] = date(2026, 9, 2)
+            row[12] = "TI-2026-0082"
+            row[13] = "Edirne"
+            row[14] = 10
+            row[15] = "Mevcut"
+            row[16] = date(2026, 9, 4)
+            row[17] = date(2026, 9, 7)
+            row[18] = date(2026, 9, 7)
+            row[19] = None
+            row[20] = date(2026, 9, 20)
+            row[21] = "Ödendi"
+            row[22] = date(2026, 9, 24)
+            row[24] = status_label
+            ws.append(row)
+            buf = io.BytesIO()
+            wb.save(buf)
+            return buf.getvalue()
+
+        wb_ongoing = _make_workbook_bytes("Devam eden/On going")
+        wb_completed = _make_workbook_bytes("Biten/Finished")
+
+        # 1) İlk aktarım: ONGOING -> çalışma IN_PROGRESS, adımlar PENDING (newly_completed_steps == 0)
+        res1 = import_study_status_workbook(self.db, wb_ongoing, tfm_user, auto_schedule=True, prune_non_excel=False)
+        self.db.expire_all()
+        st1 = self.db.query(Study).filter(Study.study_code == "GLP2026-082").first()
+        steps1 = self.db.query(StudyStep).filter(StudyStep.study_id == st1.id).all()
+        self.assertEqual(st1.status, StudyStatus.IN_PROGRESS)
+        self.assertGreater(len(steps1), 0)
+        self.assertTrue(all(s.status == StepStatus.PENDING for s in steps1))
+        self.assertEqual(res1["newly_completed_steps"], 0)
+
+        # 2) Tekrar ONGOING aktarımı -> 0 değişiklik
+        res2 = import_study_status_workbook(self.db, wb_ongoing, tfm_user, auto_schedule=True, prune_non_excel=False)
+        self.db.expire_all()
+        steps2 = self.db.query(StudyStep).filter(StudyStep.study_id == st1.id).all()
+        self.assertEqual(res2["newly_completed_steps"], 0)
+        self.assertTrue(all(s.status == StepStatus.PENDING for s in steps2))
+
+        # 3) Güncellenmiş COMPLETED aktarımı -> çalışma COMPLETED, adımlar COMPLETED, actual_start/end boş (None)
+        res3 = import_study_status_workbook(self.db, wb_completed, tfm_user, auto_schedule=True, prune_non_excel=False)
+        self.db.expire_all()
+        st3 = self.db.query(Study).filter(Study.study_code == "GLP2026-082").first()
+        steps3 = self.db.query(StudyStep).filter(StudyStep.study_id == st3.id).all()
+        self.assertEqual(st3.status, StudyStatus.COMPLETED)
+        self.assertEqual(res3["newly_completed_steps"], len(steps3))
+        self.assertTrue(all(s.status == StepStatus.COMPLETED for s in steps3))
+        self.assertTrue(all(s.actual_start is None and s.actual_end is None for s in steps3))
+
+        # 4) Tekrar COMPLETED aktarımı -> 0 yeni değişiklik
+        res4 = import_study_status_workbook(self.db, wb_completed, tfm_user, auto_schedule=True, prune_non_excel=False)
+        self.assertEqual(res4["newly_completed_steps"], 0)
+
+    # ------------------------------------------------------------------
+    # 17. MyTasks gerçek tarayıcı (Headless Chrome) uçtan uca doğrulama testi
+    # ------------------------------------------------------------------
+    def test_17_mytasks_headless_browser_e2e_verification(self):
+        import json as _json
+        import socket
+        import subprocess
+        import threading
+        import time as _time
+        import uvicorn
+
+        chrome_candidates = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        ]
+        chrome_bin = next((p for p in chrome_candidates if os.path.exists(p)), None)
+        if not chrome_bin:
+            self.skipTest("Headless Chrome/Edge bulunamadı")
+
+        sd = self.people["ezgi"]
+        tech = self.people["invivo_1"]
+        s_e2e = Study(
+            study_code="FIX17-E2E",
+            title="Browser E2E MyTasks Study",
+            test_item_name="E2E Gel",
+            study_director_id=sd.id,
+            status=StudyStatus.DRAFT,
+            extraction_polar=True,
+            extraction_non_polar=False,
+        )
+        self.db.add(s_e2e)
+        self.db.commit()
+        schedule_new_study(self.db, s_e2e.id, date(2026, 12, 7))
+        s_e2e.status = StudyStatus.IN_PROGRESS
+        self.db.commit()
+
+        steps = (
+            self.db.query(StudyStep)
+            .filter(StudyStep.study_id == s_e2e.id)
+            .order_by(StudyStep.step_order.asc())
+            .all()
+        )
+        day7 = next(s for s in steps if s.study_day == 7)  # 2026-12-14 09:00-12:00, Plan Ref: 10:00
+        day8 = next(s for s in steps if s.study_day == 8)  # 2026-12-15 10:00-10:45, Plan Ref: 10:00
+        day7.assignees = [tech]
+        day8.assignees = [tech]
+        self.db.commit()
+
+        token = self.client.post(
+            "/api/v1/auth/login",
+            json={"username": "invivo_1", "password": DEFAULT_PASSWORD},
+        ).json()["access_token"]
+        user_info = self.client.get(
+            "/api/v1/auth/me",
+            headers={"Authorization": f"Bearer {token}"},
+        ).json()
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+
+        config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error")
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        try:
+            for _ in range(50):
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                        break
+                except OSError:
+                    _time.sleep(0.1)
+
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s2:
+                s2.bind(("127.0.0.1", 0))
+                cdp_port = s2.getsockname()[1]
+
+            user_data_dir = os.path.join(_TMP_DIR, "chrome_profile")
+            proc = subprocess.Popen(
+                [
+                    chrome_bin,
+                    "--headless=new",
+                    "--disable-gpu",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    f"--user-data-dir={user_data_dir}",
+                    f"--remote-debugging-port={cdp_port}",
+                    f"http://127.0.0.1:{port}/login",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                import urllib.request
+                import fitz  # noqa: F401
+                ws_url = None
+                for _ in range(50):
+                    try:
+                        with urllib.request.urlopen(f"http://127.0.0.1:{cdp_port}/json/list", timeout=0.5) as resp:
+                            tabs = _json.loads(resp.read().decode("utf-8"))
+                            page_tab = next((t for t in tabs if t.get("type") == "page"), None)
+                            if page_tab and page_tab.get("webSocketDebuggerUrl"):
+                                ws_url = page_tab["webSocketDebuggerUrl"]
+                                break
+                    except Exception:
+                        _time.sleep(0.1)
+                self.assertIsNotNone(ws_url, "Chrome CDP bağlantısı kurulamadı")
+
+                # Basit standart kütüphane WebSocket istemcisi ile CDP Runtime.evaluate çalıştır
+                import base64
+                from urllib.parse import urlparse
+
+                parsed_ws = urlparse(ws_url)
+                sock = socket.create_connection((parsed_ws.hostname, parsed_ws.port), timeout=10)
+                key = base64.b64encode(os.urandom(16)).decode("ascii")
+                handshake = (
+                    f"GET {parsed_ws.path} HTTP/1.1\r\n"
+                    f"Host: {parsed_ws.hostname}:{parsed_ws.port}\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    f"Sec-WebSocket-Key: {key}\r\n"
+                    "Sec-WebSocket-Version: 13\r\n\r\n"
+                )
+                sock.sendall(handshake.encode("ascii"))
+                resp_buf = b""
+                while b"\r\n\r\n" not in resp_buf:
+                    resp_buf += sock.recv(1024)
+
+                msg_id = 0
+
+                def cdp_eval(js_expr: str):
+                    nonlocal msg_id
+                    msg_id += 1
+                    payload_bytes = _json.dumps(
+                        {
+                            "id": msg_id,
+                            "method": "Runtime.evaluate",
+                            "params": {"expression": js_expr, "awaitPromise": True, "returnByValue": True},
+                        }
+                    ).encode("utf-8")
+                    mask_key = os.urandom(4)
+                    header = bytearray([0x81])
+                    length = len(payload_bytes)
+                    if length < 126:
+                        header.append(0x80 | length)
+                    elif length < 65536:
+                        header.append(0x80 | 126)
+                        header.extend(length.to_bytes(2, "big"))
+                    else:
+                        header.append(0x80 | 127)
+                        header.extend(length.to_bytes(8, "big"))
+                    header.extend(mask_key)
+                    masked = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload_bytes))
+                    sock.sendall(bytes(header) + masked)
+
+                    while True:
+                        first2 = sock.recv(2)
+                        plen = first2[1] & 0x7F
+                        if plen == 126:
+                            plen = int.from_bytes(sock.recv(2), "big")
+                        elif plen == 127:
+                            plen = int.from_bytes(sock.recv(8), "big")
+                        frame = b""
+                        while len(frame) < plen:
+                            frame += sock.recv(plen - len(frame))
+                        msg = _json.loads(frame.decode("utf-8"))
+                        if msg.get("id") == msg_id:
+                            return msg.get("result", {}).get("result", {}).get("value")
+
+                # Token'ı localStorage'a yaz ve /my-tasks ekranına git
+                cdp_eval(
+                    f"""
+                    localStorage.setItem('nanolab_glp_jwt', {_json.dumps(token)});
+                    localStorage.setItem('nanolab_glp_user', {_json.dumps(_json.dumps(user_info))});
+                    window.location.href = '/my-tasks';
+                    'ok';
+                    """
+                )
+
+                # 2026-12-14 tarih butonuna tıkla ve Gün 7 görev kartının yüklenmesini bekle
+                for _ in range(40):
+                    ready = cdp_eval(
+                        f"""
+                        (() => {{
+                          const btns = Array.from(document.querySelectorAll('button'));
+                          const dBtn = btns.find(b => b.textContent.trim() === '2026-12-14');
+                          if (dBtn) dBtn.click();
+                          const inp = document.querySelector('[data-testid="ref-time-input-{day7.id}"]');
+                          return inp ? true : false;
+                        }})()
+                        """
+                    )
+                    if ready:
+                        break
+                    _time.sleep(0.2)
+
+                # 1) Referans saati girişi başlangıçta boş ('') olmalı (planlanan 10:00 otomatik yazılmamalı)
+                initial_state = cdp_eval(
+                    f"""
+                    (() => {{
+                      const inp = document.querySelector('[data-testid="ref-time-input-{day7.id}"]');
+                      const badge = document.querySelector('[data-testid="task-status-badge-{day7.id}"]');
+                      return {{
+                        inputValue: inp ? inp.value : null,
+                        badgeText: badge ? badge.textContent.trim() : null
+                      }};
+                    }})()
+                    """
+                )
+                self.assertEqual(initial_state["inputValue"], "", "Referans saati girişi başlangıçta boş olmalı")
+                self.assertEqual(initial_state["badgeText"], "Bekliyor")
+
+                # 2) Yalnızca 10:45 referans saatini gir ve 'Referans Saatini Kaydet' butonuna tıkla
+                cdp_eval(
+                    f"""
+                    (() => {{
+                      const inp = document.querySelector('[data-testid="ref-time-input-{day7.id}"]');
+                      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                      setter.call(inp, '2026-12-14T10:45');
+                      inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                      inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                      document.querySelector('[data-testid="save-ref-time-btn-{day7.id}"]').click();
+                      return true;
+                    }})()
+                    """
+                )
+
+                for _ in range(30):
+                    rec_badge = cdp_eval(
+                        f"""
+                        (() => {{
+                          const el = document.querySelector('[data-testid="recorded-ref-time-{day7.id}"]');
+                          return el ? el.textContent : null;
+                        }})()
+                        """
+                    )
+                    if rec_badge and "10:45" in rec_badge:
+                        break
+                    _time.sleep(0.2)
+
+                after_ref_ui = cdp_eval(
+                    f"""
+                    (() => {{
+                      const badge = document.querySelector('[data-testid="task-status-badge-{day7.id}"]');
+                      const dev = document.querySelector('[data-testid="ref-deviation-badge-{day7.id}"]');
+                      const actualWin = document.querySelector('[data-testid="task-actual-window-{day7.id}"]');
+                      return {{
+                        statusBadge: badge ? badge.textContent.trim() : null,
+                        devBadge: dev ? dev.textContent.trim() : null,
+                        hasActualWin: Boolean(actualWin)
+                      }};
+                    }})()
+                    """
+                )
+                self.assertEqual(
+                    after_ref_ui["statusBadge"],
+                    "Bekliyor",
+                    "Referans Saatini Kaydet bekleyen görevi otomatik Tamamlandı (COMPLETED) yapmamalı",
+                )
+                self.assertIn("+45 dk", after_ref_ui["devBadge"] or "")
+                self.assertFalse(
+                    after_ref_ui["hasActualWin"],
+                    "Yalnızca 10:45 referansı kaydedildiğinde 09:00/12:00 plan saatleri gerçekleşen saatlere yazılmamalı",
+                )
+
+                # Veritabanında da durum ve gerçekleşen saatleri doğrula
+                self.db.expire_all()
+                d7_persisted = self.db.query(StudyStep).filter(StudyStep.id == day7.id).first()
+                self.assertEqual(d7_persisted.status, StepStatus.PENDING)
+                self.assertEqual(d7_persisted.actual_reference_time, datetime(2026, 12, 14, 10, 45))
+                self.assertIsNone(d7_persisted.actual_start)
+                self.assertIsNone(d7_persisted.actual_end)
+
+                # 3) 2026-12-15 (Gün 8) görevine geç ve 'Başlat' butonuna tıkla:
+                #    Planlanan/beklenen referans saati actual_reference_time olarak kaydedilmemeli!
+                for _ in range(30):
+                    d8_ready = cdp_eval(
+                        f"""
+                        (() => {{
+                          const btns = Array.from(document.querySelectorAll('button'));
+                          const dBtn = btns.find(b => b.textContent.trim() === '2026-12-15');
+                          if (dBtn) dBtn.click();
+                          const sBtn = document.querySelector('[data-testid="start-task-btn-{day8.id}"]');
+                          return sBtn ? true : false;
+                        }})()
+                        """
+                    )
+                    if d8_ready:
+                        break
+                    _time.sleep(0.2)
+
+                cdp_eval(
+                    f"""
+                    document.querySelector('[data-testid="start-task-btn-{day8.id}"]').click();
+                    true;
+                    """
+                )
+                for _ in range(30):
+                    st8_badge = cdp_eval(
+                        f"""
+                        (() => {{
+                          const b = document.querySelector('[data-testid="task-status-badge-{day8.id}"]');
+                          return b ? b.textContent.trim() : null;
+                        }})()
+                        """
+                    )
+                    if st8_badge == "Devam Ediyor":
+                        break
+                    _time.sleep(0.2)
+
+                self.db.expire_all()
+                d8_persisted = self.db.query(StudyStep).filter(StudyStep.id == day8.id).first()
+                self.assertEqual(d8_persisted.status, StepStatus.IN_PROGRESS)
+                self.assertIsNotNone(d8_persisted.actual_start)
+                self.assertIsNone(d8_persisted.actual_end)
+                self.assertIsNone(
+                    d8_persisted.actual_reference_time,
+                    "Tarayıcıda 'Başlat' tıklandığında planlanan/beklenen referans saati actual_reference_time olarak kaydedilmemeli",
+                )
+
+                sock.close()
+            finally:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    proc.kill()
+        finally:
+            server.should_exit = True
+            thread.join(timeout=5)
 
 
 if __name__ == "__main__":

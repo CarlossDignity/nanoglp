@@ -114,6 +114,11 @@ class ApplyResolutionRequest(BaseModel):
 FACILITY_TZ = timezone(timedelta(hours=3))
 
 
+def _facility_now() -> datetime:
+    """Tesis yerel saatini (Europe/Istanbul, UTC+03:00 naive datetime) döner."""
+    return datetime.now(FACILITY_TZ).replace(tzinfo=None)
+
+
 class UpdateStepStatusRequest(BaseModel):
     status: Optional[StepStatus] = None
     notes: Optional[str] = None
@@ -1118,7 +1123,8 @@ def api_update_step_status(
         )
 
     old_status = step.status.value
-    now = datetime.utcnow()
+    utc_now = datetime.utcnow()
+    local_now = _facility_now()
     fallback_date = step.planned_start.date()
     parsed_start = _parse_step_dt(payload.actual_start, fallback_date, field_name="actual_start")
     parsed_end = _parse_step_dt(payload.actual_end, fallback_date, field_name="actual_end")
@@ -1132,12 +1138,17 @@ def api_update_step_status(
     target_status = payload.status if payload.status is not None else step.status
 
     # Durum ve zaman alanları arasında tutarlılık doğrulaması (422)
-    if target_status == StepStatus.PENDING and (
+    if payload.status == StepStatus.PENDING and (
         parsed_start is not None or parsed_end is not None or parsed_ref is not None
     ):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="PENDING (Bekliyor) durumundaki bir görev için gerçekleşen başlangıç, bitiş veya referans saati girilemez.",
+            detail="PENDING (Bekliyor) durumuna alınan bir görev için gerçekleşen başlangıç, bitiş veya referans saati girilemez.",
+        )
+    if target_status == StepStatus.PENDING and (parsed_start is not None or parsed_end is not None):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="PENDING (Bekliyor) durumundaki bir görev için gerçekleşen başlangıç veya bitiş saati girilemez.",
         )
     if target_status == StepStatus.IN_PROGRESS and parsed_end is not None:
         raise HTTPException(
@@ -1158,8 +1169,8 @@ def api_update_step_status(
             ),
         )
 
-    if check_ref is not None and check_start is not None and check_end is not None:
-        if check_ref < check_start or check_ref > check_end:
+    if check_ref is not None:
+        if check_start is not None and check_end is not None and (check_ref < check_start or check_ref > check_end):
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=(
@@ -1168,14 +1179,22 @@ def api_update_step_status(
                     f"aralığı içinde olmalıdır."
                 ),
             )
-    elif check_ref is not None and parsed_start is not None and check_ref < parsed_start:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=(
-                f"Gerçekleşen biyolojik referans/gözlem saati ({check_ref.isoformat()}), "
-                f"gerçekleşen başlangıç saatinden ({parsed_start.isoformat()}) önce olamaz."
-            ),
-        )
+        if check_start is not None and check_ref < check_start:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    f"Gerçekleşen biyolojik referans/gözlem saati ({check_ref.isoformat()}), "
+                    f"gerçekleşen başlangıç saatinden ({check_start.isoformat()}) önce olamaz."
+                ),
+            )
+        if check_end is not None and check_ref > check_end:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    f"Gerçekleşen biyolojik referans/gözlem saati ({check_ref.isoformat()}), "
+                    f"gerçekleşen bitiş saatinden ({check_end.isoformat()}) sonra olamaz."
+                ),
+            )
 
     if payload.status is not None:
         step.status = payload.status
@@ -1194,17 +1213,13 @@ def api_update_step_status(
     elif payload.notes and not step.deviation_notes:
         step.deviation_notes = payload.notes
 
-    if step.status == StepStatus.IN_PROGRESS and not step.actual_start:
-        step.actual_start = step.actual_reference_time or now
-    elif step.status == StepStatus.COMPLETED:
+    if payload.status == StepStatus.IN_PROGRESS and not step.actual_start:
+        step.actual_start = local_now
+    elif payload.status == StepStatus.COMPLETED:
         if not step.actual_start:
-            step.actual_start = step.actual_reference_time or step.actual_end or now
+            step.actual_start = step.actual_end or local_now
         if not step.actual_end:
-            step.actual_end = (
-                step.actual_reference_time
-                if (step.actual_reference_time and step.actual_reference_time >= step.actual_start)
-                else max(step.actual_start, now)
-            )
+            step.actual_end = max(step.actual_start, local_now)
 
     db.flush()
     if step.study is not None:

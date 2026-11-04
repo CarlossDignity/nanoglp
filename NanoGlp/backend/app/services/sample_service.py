@@ -1789,27 +1789,31 @@ def import_study_status_workbook(
     all_parsed = glp_parsed + nglp_parsed
     excel_codes = {r["study_code"] for r in all_parsed}
 
-    if prune_non_excel and len(all_parsed) >= 88:
-        def _is_prunable_demo_or_test_code(c_val: Optional[str], st_obj: Optional[Study] = None) -> bool:
-            c_up = str(c_val or "").strip().upper()
-            if not c_up:
-                return False
-            if c_up.startswith(("T-", "26/", "NDMA", "GADOBUTROL", "GLP-2026-EDR-")) or c_up in ("GLP2026-090", "GLP2026-091"):
-                return True
-            m = re.match(r"^(?:GLP|NGLP)-?\d{4}-(\d+)$", c_up)
-            if m and int(m.group(1)) > 150:
+    if prune_non_excel:
+        def _is_explicit_demo_sample(s_row: SampleRecord, st_obj: Optional[Study] = None) -> bool:
+            wf_meta = s_row.workflow if isinstance(getattr(s_row, "workflow", None), dict) else {}
+            if wf_meta.get("is_historical_demo") is True or wf_meta.get("_is_demo") is True:
                 return True
             if st_obj is not None and isinstance(getattr(st_obj, "dossier_metadata", None), dict):
-                if st_obj.dossier_metadata.get("is_historical_demo"):
+                if st_obj.dossier_metadata.get("is_historical_demo") is True:
                     return True
             return False
 
+        def _is_explicit_demo_study(st_obj: Study) -> bool:
+            if isinstance(getattr(st_obj, "dossier_metadata", None), dict):
+                if st_obj.dossier_metadata.get("is_historical_demo") is True:
+                    return True
+            return False
+
+        study_map_for_demo = {st_item.study_code: st_item for st_item in db.query(Study).all() if st_item.study_code}
         for old_row in db.query(SampleRecord).all():
-            if old_row.study_code not in excel_codes and _is_prunable_demo_or_test_code(old_row.study_code):
+            if old_row.study_code not in excel_codes and _is_explicit_demo_sample(
+                old_row, study_map_for_demo.get(old_row.study_code)
+            ):
                 db.delete(old_row)
         from app.models.conflict import Conflict
         for old_st in db.query(Study).all():
-            if old_st.study_code not in excel_codes and _is_prunable_demo_or_test_code(old_st.study_code, old_st):
+            if old_st.study_code not in excel_codes and _is_explicit_demo_study(old_st):
                 db.query(Conflict).filter((Conflict.study_id == old_st.id) | (Conflict.related_study_id == old_st.id)).delete(synchronize_session=False)
                 for st_step in db.query(StudyStep).filter(StudyStep.study_id == old_st.id).all():
                     st_step.assignees = []
@@ -1855,14 +1859,17 @@ def import_study_status_workbook(
         else:
             updated += 1
 
+        study = find_study(db, code)
+        existing_has_steps = _study_has_steps(db, study)
         for k, v in rec.items():
             if k == "study_code":
+                continue
+            if k == "planned_end" and v is None and existing_has_steps and sample.planned_end is not None:
                 continue
             setattr(sample, k, v)
         sample.workflow = wf
 
         # Study tablosu senkronizasyonu
-        study = find_study(db, code)
         sd_u = match_study_director(db, rec["study_director_name"], include_inactive=True)
         if sd_u is None:
             sd_u = db.query(User).filter(User.role == UserRole.STUDY_DIRECTOR, User.is_active == True).order_by(User.id).first()  # noqa: E712
@@ -1924,14 +1931,15 @@ def import_study_status_workbook(
     if auto_schedule:
         sched_res = auto_schedule_excel_studies(db, user, target_study_codes=excel_codes)
         scheduled_count = sched_res["scheduled"]
-        from app.services.scheduling_engine import sync_historical_completion_and_conflicts
 
-        sync_historical_completion_and_conflicts(
-            db,
-            from_excel_import=True,
-            target_study_codes=excel_codes,
-        )
-        db.commit()
+    from app.services.scheduling_engine import sync_historical_completion_and_conflicts
+
+    hist_sync = sync_historical_completion_and_conflicts(
+        db,
+        from_excel_import=True,
+        target_study_codes=excel_codes,
+    )
+    db.commit()
 
     sync_faz_9_3_sample_fields(db)
 
@@ -1948,6 +1956,7 @@ def import_study_status_workbook(
                 "created": created,
                 "updated": updated,
                 "auto_scheduled": scheduled_count,
+                "newly_completed_steps": hist_sync.get("newly_completed_steps", 0),
             },
             reason=(
                 f"{user.username}: Study Status Excel tam içe aktarma — {len(glp_parsed)} GLP + {len(nglp_parsed)} Non-GLP "
@@ -1966,6 +1975,8 @@ def import_study_status_workbook(
         "non_glp_count": len(nglp_parsed),
         "workflow_matched": len(wf_by_code),
         "auto_scheduled": scheduled_count,
+        "newly_completed_steps": hist_sync.get("newly_completed_steps", 0),
+        "historical_sync": hist_sync,
     }
 
 
@@ -2040,32 +2051,14 @@ def auto_schedule_excel_studies(
 # ---------------------------------------------------------------------------
 def sync_faz_9_3_sample_fields(db: Session) -> Dict[str, Any]:
     """
-    FAZ 9.3 veri senkronizasyonu (hiçbir gerçek çalışma silinmez):
-    1) Test amaçlı > 150 kodlu kalıntı varsa temizler.
-    2) SPONSOR SÖZLŞ.-SPONSOR AGREEM. sekmesindeki 10 firmanın sözleşme tarihi, iletişim bilgisi ve
+    FAZ 9.3 veri senkronizasyonu (hiçbir çalışma veya adım silinmez):
+    1) SPONSOR SÖZLŞ.-SPONSOR AGREEM. sekmesindeki 10 firmanın sözleşme tarihi, iletişim bilgisi ve
        taahhüt (`Planlanan Gönderim Tarihi`) tarihlerini eşleştirir.
-    3) Non-GLP çalışmalarda ayrı Taslak Rapor sütunu olmadığı için `draft_report_date = None` yapar.
-    4) `Mevcut (Karantina)` olan Planlanan/Beklenen çalışmalarda (`+7g` karantina TAT farkı)
+    2) Non-GLP çalışmalarda ayrı Taslak Rapor sütunu olmadığı için `draft_report_date = None` yapar.
+    3) `Mevcut (Karantina)` olan Planlanan/Beklenen çalışmalarda (`+7g` karantina TAT farkı)
        `draft_report_date` ve `final_report_date` tarihlerini karantina süresini içerecek şekilde günceller.
     """
-    from app.models.conflict import Conflict
-
     pruned_test_codes: List[str] = []
-    for s in db.query(SampleRecord).all():
-        m = re.match(r"^(?:GLP|NGLP)-?\d{4}-(\d+)$", str(s.study_code or "").strip().upper())
-        if m and int(m.group(1)) > 150:
-            pruned_test_codes.append(s.study_code)
-            db.delete(s)
-    for st_obj in db.query(Study).all():
-        m = re.match(r"^(?:GLP|NGLP)-?\d{4}-(\d+)$", str(st_obj.study_code or "").strip().upper())
-        if m and int(m.group(1)) > 150:
-            db.query(Conflict).filter((Conflict.study_id == st_obj.id) | (Conflict.related_study_id == st_obj.id)).delete(synchronize_session=False)
-            for st_step in db.query(StudyStep).filter(StudyStep.study_id == st_obj.id).all():
-                st_step.assignees = []
-                db.delete(st_step)
-            db.delete(st_obj)
-    db.flush()
-
     updated_contracts = 0
     updated_quarantine_dates = 0
     for s in db.query(SampleRecord).all():

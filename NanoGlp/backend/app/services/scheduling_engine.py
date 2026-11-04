@@ -425,51 +425,80 @@ def compute_friday_alignment_offset(acclimatization_start_date: date, min_offset
     return start_offset + ((4 - base_ex_date.weekday()) % 7)
 
 
-def get_study_extraction_usage(study: Optional[Study]) -> Dict[str, Any]:
+def get_study_extraction_usage(study: Optional[Study], has_extraction_step: bool = True) -> Dict[str, Any]:
     """
-    Bir çalışmanın Polar (Su Banyosu) ve Apolar (Kabin) ekstraksiyon kullanım durumunu tek merkezden hesaplar.
-    `None` (henüz girilmemiş / bilinmeyen bilgi) ASLA `True` (kesin polar kullanımı) olarak varsayılmaz:
-      * extraction_polar is True     -> Su Banyosu kullanılır
-      * extraction_non_polar is True -> Apolar Kabin kullanılır
-      * False                        -> İlgili cihaz kullanılmaz
-      * None                         -> Ekstraksiyon bilgisi eksik/belirsizdir
+    Bir çalışmanın Polar ve Apolar ekstraksiyon kullanım durumunu ve Çalkalamalı Su Banyosu
+    (EQ-WB-001) kaynak gereksinimini tek merkezden hesaplar.
+    `None` (henüz girilmemiş / bilinmeyen bilgi) ASLA `True` veya `False` olarak varsayılmaz:
+      * extraction_polar is True     -> Polar kapasite kullanılır (EQ-WB-001)
+      * extraction_non_polar is True -> Apolar kapasite kullanılır (EQ-WB-001)
+      * False                        -> İlgili kapasite kullanılmaz
+      * None                         -> İlgili bileşen bilgisi eksik/belirsizdir
+    Cihaz atama, rezervasyon, kapasite çakışması ve alternatif tarih önerisi aynı
+    doğrulanmış kaynak tanımını (`uses_water_bath = uses_polar or uses_apolar`) kullanır.
     """
     if study is None:
         return {
+            "polar": None,
+            "apolar": None,
+            "polar_known": False,
+            "apolar_known": False,
             "uses_polar": False,
             "uses_apolar": False,
             "uses_water_bath": False,
-            "uses_apolar_cabinet": False,
-            "missing_extraction_info": True,
-            "status": "MISSING",
+            "missing_components": ["polar", "apolar"] if has_extraction_step else [],
+            "missing_extraction_info": bool(has_extraction_step),
+            "status": "MISSING" if has_extraction_step else "NOT_APPLICABLE",
             "message": "Çalışmanın polar/apolar ekstraksiyon çözücü bilgisi henüz girilmedi.",
         }
     polar = getattr(study, "extraction_polar", None)
     apolar = getattr(study, "extraction_non_polar", None)
+    polar_known = polar is not None
+    apolar_known = apolar is not None
     uses_polar = polar is True
     uses_apolar = apolar is True
-    missing = polar is None and apolar is None
-    if missing:
+    uses_water_bath = bool(uses_polar or uses_apolar)
+
+    missing_components: List[str] = []
+    if has_extraction_step:
+        if polar is None:
+            missing_components.append("polar")
+        if apolar is None:
+            missing_components.append("apolar")
+    missing = len(missing_components) > 0
+
+    if not has_extraction_step:
+        status_code = "NOT_APPLICABLE"
+        msg = "Çalışmada ekstraksiyon adımı bulunmuyor."
+    elif polar is None and apolar is None:
         status_code = "MISSING"
         msg = "Ekstraksiyon çözücü bilgisi (Polar / Apolar) eksik; cihaz kullanımı varsayılmadı."
+    elif missing:
+        status_code = "PARTIAL_MISSING"
+        missing_labels = ", ".join("Polar" if c == "polar" else "Apolar" for c in missing_components)
+        msg = f"Ekstraksiyon çözücü bilgisi kısmen eksik ({missing_labels} belirsiz); yalnızca bilinen bileşen değerlendirildi."
     elif uses_polar and uses_apolar:
         status_code = "POLAR_AND_APOLAR"
-        msg = "Polar (Su Banyosu) ve Apolar (Kabin) ekstraksiyon birlikte kullanılıyor."
+        msg = "Polar ve Apolar ekstraksiyon birlikte kullanılıyor (Çalkalamalı Su Banyosu)."
     elif uses_polar:
         status_code = "POLAR_ONLY"
-        msg = "Yalnızca Polar (Su Banyosu) ekstraksiyon kullanılıyor."
+        msg = "Yalnızca Polar ekstraksiyon kullanılıyor (Çalkalamalı Su Banyosu)."
     elif uses_apolar:
         status_code = "APOLAR_ONLY"
-        msg = "Yalnızca Apolar (Kabin) ekstraksiyon kullanılıyor (Su Banyosu kullanılmaz)."
+        msg = "Yalnızca Apolar ekstraksiyon kullanılıyor (Çalkalamalı Su Banyosu)."
     else:
-        status_code = "NO_EXTRACTION_EQUIPMENT"
-        msg = "Polar veya Apolar ekstraksiyon cihazı kullanılmıyor."
+        status_code = "NONE"
+        msg = "Polar veya Apolar ekstraksiyon kullanılmıyor."
 
     return {
+        "polar": polar,
+        "apolar": apolar,
+        "polar_known": polar_known,
+        "apolar_known": apolar_known,
         "uses_polar": uses_polar,
         "uses_apolar": uses_apolar,
-        "uses_water_bath": uses_polar,
-        "uses_apolar_cabinet": uses_apolar,
+        "uses_water_bath": uses_water_bath,
+        "missing_components": missing_components,
         "missing_extraction_info": missing,
         "status": status_code,
         "message": msg,
@@ -1891,7 +1920,14 @@ def _format_schedule_response(
     }
     bio_info = compute_biological_dependency_info(study, steps, template)
     bio_by_step = bio_info["by_step_id"]
-    ext_usage = get_study_extraction_usage(study)
+    has_ext_step = any(
+        (s.step_type == "Ekstraksiyon" or "Ekstraksiyon" in (s.step_name or ""))
+        for s in steps
+    ) or any(
+        (ts.step_type == "Ekstraksiyon" or "Ekstraksiyon" in (ts.name or ""))
+        for ts in (getattr(template, "steps", None) or [])
+    )
+    ext_usage = get_study_extraction_usage(study, has_extraction_step=has_ext_step)
 
     return {
         "study_id": study.id,
@@ -2553,7 +2589,7 @@ def sync_historical_completion_and_conflicts(
             if st.status != StudyStatus.COMPLETED:
                 st.status = StudyStatus.COMPLETED
             completed_studies_count += 1
-            if not meta.get("historical_sync_done"):
+            if meta.get("historical_synced_status") != "COMPLETED":
                 for step in steps:
                     if step.status != StepStatus.COMPLETED:
                         step.status = StepStatus.COMPLETED
@@ -2562,6 +2598,7 @@ def sync_historical_completion_and_conflicts(
                             if "[HISTORICAL_IMPORT_COMPLETED]" not in notes:
                                 step.deviation_notes = (notes + " [HISTORICAL_IMPORT_COMPLETED]").strip()
                         newly_completed_steps += 1
+                meta["historical_synced_status"] = "COMPLETED"
                 meta["historical_sync_done"] = True
                 meta["historical_excel_import"] = True
                 st.dossier_metadata = meta
@@ -2569,6 +2606,11 @@ def sync_historical_completion_and_conflicts(
             target_study_codes is not None or meta.get("historical_excel_import") or meta.get("is_historical_demo")
         ):
             meta["historical_excel_import"] = True
+            meta["historical_synced_status"] = (
+                (sr.stored_status or "").upper()
+                if (sr is not None and sr.stored_status)
+                else st.status.value
+            )
             meta["historical_sync_done"] = True
             st.dossier_metadata = meta
 
@@ -2744,7 +2786,7 @@ def classify_conflict_record(
             conflict.conflict_type == ConflictType.BIOLOGICAL_TIME_VIOLATION
             or (
                 conflict.conflict_type == ConflictType.EQUIPMENT_OVERLAP
-                and ("Su Banyosu" in title_str or (study is not None and study.extraction_polar is None and study.extraction_non_polar is None))
+                and ("Su Banyosu" in title_str or (study is not None and (study.extraction_polar is None or study.extraction_non_polar is None)))
             )
         )
     ):

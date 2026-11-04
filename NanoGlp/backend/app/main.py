@@ -25,7 +25,7 @@ FRONTEND_DIST_DIR = Path(__file__).resolve().parent.parent.parent / "frontend" /
 
 
 def _migrate_faz84_yigit_and_cleanups(db) -> None:
-    """FAZ 8.4: 'yigit' hesabını SYSADMIN olarak garantiye alır ve hatalı uzun analiz adlı Non-GLP Study satırlarını temizler."""
+    """FAZ 8.4: 'yigit' hesabını SYSADMIN olarak garantiye alır ve yalnızca açıkça is_historical_demo olarak işaretli demo kayıtları temizler."""
     from app.models.user import User, UserRole
     from app.models.study import Study
     from app.models.study_step import StudyStep
@@ -44,7 +44,8 @@ def _migrate_faz84_yigit_and_cleanups(db) -> None:
         bogus_studies = [
             st for st in db.query(Study).all()
             if st.study_code not in sample_codes
-            and st.study_code not in {"GLP2026-024", "GLP2026-025", "GLP2026-026", "GLP2026-031", "GLP2026-034"}
+            and isinstance(getattr(st, "dossier_metadata", None), dict)
+            and st.dossier_metadata.get("is_historical_demo") is True
         ]
         if bogus_studies:
             for bst in bogus_studies:

@@ -28,22 +28,6 @@ function toLocalInputValue(isoStr) {
   return String(isoStr).slice(0, 16);
 }
 
-function buildCompatibleBounds(task, refIso, targetStatus) {
-  if (!refIso) return {};
-  const refNorm = refIso.length === 16 ? `${refIso}:00` : refIso;
-  const pStart = task.actual_start || task.planned_start || refNorm;
-  const pEnd = task.actual_end || task.planned_end || refNorm;
-  const effStart = refNorm < pStart ? refNorm : pStart;
-  const effEnd = refNorm > pEnd ? refNorm : pEnd;
-  if (targetStatus === 'IN_PROGRESS') {
-    return { actual_start: effStart };
-  }
-  return {
-    actual_start: effStart,
-    actual_end: effEnd < effStart ? effStart : effEnd,
-  };
-}
-
 export default function MyTasks() {
   const { user, isReadOnly } = useAuth();
   const { t, tr, lang, formatStatusBadge } = usePreferences();
@@ -67,13 +51,9 @@ export default function MyTasks() {
       setRefInputs((prev) => {
         const next = { ...prev };
         for (const step of all) {
-          if (step.actual_reference_time) {
-            next[step.id] = toLocalInputValue(step.actual_reference_time);
-          } else if (!next[step.id]) {
-            next[step.id] = toLocalInputValue(
-              step.expected_reference_time || step.planned_reference_time || step.planned_start
-            );
-          }
+          next[step.id] = step.actual_reference_time
+            ? toLocalInputValue(step.actual_reference_time)
+            : '';
         }
         return next;
       });
@@ -108,13 +88,7 @@ export default function MyTasks() {
     setError(null);
     try {
       const body = { status: nextStatus };
-      const refVal = (refInputs[stepId] || '').trim();
       const noteVal = (noteInputs[stepId] || '').trim();
-      if (taskObj.requires_reference_time && refVal && nextStatus !== 'PENDING') {
-        const refIso = refVal.length === 16 ? `${refVal}:00` : refVal;
-        body.actual_reference_time = refIso;
-        Object.assign(body, buildCompatibleBounds(taskObj, refIso, nextStatus));
-      }
       if (noteVal) {
         body.deviation_notes = noteVal;
       }
@@ -140,11 +114,8 @@ export default function MyTasks() {
     setError(null);
     try {
       const refIso = refVal.length === 16 ? `${refVal}:00` : refVal;
-      const effectiveStatus = task.status === 'PENDING' ? 'COMPLETED' : task.status;
       const body = {
-        status: effectiveStatus,
         actual_reference_time: refIso,
-        ...buildCompatibleBounds(task, refIso, effectiveStatus),
       };
       const noteVal = (noteInputs[stepId] || '').trim();
       if (noteVal) {
@@ -194,12 +165,17 @@ export default function MyTasks() {
           <div className="flex flex-wrap items-center gap-2">
             <span className="font-semibold text-slate-800">{roleLabel}</span>
             {task.planned_reference_time && (
-              <span className="text-slate-500">
+              <span className="text-slate-500" data-testid={`planned-ref-time-${task.id}`}>
                 Planlanan: <strong className="font-mono text-slate-700">{fmtDateTime(task.planned_reference_time)}</strong>
               </span>
             )}
+            {task.expected_reference_time && task.expected_reference_time !== task.planned_reference_time && (
+              <span className="px-2 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-200 font-medium" data-testid={`expected-ref-time-${task.id}`}>
+                Beklenen Referans: {fmtDateTime(task.expected_reference_time)}
+              </span>
+            )}
             {task.expected_start && task.expected_start !== task.planned_start && (
-              <span className="px-2 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-200 font-medium">
+              <span className="px-2 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-200 font-medium" data-testid={`expected-window-${task.id}`}>
                 Beklenen Pencere: {fmtDateTime(task.expected_start)} – {fmtTime(task.expected_end)}
               </span>
             )}
@@ -466,13 +442,21 @@ export default function MyTasks() {
                             <Lock className="w-3 h-3" /> Biyolojik Kilitli (±{task.biological_tolerance_minutes} dk)
                           </span>
                         )}
-                        <span className={`text-[11px] font-semibold px-2 py-0.5 rounded border ${badge.cls}`}>
+                        <span
+                          data-testid={`task-status-badge-${task.id}`}
+                          className={`text-[11px] font-semibold px-2 py-0.5 rounded border ${badge.cls}`}
+                        >
                           {badge.label}
                         </span>
                       </div>
                       <p className="text-sm font-semibold text-slate-900">{task.step_name}</p>
                       <p className="text-xs text-slate-500">
-                        Saat: <strong className="text-slate-700">{fmtTime(task.planned_start)} – {fmtTime(task.planned_end)}</strong>
+                        Planlanan Saat: <strong className="text-slate-700">{fmtTime(task.planned_start)} – {fmtTime(task.planned_end)}</strong>
+                        {(task.actual_start || task.actual_end) && (
+                          <span data-testid={`task-actual-window-${task.id}`} className="ml-2 text-emerald-700 font-mono">
+                            · Gerçekleşen: {task.actual_start ? fmtDateTime(task.actual_start) : '—'} – {task.actual_end ? fmtDateTime(task.actual_end) : '—'}
+                          </span>
+                        )}
                         {' · '}Süre: {fmtMinutes(task.duration_minutes)}
                         {' · '}Görevliler: {task.assignee_names?.join(', ')}
                       </p>
@@ -484,6 +468,7 @@ export default function MyTasks() {
                           <button
                             type="button"
                             disabled={busy}
+                            data-testid={`start-task-btn-${task.id}`}
                             onClick={() => handleStatusChange(task, 'IN_PROGRESS')}
                             className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-md bg-slate-900 hover:bg-slate-800 text-white disabled:opacity-50"
                           >
@@ -494,6 +479,7 @@ export default function MyTasks() {
                           <button
                             type="button"
                             disabled={busy}
+                            data-testid={`complete-task-btn-${task.id}`}
                             onClick={() => handleStatusChange(task, 'COMPLETED')}
                             className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-md bg-emerald-600 hover:bg-emerald-700 text-white disabled:opacity-50"
                           >
