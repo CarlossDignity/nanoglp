@@ -1762,9 +1762,9 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
             self.assertEqual(step_after.status, StepStatus.IN_PROGRESS)
             self.assertEqual([u.id for u in step_after.assignees], [tech.id])
 
-        self.assertIsNone(
+        self.assertIsNotNone(
             self.db.query(Study).filter(Study.study_code == "DEMO-EXPLICIT-001").first(),
-            "Açıkça is_historical_demo=True işaretli demo kaydı temizlenebilmeli",
+            "Excel güncellemesi dosyada olmayan demo kayıtlarını da silmemeli",
         )
 
     # ------------------------------------------------------------------
@@ -1880,10 +1880,17 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
         st1 = self.db.query(Study).filter(Study.study_code == "GLP2026-082").first()
         steps1 = self.db.query(StudyStep).filter(StudyStep.study_id == st1.id).all()
         self.assertEqual(st1.status, StudyStatus.IN_PROGRESS)
-        self.assertGreater(len(steps1), 0)
-        self.assertTrue(all(s.status == StepStatus.PENDING for s in steps1))
+        self.assertEqual(len(steps1), 0, "Devam eden çalışmaya Excel görev üretmemeli")
+        self.assertEqual(res1["auto_scheduled"], 0)
         self.assertEqual(res1["newly_completed_steps"], 0)
 
+        # Operasyonel görev Excel dışında oluşturuldu; sonraki aktarım bunu korumalı.
+        preserved = StudyStep(study_id=st1.id, step_order=1, step_name="Mevcut görev",
+                              planned_start=datetime(2026,11,2,9), planned_end=datetime(2026,11,2,10),
+                              status=StepStatus.PENDING)
+        self.db.add(preserved)
+        self.db.commit()
+        preserved_id = preserved.id
         # 2) Tekrar ONGOING aktarımı -> 0 değişiklik
         res2 = import_study_status_workbook(self.db, wb_ongoing, tfm_user, auto_schedule=True, prune_non_excel=False)
         self.db.expire_all()
@@ -1891,14 +1898,16 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
         self.assertEqual(res2["newly_completed_steps"], 0)
         self.assertTrue(all(s.status == StepStatus.PENDING for s in steps2))
 
-        # 3) Güncellenmiş COMPLETED aktarımı -> çalışma COMPLETED, adımlar COMPLETED, actual_start/end boş (None)
+        # 3) Excel COMPLETED kaynağı operasyonel çalışmayı veya mevcut görevi tamamlamaz
         res3 = import_study_status_workbook(self.db, wb_completed, tfm_user, auto_schedule=True, prune_non_excel=False)
         self.db.expire_all()
         st3 = self.db.query(Study).filter(Study.study_code == "GLP2026-082").first()
         steps3 = self.db.query(StudyStep).filter(StudyStep.study_id == st3.id).all()
-        self.assertEqual(st3.status, StudyStatus.COMPLETED)
-        self.assertEqual(res3["newly_completed_steps"], len(steps3))
-        self.assertTrue(all(s.status == StepStatus.COMPLETED for s in steps3))
+        self.assertEqual(st3.status, StudyStatus.IN_PROGRESS, "Excel tamamlandı işareti operasyonel gerçekleşme değildir")
+        self.assertEqual(res3["newly_completed_steps"], 0)
+        self.assertGreater(res3["review_required"], 0)
+        self.assertEqual([s.id for s in steps3], [preserved_id])
+        self.assertTrue(all(s.status == StepStatus.PENDING for s in steps3))
         self.assertTrue(all(s.actual_start is None and s.actual_end is None for s in steps3))
 
         # 4) Tekrar COMPLETED aktarımı -> 0 yeni değişiklik

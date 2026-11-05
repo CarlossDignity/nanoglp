@@ -467,9 +467,9 @@ def build_stepper(
                     "key": k,
                     "label": v["label"],
                     "full": v["full"],
-                    "signed": k in ap or (done and not ap),
-                    "by": (ap.get(k) or {}).get("by") or (v["label"] if (done and not ap) else None),
-                    "at": (ap.get(k) or {}).get("at") or (done_at if (done and not ap) else None),
+                    "signed": k in ap,
+                    "by": (ap.get(k) or {}).get("by"),
+                    "at": (ap.get(k) or {}).get("at"),
                     "can_sign": k in perms["approval_roles"],
                 }
                 for k, v in APPROVAL_ROLES.items()
@@ -505,6 +505,9 @@ def build_stepper(
                 extra["payment_status"] = sample.payment_status
         else:
             done = bool(st.get("done") or marker == "+")
+        if st.get("source") == "excel":
+            done_at, done_by = st.get("done_at"), st.get("done_by")
+            extra["source"] = "excel"
         out.append(
             {
                 "no": no,
@@ -826,6 +829,7 @@ def plan_sample(
     start_date: Optional[date] = None,
     preserve_status: bool = False,
     allow_non_draft: bool = False,
+    existing_study: Optional[Study] = None,
 ) -> Dict[str, Any]:
     from app.services.scheduling_engine import schedule_new_study  # döngüsel içe aktarmayı önlemek için yerel
 
@@ -834,7 +838,7 @@ def plan_sample(
         tpl_code = DEFAULT_TEMPLATE_CODE
     tpl = get_template(tpl_code, db=db)
 
-    study = find_study(db, sample.study_code)
+    study = existing_study if existing_study is not None else find_study(db, sample.study_code)
     if study is not None and study.status != StudyStatus.DRAFT and not allow_non_draft:
         raise PermissionError(
             f"'{sample.study_code}' çalışması {study.status.value} durumundadır; onaylı çalışmaların takvimi "
@@ -1398,45 +1402,10 @@ def _build_workflow_from_markers(
     draft_dt: Optional[date],
     final_dt: Optional[date],
 ) -> Dict[str, Any]:
-    wf: Dict[str, Any] = {}
-    sd_lbl = sd_name or "Çalışma Yöneticisi"
-    sales_lbl = sales_name or "Satış"
-    for idx, m in enumerate(markers, start=1):
-        key = str(idx)
-        if m == "yurt dışı":
-            wf[key] = {"done": False, "marker": "yurt dışı", "abroad": True}
-        elif m == "+":
-            done_at = None
-            done_by = sd_lbl
-            if idx == 1:
-                done_by = sales_lbl
-                done_at = agreement_dt.isoformat() if agreement_dt else None
-            elif idx == 4:
-                done_by = "TRM Kabul"
-                done_at = arrival_dt.isoformat() if arrival_dt else None
-            elif idx in (5, 6, 7):
-                done_at = start_dt.isoformat() if start_dt else None
-            elif idx == 8:
-                done_at = end_dt.isoformat() if end_dt else None
-            elif idx == 9:
-                done_at = draft_dt.isoformat() if draft_dt else None
-            elif idx == 10:
-                done_by = sales_lbl
-                done_at = (final_dt or draft_dt or end_dt).isoformat() if (final_dt or draft_dt or end_dt) else None
-            elif idx == 11:
-                done_at = final_dt.isoformat() if final_dt else None
-            entry: Dict[str, Any] = {"done": True, "marker": "+", "done_by": done_by, "done_at": done_at}
-            if idx in (6, 11):
-                stamp = (done_at or date.today().isoformat()) + "T10:00:00"
-                entry["approvals"] = {
-                    "CY": {"by": sd_lbl, "at": stamp},
-                    "KG": {"by": "Selin Bolcan", "at": stamp},
-                    "TBY": {"by": "Emine ARMUTOĞLU", "at": stamp},
-                }
-            wf[key] = entry
-        else:
-            wf[key] = {"done": False, "marker": "-"}
-    return wf
+    # Imported assertions are source information, never application signatures.
+    return {str(i): {"done": m == "+", "marker": m, "source": "excel",
+                     **({"abroad": True} if m == "yurt dışı" else {})}
+            for i, m in enumerate(markers, 1)}
 
 
 def _build_default_workflow_for_status(
@@ -1508,7 +1477,7 @@ def _map_status(raw_status: Optional[str], has_arrival: bool) -> str:
     return "PLANNED" if has_arrival else "EXPECTED"
 
 
-def import_study_status_workbook(
+def _import_study_status_workbook(
     db: Session,
     content: bytes,
     user: User,
@@ -1521,7 +1490,6 @@ def import_study_status_workbook(
     """
     from openpyxl import load_workbook
 
-    ensure_excel_personnel_users(db)
     wb = load_workbook(io.BytesIO(content), data_only=True)
 
     ws_glp = next((wb[n] for n in wb.sheetnames if "glp medikal" in norm_key(n)), None)
@@ -1531,6 +1499,11 @@ def import_study_status_workbook(
     if ws_glp is None:
         wb.close()
         raise ValueError("'GLP Medikal' sekmesi bulunamadı.")
+
+    from app.services.excel_refresh import SheetColumns
+    ws_glp = SheetColumns(ws_glp, 7, "glp")
+    if ws_nglp is not None:
+        ws_nglp = SheetColumns(ws_nglp, 6, "non_glp")
 
     # 1) Sponsor sözleşme sekmesinden yedek iletişim / sözleşme tarihi sözlüğü
     sponsor_lookup: Dict[str, Dict[str, Any]] = {}
@@ -1582,7 +1555,9 @@ def import_study_status_workbook(
     for r in range(8, ws_glp.max_row + 1):
         sira_raw = ws_glp.cell(r, 1).value
         if sira_raw is None or str(sira_raw).strip() == "":
-            continue
+            if not ws_glp.cell(r, 8).value:
+                continue
+            sira_raw = r - 7
         try:
             sira_no = int(float(str(sira_raw).strip()))
         except ValueError:
@@ -1590,13 +1565,13 @@ def import_study_status_workbook(
         raw_code = ws_glp.cell(r, 8).value
         study_code = _clean_code(raw_code, sira_no)
         if not study_code:
-            continue
+            raise ValueError(f"GLP Medikal satır {r}: çalışma kodu eksik")
         req_analysis = re.sub(r"\s+", " ", str(ws_glp.cell(r, 2).value or "")).strip() or None
         test_item = re.sub(r"\s+", " ", str(ws_glp.cell(r, 3).value or "")).strip() or None
         sd_name = normalize_study_director_name(ws_glp.cell(r, 4).value)
         billing = re.sub(r"\s+", " ", str(ws_glp.cell(r, 5).value or "")).strip() or None
         raw_sp = re.sub(r"\s+", " ", str(ws_glp.cell(r, 6).value or "")).strip()
-        sponsor = raw_sp if (raw_sp and raw_sp != "-") else billing
+        sponsor = raw_sp if (raw_sp and raw_sp != "-") else None
         person_mail_raw = str(ws_glp.cell(r, 7).value or "").strip()
         sales_mgr = normalize_sales_manager(ws_glp.cell(r, 9).value)
         quote_no = re.sub(r"\s+", " ", str(ws_glp.cell(r, 10).value or "")).strip() or None
@@ -1677,7 +1652,7 @@ def import_study_status_workbook(
                 "sample_note": note_col,
                 "stored_status": stored_status,
                 "sample_status": "Bekleniyor" if stored_status == "EXPECTED" else "Kabul edildi",
-                "template_code": infer_template_code(req_analysis) or DEFAULT_TEMPLATE_CODE,
+                "template_code": (infer_template_code(req_analysis) or DEFAULT_TEMPLATE_CODE) if req_analysis else None,
             }
         )
 
@@ -1784,200 +1759,41 @@ def import_study_status_workbook(
                     "template_code": "PHYS_CHEM_MONO",
                 }
             )
+    for sheet, records, start in ((ws_glp, glp_parsed, 8), (ws_nglp, nglp_parsed, 7)):
+        if sheet is not None:
+            for rec in records:
+                rec.update(sheet.extras.get(rec["study_code"], {}))
     wb.close()
 
     all_parsed = glp_parsed + nglp_parsed
-    excel_codes = {r["study_code"] for r in all_parsed}
+    from app.services.excel_refresh import apply_refresh
+    return apply_refresh(db, all_parsed, wf_by_code, user, auto_schedule,
+                         glp_count=len(glp_parsed), non_glp_count=len(nglp_parsed))
 
-    if prune_non_excel:
-        def _is_explicit_demo_sample(s_row: SampleRecord, st_obj: Optional[Study] = None) -> bool:
-            wf_meta = s_row.workflow if isinstance(getattr(s_row, "workflow", None), dict) else {}
-            if wf_meta.get("is_historical_demo") is True or wf_meta.get("_is_demo") is True:
-                return True
-            if st_obj is not None and isinstance(getattr(st_obj, "dossier_metadata", None), dict):
-                if st_obj.dossier_metadata.get("is_historical_demo") is True:
-                    return True
-            return False
 
-        def _is_explicit_demo_study(st_obj: Study) -> bool:
-            if isinstance(getattr(st_obj, "dossier_metadata", None), dict):
-                if st_obj.dossier_metadata.get("is_historical_demo") is True:
-                    return True
-            return False
+class _ExcelTransactionSession(Session):
+    """Legacy planning helpers may flush, but only the import boundary commits."""
+    def commit(self):
+        self.flush()
 
-        study_map_for_demo = {st_item.study_code: st_item for st_item in db.query(Study).all() if st_item.study_code}
-        for old_row in db.query(SampleRecord).all():
-            if old_row.study_code not in excel_codes and _is_explicit_demo_sample(
-                old_row, study_map_for_demo.get(old_row.study_code)
-            ):
-                db.delete(old_row)
-        from app.models.conflict import Conflict
-        for old_st in db.query(Study).all():
-            if old_st.study_code not in excel_codes and _is_explicit_demo_study(old_st):
-                db.query(Conflict).filter((Conflict.study_id == old_st.id) | (Conflict.related_study_id == old_st.id)).delete(synchronize_session=False)
-                for st_step in db.query(StudyStep).filter(StudyStep.study_id == old_st.id).all():
-                    st_step.assignees = []
-                    db.delete(st_step)
-                db.delete(old_st)
-        db.flush()
 
-    created = updated = 0
-    for rec in all_parsed:
-        code = rec["study_code"]
-        markers = wf_by_code.get(code)
-        if markers is not None:
-            wf = _build_workflow_from_markers(
-                markers,
-                rec["study_director_name"],
-                rec["sales_manager"],
-                rec["study_agreement_date"],
-                rec["lab_arrival_date"] or rec["istanbul_arrival_date"],
-                rec["planned_start"],
-                rec["planned_end"],
-                rec["draft_report_date"],
-                rec["final_report_date"],
-            )
-        else:
-            wf = _build_default_workflow_for_status(
-                rec["stored_status"],
-                rec["study_director_name"],
-                rec["sales_manager"],
-                rec["study_agreement_date"],
-                rec["lab_arrival_date"] or rec["istanbul_arrival_date"],
-                rec["planned_start"],
-                rec["planned_end"],
-                rec["draft_report_date"],
-                rec["final_report_date"],
-                rec["payment_status"],
-            )
-
-        sample = db.query(SampleRecord).filter(SampleRecord.study_code == code).first()
-        if sample is None:
-            sample = SampleRecord(study_code=code)
-            db.add(sample)
-            created += 1
-        else:
-            updated += 1
-
-        study = find_study(db, code)
-        existing_has_steps = _study_has_steps(db, study)
-        for k, v in rec.items():
-            if k == "study_code":
-                continue
-            if k == "planned_end" and v is None and existing_has_steps and sample.planned_end is not None:
-                continue
-            setattr(sample, k, v)
-        sample.workflow = wf
-
-        # Study tablosu senkronizasyonu
-        sd_u = match_study_director(db, rec["study_director_name"], include_inactive=True)
-        if sd_u is None:
-            sd_u = db.query(User).filter(User.role == UserRole.STUDY_DIRECTOR, User.is_active == True).order_by(User.id).first()  # noqa: E712
-        tpl = TEMPLATES.get(resolve_template_code(rec["template_code"])) or TEMPLATES[DEFAULT_TEMPLATE_CODE]
-        st_status = (
-            StudyStatus.COMPLETED
-            if rec["stored_status"] == "COMPLETED"
-            else StudyStatus.IN_PROGRESS
-            if rec["stored_status"] == "ONGOING"
-            else StudyStatus.DRAFT
-        )
-        contact_txt = "; ".join(
-            f"{c.get('name', '')} <{c.get('email', '')}>".replace(" <>", "") for c in (rec["contacts"] or [])
-        ) or None
-        item_name = rec["test_item_name"] or "BELİRTİLMEDİ"
-        if study is None and sd_u is not None:
-            study = Study(
-                study_code=code,
-                title=f"{tpl.standard} {tpl.title} — {item_name} ({code})",
-                test_type=rec["requested_analysis"] or tpl.title,
-                template_code=tpl.code,
-                guideline=tpl.standard,
-                status=st_status,
-                study_director_id=sd_u.id,
-                sponsor_name=rec["sponsor_name"] or rec["billing_company"],
-                sponsor_contact=contact_txt,
-                test_item_name=item_name,
-                acclimatization_start_date=rec["planned_start"] or rec["experiment_start_date"],
-                target_start_date=rec["planned_start"] or rec["experiment_start_date"],
-                target_end_date=rec["planned_end"] or rec["experiment_end_date"],
-                dossier_metadata={"historical_excel_import": True},
-            )
-            db.add(study)
-        elif study is not None:
-            study.template_code = tpl.code
-            study.test_type = rec["requested_analysis"] or study.test_type or tpl.title
-            study.guideline = tpl.standard
-            study.status = st_status
-            if sd_u is not None:
-                study.study_director_id = sd_u.id
-            if rec["sponsor_name"] or rec["billing_company"]:
-                study.sponsor_name = rec["sponsor_name"] or rec["billing_company"]
-            if contact_txt:
-                study.sponsor_contact = contact_txt
-            if rec["test_item_name"]:
-                study.test_item_name = rec["test_item_name"]
-            if rec["planned_start"] or rec["experiment_start_date"]:
-                study.acclimatization_start_date = rec["planned_start"] or rec["experiment_start_date"]
-                study.target_start_date = rec["planned_start"] or rec["experiment_start_date"]
-            if rec["planned_end"] or rec["experiment_end_date"]:
-                study.target_end_date = rec["planned_end"] or rec["experiment_end_date"]
-            meta = dict(study.dossier_metadata or {}) if isinstance(study.dossier_metadata, dict) else {}
-            meta["historical_excel_import"] = True
-            study.dossier_metadata = meta
-
-    db.commit()
-
-    scheduled_count = 0
-    if auto_schedule:
-        sched_res = auto_schedule_excel_studies(db, user, target_study_codes=excel_codes)
-        scheduled_count = sched_res["scheduled"]
-
-    from app.services.scheduling_engine import sync_historical_completion_and_conflicts
-
-    hist_sync = sync_historical_completion_and_conflicts(
-        db,
-        from_excel_import=True,
-        target_study_codes=excel_codes,
-    )
-    db.commit()
-
-    sync_faz_9_3_sample_fields(db)
-
-    db.add(
-        AuditLog(
-            user_id=user.id,
-            entity_name="SampleRecord",
-            entity_id=0,
-            action="STUDY_STATUS_WORKBOOK_IMPORT",
-            new_values={
-                "glp_count": len(glp_parsed),
-                "non_glp_count": len(nglp_parsed),
-                "workflow_matched": len(wf_by_code),
-                "created": created,
-                "updated": updated,
-                "auto_scheduled": scheduled_count,
-                "newly_completed_steps": hist_sync.get("newly_completed_steps", 0),
-            },
-            reason=(
-                f"{user.username}: Study Status Excel tam içe aktarma — {len(glp_parsed)} GLP + {len(nglp_parsed)} Non-GLP "
-                f"çalışma, {len(wf_by_code)} iş akışı eşleşti, {scheduled_count} çalışma otomatik takvimlendi."
-            ),
-        )
-    )
-    db.commit()
-    return {
-        "created": created,
-        "updated": updated,
-        "skipped": 0,
-        "errors": [],
-        "total_rows": len(all_parsed),
-        "glp_count": len(glp_parsed),
-        "non_glp_count": len(nglp_parsed),
-        "workflow_matched": len(wf_by_code),
-        "auto_scheduled": scheduled_count,
-        "newly_completed_steps": hist_sync.get("newly_completed_steps", 0),
-        "historical_sync": hist_sync,
-    }
+def import_study_status_workbook(db, content, user, auto_schedule=True, prune_non_excel=False):
+    # A separate identity map prevents helper commits from persisting partial rows.
+    # rollback_only joins the caller's transaction without owning its connection.
+    worker = _ExcelTransactionSession(bind=db.connection(), join_transaction_mode="rollback_only")
+    try:
+        actor = worker.get(User, user.id)
+        result = _import_study_status_workbook(worker, content, actor, auto_schedule, False)
+        worker.flush()
+        db.commit()
+        db.expire_all()
+        return result
+    except Exception:
+        db.rollback()
+        db.expire_all()
+        raise
+    finally:
+        worker.close()
 
 
 def auto_schedule_excel_studies(

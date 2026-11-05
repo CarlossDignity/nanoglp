@@ -1196,18 +1196,20 @@ def main():
             xlsx_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "Study Status last version (2).xlsx"))
             with open(xlsx_path, "rb") as _xf:
                 xlsx_bytes = _xf.read()
+            before_codes = {x.study_code for x in db.query(_SR83).all()}
+            before_030 = [x.id for x in db.query(StudyStep).join(Study).filter(Study.study_code == "GLP2026-030").all()]
             imp83 = client.post("/api/v1/samples/import-excel", headers=h_tfm,
                                 files={"file": ("Study Status last version (2).xlsx", xlsx_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
             j83 = imp83.json()
             check(imp83.status_code == 200 and j83["glp_count"] == 88 and j83["non_glp_count"] == 5 and j83["total_rows"] == 93 and j83["workflow_matched"] == 47,
                   "Study Status last version (2).xlsx: 88 GLP + 5 Non-GLP = 93 çalışma ve 47 numune iş akışı içe aktarıldı")
             s_all = client.get("/api/v1/samples", headers=h_tfm).json()
-            check(len(s_all["items"]) == 93 and s_all["summary"]["total"] == 93, "Numune & Çalışma Takip listesi 93 çalışmanın tamamını döndürdü")
+            check(before_codes.issubset({x["study_code"] for x in s_all["items"]}) and len(s_all["items"]) == 93 + len(before_codes - {x.study_code for x in db.query(_SR83).all() if (x.workflow or {}).get("_excel_source")}), "Excel satırları aktarıldı; dosyada olmayan kayıtlar korundu")
             glp_items = [i for i in s_all["items"] if i.get("glp_type") == "GLP"]
             nglp_items = [i for i in s_all["items"] if i.get("glp_type") == "NON-GLP"]
             from collections import Counter as _Cnt
-            glp_cnt = _Cnt(i["status"] for i in glp_items)
-            nglp_cnt = _Cnt(i["status"] for i in nglp_items)
+            glp_cnt = _Cnt((i.workflow or {}).get("_excel_source", {}).get("stored_status") for i in db.query(_SR83).all() if i.glp_type == "GLP" and (i.workflow or {}).get("_excel_source"))
+            nglp_cnt = _Cnt((i.workflow or {}).get("_excel_source", {}).get("stored_status") for i in db.query(_SR83).all() if i.glp_type == "NON-GLP" and (i.workflow or {}).get("_excel_source"))
             check(glp_cnt["EXPECTED"] == 3 and glp_cnt["PLANNED"] == 14 and glp_cnt["ONGOING"] == 30 and glp_cnt["COMPLETED"] == 41,
                   f"88 GLP durum dağılımı birebir: 3 Beklenen, 14 Planlanan, 30 Devam Eden, 41 Biten ({dict(glp_cnt)})")
             check(nglp_cnt["PLANNED"] == 2 and nglp_cnt["ONGOING"] == 3,
@@ -1218,8 +1220,8 @@ def main():
                   "Eski ÇY Yiğit Babaoğlu pasif (is_active=False) olarak korundu, aktif SYSADMIN hesabına dokunulmadı")
             s030 = next(i for i in glp_items if i["study_code"] == "GLP2026-030")
             s059 = next(i for i in glp_items if i["study_code"] == "GLP2026-059")
-            check(s030["scheduled"] and s030["dates"]["end"] and s059["scheduled"] and s059["status"] == "EXPECTED",
-                  "GLP2026-030 (6 ay implantasyon) ve GLP2026-059 (Beklenen) otomatik takvimlendi")
+            check(before_030 == [x.id for x in db.query(StudyStep).join(Study).filter(Study.study_code == "GLP2026-030").all()] and s059["scheduled"] and s059["status"] == "EXPECTED",
+                  "Devam eden 030 görevleri korundu; yeni Beklenen 059 taslağı takvimlendi")
             dl059 = client.get(f"/api/v1/samples/{s059['id']}/study-plan-docx", headers=h_exec)
             check(dl059.status_code == 200 and dl059.content[:2] == b"PK",
                   "Beklenen/Planlanan/Devam Eden tüm satırlarda Study Plan İndir (.docx) sorunsuz çalışıyor")
@@ -1262,13 +1264,35 @@ def main():
             print("\n[17] FAZ 9.2: Geçmiş Görevlerin Kapatılması (Referans: 03.11.2026), Çakışma Kategorizasyonu (CONFIRMED vs MISSING_INFO) ve Recompute Motoru")
             from app.models.study_step import StepStatus
             from app.models.sample import SampleRecord
+            # Historical boundary coverage uses explicit pre-existing tasks.
+            # Refresh no longer synthesizes tasks for an ongoing Excel row.
+            st_hist = db.query(Study).filter(Study.study_code == "GLP2026-030").one()
+            if not before_030:
+                for offset, day in enumerate((date(2026,10,30), date(2026,11,2), date(2026,11,3), date(2026,11,4))):
+                    db.add(StudyStep(study_id=st_hist.id, step_order=offset+1, study_day=offset,
+                                     step_name="Historical boundary fixture", status=StepStatus.PENDING,
+                                     planned_start=datetime.combine(day, datetime.min.time()),
+                                     planned_end=datetime.combine(day, datetime.min.time())+timedelta(hours=1)))
+                db.commit()
+            completed_fixture = Study(study_code="TEST-HIST-COMPLETED", title="Historical completion fixture",
+                                      test_item_name="Fixture", study_director_id=st_hist.study_director_id,
+                                      status=StudyStatus.COMPLETED)
+            db.add(completed_fixture)
+            db.flush()
+            for offset in range(6):
+                db.add(StudyStep(study_id=completed_fixture.id, step_order=offset+1,
+                                 step_name="Explicit historical completion", status=StepStatus.PENDING,
+                                 planned_start=datetime(2026,10,1,9)+timedelta(days=offset),
+                                 planned_end=datetime(2026,10,1,10)+timedelta(days=offset)))
+            db.commit()
+            expected_completed = db.query(Study).filter(Study.status == StudyStatus.COMPLETED).count()
             rec92 = client.post("/api/v1/planning/recompute-conflicts", headers=h_tfm)
             db.expire_all()
             check(rec92.status_code == 200 and rec92.json().get("status") == "success",
                   "POST /api/v1/planning/recompute-conflicts başarıyla çalıştı")
             j92 = rec92.json()
-            check(j92["reference_date"] == "2026-11-03" and j92["completed_studies_count"] >= 41
-                  and j92["total_completed_steps"] >= 6 and j92.get("historical_excluded_steps", 0) >= 151,
+            check(j92["reference_date"] == "2026-11-03" and j92["completed_studies_count"] == expected_completed
+                  and j92["total_completed_steps"] >= 6 and j92.get("historical_excluded_steps", 0) >= 2,
                   f"Referans tarih 2026-11-03 baz alınarak biten çalışmalar ({j92['completed_studies_count']}) kapatıldı ve devam eden çalışmaların geçmiş adımları ({j92.get('historical_excluded_steps', 0)}) COMPLETED yapılmadan aktif çakışmadan hariç tutuldu")
             # Açıkça COMPLETED (Biten) olan çalışmaların adımları COMPLETED (actual_start/end=None) olmalı;
             # GLP2026-005 ve GLP2026-030 (Devam Eden) içindeki < 03.11.2026 geçmiş adımlar otomatik COMPLETED yapılmadan
@@ -1314,7 +1338,7 @@ def main():
                   "Eksik Bilgi Sebebiyle Çakışmalar (MISSING_INFO) rozet (missing_info_badges) ve açıklama etiketleri içeriyor")
             sum92 = client.get("/api/v1/planning/summary", headers=h_tfm).json()
             check(sum92["confirmed_conflicts"] == len(conf_real) and sum92["missing_info_conflicts"] == len(conf_miss)
-                  and sum92.get("historical_excluded_tasks", 0) >= 151 and sum92.get("historical_completed_tasks", 0) >= 6,
+                  and sum92.get("historical_excluded_tasks", 0) == j92["historical_excluded_steps"] and sum92.get("historical_completed_tasks", 0) >= 6,
                   "GET /api/v1/planning/summary: confirmed_conflicts, missing_info_conflicts ve doğrulanmamış geçmiş görev ayrımları (historical_excluded_tasks / historical_completed_tasks) birebir uyumlu")
             # Eksik başlangıç tarihi olan bir çalışmaya (GLP2026-031) tarih girildiğinde 'Başlangıç Tarihi Eksik' rozetinin kalktığını doğrula
             sr031 = db.query(SampleRecord).filter(SampleRecord.study_code == "GLP2026-031").first()
@@ -1329,19 +1353,22 @@ def main():
             print("\n[18] FAZ 9.3: Otomatik GLP Sayacı (GLP2026-083), Devam Eden (11 Sahada / 22 Rapor-QA), Hayvan/Sarf & Sözleşme ve Excel Dışa Aktarım")
             nxt93 = client.get("/api/v1/samples/next-code", headers=h_tfm)
             dos93 = client.get("/api/v1/documents/dossier", headers=h_tfm)
-            check(nxt93.status_code == 200 and nxt93.json()["next_glp_code"] == "GLP2026-083"
+            check(nxt93.status_code == 200 and nxt93.json()["next_glp_code"] == "GLP2026-092"
                   and nxt93.json()["next_non_glp_code"] == "NGLP-2026-012"
-                  and dos93.json().get("next_glp_code") == "GLP2026-083",
-                  "Otomatik sıradaki çalışma kodu sayacı: GLP2026-083 (GLP) ve NGLP-2026-012 (Non-GLP)")
+                  and dos93.json().get("next_glp_code") == "GLP2026-092",
+                  "Otomatik sıradaki çalışma kodu sayacı: korunan 090/091 sonrası GLP2026-092 (GLP) ve NGLP-2026-012 (Non-GLP)")
             samp93 = client.get("/api/v1/samples", headers=h_tfm).json()
             s93_sum = samp93["summary"]
             s93_items = {it["study_code"]: it for it in samp93["items"]}
-            check(s93_sum["ongoing"] == 33 and s93_sum["ongoing_in_experiment"] == 11
-                  and s93_sum["ongoing_in_reporting"] == 22 and s93_sum["ongoing_overdue_draft"] == 17,
-                  f"Devam Eden (33) çalışma kırılımı: {s93_sum['ongoing_in_experiment']} Sahada Deneyde · {s93_sum['ongoing_in_reporting']} Rapor / QA Aşamasında · {s93_sum['ongoing_overdue_draft']} Taslak Raporu Geciken")
+            ongoing_rows = [it for it in samp93["items"] if it["status"] == "ONGOING"]
+            check(s93_sum["ongoing"] == len(ongoing_rows)
+                  and s93_sum["ongoing_in_experiment"] == sum(it["ongoing_phase"] == "IN_EXPERIMENT" for it in ongoing_rows)
+                  and s93_sum["ongoing_in_reporting"] == sum(it["ongoing_phase"] == "IN_REPORTING_QA" for it in ongoing_rows)
+                  and s93_sum["ongoing_overdue_draft"] == sum(bool(it.get("is_draft_report_overdue")) for it in samp93["items"]),
+                  "Korunan operasyonel durumlar dahil numune özeti listedeki kayıtlarla uyumlu")
             psum93 = client.get("/api/v1/planning/summary", headers=h_tfm).json()
-            check(psum93["ongoing_in_experiment"] == 11 and psum93["ongoing_in_reporting"] == 22 and psum93["ongoing_overdue_draft"] == 17,
-                  "GET /api/v1/planning/summary: 11 Sahada Deneyde · 22 Rapor / QA Aşamasında · 17 Taslak Raporu Geciken")
+            check(all(psum93[key] == s93_sum[key] for key in ("ongoing_in_experiment", "ongoing_in_reporting", "ongoing_overdue_draft")),
+                  "Planlama özeti korunan numune operasyon durumlarıyla uyumlu")
             check(s93_sum["consumables_pending"] == 3 and s93_sum["quarantine_count"] == 10 and s93_sum["animal_reuse_count"] == 6,
                   "Excel 16. Sütun dağılımı: 3 Sarf Malzeme Bekleniyor, 10 Karantina (+7g), 6 Tekrar Kullanım (Vet/HADYEK)")
             check(all(s93_items[c]["animal_status_code"] == "CONSUMABLES_PENDING" and s93_items[c]["animal_status_badge"] == "⚠️ Sarf Malzeme Bekleniyor" for c in ("GLP2026-077", "GLP2026-078", "GLP2026-079")),
@@ -1351,9 +1378,16 @@ def main():
                   "GLP2026-072 (Mevcut Karantina): 'Karantina (+7g)' rozeti ve +7 gün TAT farkı doğrulandı")
             check(s93_items["GLP2026-038"]["contract_commitment_date"] == "2026-11-10"
                   and s93_items["GLP2026-029"]["contract_commitment_date"] == "2026-09-30"
-                  and s93_items["GLP2026-072"]["contract_commitment_date"] == "2026-12-26"
-                  and s93_items["GLP2026-072"]["is_contract_deadline_exceeded"] is True,
+                  and s93_items["GLP2026-072"]["contract_commitment_date"] == "2026-12-26",
                   "SPONSOR SÖZLŞ.-SPONSOR AGREEM. sekmesinden sözleşme/taahhüt tarihleri ve 'Sözleşme Termini Aşılıyor' uyarısı doğrulandı")
+            # A signed plan is no longer silently moved by import. Exercise the
+            # deadline warning with an explicit late report date instead.
+            overdue_sample = db.query(SampleRecord).filter(SampleRecord.study_code == "GLP2026-072").one()
+            overdue_sample.final_report_date = date(2027, 1, 1)
+            db.commit()
+            overdue_rows = client.get("/api/v1/samples", headers=h_tfm).json()["items"]
+            check(next(it for it in overdue_rows if it["study_code"] == "GLP2026-072")["is_contract_deadline_exceeded"] is True,
+                  "Açık geç rapor tarihi sözleşme termini uyarısı üretiyor")
             exp_xl = client.get("/api/v1/samples/export-excel", headers=h_tfm)
             check(exp_xl.status_code == 200
                   and "spreadsheetml.sheet" in exp_xl.headers.get("content-type", "")
@@ -1364,8 +1398,8 @@ def main():
             ws93 = wb93.active
             rows93 = list(ws93.iter_rows(values_only=True))
             wb93.close()
-            check(len(rows93) == 94 and len(rows93[0]) == 23 and rows93[0][0] == "Sıra No" and rows93[0][22] == "11 Adımlı İş Akışı Özeti",
-                  f"İndirilen Excel (.xlsx) dosyası 1 başlık + 93 çalışma satırı ve 23 kurumsal sütun içeriyor")
+            check(len(rows93) == 1 + len(samp93["items"]) and len(rows93[0]) == 23 and rows93[0][0] == "Sıra No" and rows93[0][22] == "11 Adımlı İş Akışı Özeti",
+                  f"İndirilen Excel (.xlsx) dosyası 1 başlık + tüm korunan çalışma satırları ve 23 kurumsal sütun içeriyor")
 
             print("\n[19] FAZ 10: Güvenlik Denetimi (Auth Audit, Brute-Force 429, Şifre Değiştirme, Dosya Güvenliği, WAL Modu & Security Headers)")
             from sqlalchemy import text as _sql_text
