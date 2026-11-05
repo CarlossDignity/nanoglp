@@ -15,41 +15,32 @@ import { getSummary, getSteps, getCalendar, getEquipment, extractError } from '.
 import { fmtDateTime, fmtMinutes, fmtDateWeekday, relativeFromNow } from '../utils/format';
 import { usePreferences } from '../state/PreferencesContext';
 
-const HOUR_MS = 3600 * 1000;
 const WATER_BATH_CODE = 'EQ-WB-001';
 
-/** Ekstraksiyon (G4–G7, 72 saat) pencerelerinden polar / apolar eşzamanlı zirve doluluğu hesaplar. */
-function computeWaterBathLoad(studies = []) {
+/** Backend'in doğruladığı rezervasyonlardan [start, end) zirve eşzamanlı çalışma sayısı. */
+export function computeWaterBathLoad(studies = []) {
   const windows = [];
-  studies.forEach((st) => {
-    if (st.study_status === 'COMPLETED') return;
-    const ex = (st.steps || []).find(
-      (s) => s.status !== 'COMPLETED' && (s.step_type === 'Ekstraksiyon' || /ekstraksiyon/i.test(s.step_name || ''))
-    );
-    if (!ex) return;
-    const start = new Date(ex.planned_start).getTime();
-    windows.push({
-      code: st.study_code,
-      status: st.study_status,
-      start,
-      end: start + 72 * HOUR_MS,
-      polar: st.extraction_polar === true,
-      nonPolar: st.extraction_non_polar === true,
-      day: ex.study_day,
-      iso: ex.planned_start,
+  studies.forEach((study) => {
+    if (!['DRAFT', 'APPROVED', 'IN_PROGRESS'].includes(study.study_status)) return;
+    (study.water_bath_reservations || []).forEach((reservation) => {
+      if (reservation.equipment_code !== WATER_BATH_CODE) return;
+      const start = Date.parse(reservation.window_start);
+      const end = Date.parse(reservation.window_end);
+      const polar = reservation.uses_polar === true;
+      const nonPolar = reservation.uses_apolar === true;
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start || (!polar && !nonPolar)) return;
+      windows.push({ studyId: study.study_id ?? study.study_code, code: study.study_code, start, end, polar, nonPolar });
     });
   });
   const peak = (flag) => {
-    let max = 0;
-    windows
-      .filter((w) => w[flag])
-      .forEach((w) => {
-        const concurrent = windows.filter((o) => o[flag] && o.start <= w.start && o.end > w.start).length;
-        max = Math.max(max, concurrent);
-      });
-    return max;
+    const relevant = windows.filter((window) => window[flag]);
+    return relevant.reduce((max, window) => Math.max(max, new Set(
+      relevant.filter((other) => other.start <= window.start && window.start < other.end)
+        .map((other) => other.studyId)
+    ).size), 0);
   };
-  return { windows, polarPeak: peak('polar'), nonPolarPeak: peak('nonPolar') };
+  return { windows, studyCount: new Set(windows.map((window) => window.studyId)).size,
+    polarPeak: peak('polar'), nonPolarPeak: peak('nonPolar') };
 }
 
 function CapacityBar({ label, used, max }) {
@@ -72,7 +63,7 @@ function CapacityBar({ label, used, max }) {
   );
 }
 
-function EquipmentCapacityCard({ equipment, load, loading }) {
+export function EquipmentCapacityCard({ equipment, load, loading }) {
   const { t } = usePreferences();
   const polarMax = equipment?.polar_capacity ?? 3;
   const nonPolarMax = equipment?.non_polar_capacity ?? 1;
@@ -111,8 +102,8 @@ function EquipmentCapacityCard({ equipment, load, loading }) {
           <p className="text-[11px] text-slate-500 mt-3 leading-snug">
             {hasExtraction
               ? t(
-                  `Aktif + taslak ${load.windows.length} çalışmanın 72s ekstraksiyon (G4–G7) penceresindeki zirve eşzamanlı doluluk.`,
-                  `Peak concurrent occupancy across ${load.windows.length} active + draft studies in the 72h extraction (D4–D7) window.`
+                  `Aktif + taslak ${load.studyCount} çalışmanın 72s ekstraksiyon (G4–G7) penceresindeki zirve eşzamanlı doluluk.`,
+                  `Peak concurrent occupancy across ${load.studyCount} active + draft studies in the 72h extraction (D4–D7) window.`
                 )
               : t(
                   'Planlı ekstraksiyon (G4–G7) penceresi bulunmuyor.',
