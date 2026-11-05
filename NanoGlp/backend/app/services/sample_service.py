@@ -580,10 +580,11 @@ def serialize_sample(
     perms: Dict[str, Any],
     all_samples: Optional[List[SampleRecord]] = None,
     detailed: bool = True,
+    sync_schedule_dates: bool = True,
 ) -> Dict[str, Any]:
     study = find_study(db, s.study_code)
     has_schedule = _study_has_steps(db, study)
-    if has_schedule:
+    if has_schedule and sync_schedule_dates:
         sync_dates_from_study(db, s, study)
     stepper = build_stepper(s, study, has_schedule, perms)
     status = effective_status(s, stepper)
@@ -810,6 +811,46 @@ def apply_field_updates(sample: SampleRecord, payload: Dict[str, Any], fields: T
         if getattr(sample, f) != val:
             setattr(sample, f, val)
             changed.append(f)
+    return changed
+
+
+def sync_sample_shared_fields(db: Session, sample: SampleRecord, submitted_fields) -> List[str]:
+    """Sync only submitted shared facts; never create a Study or touch its plan.
+
+    Manual empty values explicitly clear nullable fields, unlike ambiguous blank
+    Excel cells. A linked Study's mandatory product name cannot be cleared.
+    The caller owns the transaction for this sample and all related records.
+    """
+    from app.services.excel_refresh import SHARED
+
+    fields = set(submitted_fields) & (set(SHARED) | {"contacts"})
+    if not fields:
+        return []
+    code = _clean_code(sample.study_code, 0)
+    matches = [study for study in db.query(Study).all()
+               if _clean_code(study.study_code, 0) == code] if code else []
+    if len(matches) > 1:
+        raise ValueError(f"{code}: birden fazla Study kaydı eşleşiyor; ortak alanlar güncellenemedi.")
+    if not matches:
+        return []
+    study = matches[0]
+    changed = []
+    for source in sorted(fields):
+        if source == "contacts":
+            # Same representation used by the Excel refresh and plan_sample.
+            value = "; ".join(
+                f"{c.get('name', '')} <{c.get('email', '')}>".replace(" <>", "")
+                for c in (sample.contacts or [])
+            ) or None
+            target = "sponsor_contact"
+        else:
+            value = getattr(sample, source)
+            target = SHARED[source]
+        if target == "test_item_name" and not value:
+            raise ValueError(f"{code}: bağlı çalışmanın zorunlu test maddesi / ürün adı boşaltılamaz.")
+        if getattr(study, target) != value:
+            setattr(study, target, value)
+            changed.append(target)
     return changed
 
 
