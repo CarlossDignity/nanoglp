@@ -296,6 +296,203 @@ class ExcelUpdates(unittest.TestCase):
             datetime(2026, 12, 7, 12, 34),
         )
 
+    def refresh_workbook(self, director="Ezgi Nur AKIN", marker="-", approval="-"):
+        from openpyxl import load_workbook
+
+        w = load_workbook(io.BytesIO(workbook()))
+        w.active.cell(8, 1).value = 4
+        w.active.cell(8, 4).value = director
+        flow = w.create_sheet("NUMUNE İŞ AKIŞI")
+        flow.cell(5, 1, "Company")
+        flow.cell(5, 2, "Intracutaneous Reactivity")
+        for c in range(3, 18):
+            flow.cell(5, c, "-")
+        flow.cell(5, 4).value = marker
+        flow.cell(5, 8).value = approval
+        b = io.BytesIO()
+        w.save(b)
+        return b.getvalue()
+
+    def test_sd_only_refresh_moves_assignees_and_detects_new_conflict(self):
+        from app.models.conflict import Conflict, ConflictType
+
+        self.load(self.refresh_workbook())
+        study = self.db.query(Study).one()
+        old_sd = study.study_director_id
+        director = ss.match_study_director(self.db, "Ayşe Özgür", include_inactive=True)
+        steps = self.db.query(StudyStep).filter_by(study_id=study.id).all()
+        assigned = next(
+            step for step in steps if old_sd in [u.id for u in step.assignees]
+        )
+        before = {
+            step.id: (
+                [u.id for u in step.assignees],
+                step.planned_start,
+                step.planned_end,
+            )
+            for step in steps
+        }
+        other = Study(
+            study_code="SD-BUSY",
+            title="Other study",
+            test_item_name="Other",
+            study_director_id=director.id,
+            status=StudyStatus.APPROVED,
+        )
+        self.db.add(other)
+        self.db.flush()
+        busy = StudyStep(
+            study_id=other.id,
+            step_name="Director busy",
+            planned_start=assigned.planned_start,
+            planned_end=assigned.planned_end,
+            status=StepStatus.PENDING,
+        )
+        busy.assignees = [director]
+        self.db.add(busy)
+        self.db.commit()
+        content = self.refresh_workbook(director="Ayşe Özgür")
+        result = self.load(content)
+        self.assertEqual(result["auto_scheduled"], 0)
+        self.assertEqual(study.study_director_id, director.id)
+        for step in self.db.query(StudyStep).filter_by(study_id=study.id):
+            old_ids, start, end = before[step.id]
+            self.assertEqual(
+                {u.id for u in step.assignees},
+                {director.id if uid == old_sd else uid for uid in old_ids},
+            )
+            self.assertEqual((step.planned_start, step.planned_end), (start, end))
+        conflicts = (
+            self.db.query(Conflict)
+            .filter_by(
+                study_id=study.id,
+                related_study_id=other.id,
+                conflict_type=ConflictType.PERSONNEL_OVERLAP,
+                is_resolved=False,
+            )
+            .all()
+        )
+        self.assertTrue(conflicts)
+        self.assertTrue(any(director.full_name in c.description for c in conflicts))
+        conflict_ids = [c.id for c in self.db.query(Conflict).all()]
+        repeated = self.load(content)
+        self.assertEqual((repeated["updated"], repeated["auto_scheduled"]), (0, 0))
+        self.assertEqual(conflict_ids, [c.id for c in self.db.query(Conflict).all()])
+
+    def test_sd_refresh_keeps_each_operational_protection(self):
+        self.load(self.refresh_workbook())
+        study = self.db.query(Study).one()
+        sample = self.db.query(SampleRecord).one()
+        step = self.db.query(StudyStep).first()
+        before = {s.id: [u.id for u in s.assignees] for s in self.db.query(StudyStep)}
+        old_sd = study.study_director_id
+        for protection in ("approved", "started", "signed", "actual"):
+            with self.subTest(protection=protection):
+                study.status = StudyStatus.DRAFT
+                sample.workflow = {
+                    k: v for k, v in (sample.workflow or {}).items() if k != "6"
+                }
+                step.actual_start = None
+                if protection == "approved":
+                    study.status = StudyStatus.APPROVED
+                if protection == "started":
+                    study.status = StudyStatus.IN_PROGRESS
+                if protection == "signed":
+                    sample.workflow = dict(
+                        sample.workflow,
+                        **{
+                            "6": {
+                                "approvals": {
+                                    "CY": {"by": "Real", "at": "2026-12-01T09:12:00"}
+                                }
+                            }
+                        },
+                    )
+                if protection == "actual":
+                    step.actual_start = datetime(2026, 12, 7, 9, 12)
+                self.db.commit()
+                self.load(self.refresh_workbook(director="Ayşe Özgür"))
+                self.assertEqual(study.study_director_id, old_sd)
+                self.assertEqual(
+                    before,
+                    {
+                        s.id: [u.id for u in s.assignees]
+                        for s in self.db.query(StudyStep)
+                    },
+                )
+
+    def test_workflow_refresh_reaches_api_and_preserves_user_actions(self):
+        from fastapi.testclient import TestClient
+        from app.main import app
+        from app.seed import DEFAULT_PASSWORD
+
+        self.load(self.refresh_workbook())
+        sample = self.db.query(SampleRecord).one()
+        client = TestClient(app)
+        login = client.post(
+            "/api/v1/auth/login",
+            json={"username": self.user.username, "password": DEFAULT_PASSWORD},
+        )
+        self.assertEqual(login.status_code, 200)
+        headers = {"Authorization": "Bearer " + login.json()["access_token"]}
+
+        def flow():
+            response = client.get(f"/api/v1/samples/{sample.id}", headers=headers)
+            self.assertEqual(response.status_code, 200)
+            return {row["no"]: row for row in response.json()["workflow"]}
+
+        self.assertFalse(flow()[2]["done"])
+        content = self.refresh_workbook(marker="+", approval="+")
+        self.load(content)
+        updated = flow()
+        self.assertTrue(updated[2]["done"])
+        self.assertTrue(updated[6]["done"])
+        for n in (2, 6):
+            self.assertIsNone(updated[n]["done_by"])
+            self.assertIsNone(updated[n]["done_at"])
+        self.assertTrue(all(not a["signed"] for a in updated[6]["approvals"]))
+        self.assertEqual(self.load(content)["updated"], 0)
+        self.load(self.refresh_workbook())
+        self.assertFalse(flow()[2]["done"])
+        self.assertFalse(flow()[6]["done"])
+        # Real API actions replace Excel ownership, including undo/revoke.
+        for n, data in (
+            (2, {"action": "complete"}),
+            (6, {"action": "sign", "approver": "TBY"}),
+        ):
+            self.assertEqual(
+                client.post(
+                    f"/api/v1/samples/{sample.id}/workflow/{n}",
+                    headers=headers,
+                    json=data,
+                ).status_code,
+                200,
+            )
+        self.db.expire_all()
+        real = {k: sample.workflow[k] for k in ("2", "6")}
+        self.load(content)
+        self.assertEqual(real, {k: sample.workflow[k] for k in ("2", "6")})
+        for n, data in (
+            (2, {"action": "undo"}),
+            (6, {"action": "revoke", "approver": "TBY"}),
+        ):
+            self.assertEqual(
+                client.post(
+                    f"/api/v1/samples/{sample.id}/workflow/{n}",
+                    headers=headers,
+                    json=data,
+                ).status_code,
+                200,
+            )
+        self.load(self.refresh_workbook())
+        result = self.load(content)
+        self.assertFalse(flow()[2]["done"])
+        self.assertFalse(flow()[6]["done"])
+        self.assertEqual(sample.workflow["2"], {"done": False})
+        self.assertEqual(sample.workflow["6"], {"approvals": {}})
+        repeated = self.load(content)
+        self.assertEqual((repeated["updated"], repeated["auto_scheduled"]), (0, 0))
+
 
 if __name__ == "__main__":
     try:

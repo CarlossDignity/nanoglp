@@ -160,6 +160,7 @@ def apply_refresh(db, records, markers, user, auto_schedule, **counts):
         workflow_matched=len(markers),
         **counts,
     )
+    revalidate_ids = set()
     for rec in records:
         rec = {k: (None if v == "-" else v) for k, v in rec.items()}
         code = rec["study_code"]
@@ -306,9 +307,38 @@ def apply_refresh(db, records, markers, user, auto_schedule, **counts):
                 director = ss.match_study_director(
                     db, sample.study_director_name, include_inactive=True
                 )
-                if director:
+                if director and director.id != study.study_director_id:
+                    previous_director_id = study.study_director_id
                     study.study_director_id = director.id
-                else:
+                    for step in steps:
+                        old_ids = [person.id for person in step.assignees]
+                        if previous_director_id not in old_ids:
+                            continue
+                        # Replace only the previous study director; technicians,
+                        # QA and all other assignments retain their identity.
+                        assignees = [
+                            person
+                            for person in step.assignees
+                            if person.id != previous_director_id
+                        ]
+                        if director.id not in [person.id for person in assignees]:
+                            assignees.append(director)
+                        step.assignees = assignees
+                        report(
+                            "assignees",
+                            old_ids,
+                            [person.id for person in assignees],
+                            target=f"StudyStep.{step.id}.assignees",
+                        )
+                    if steps:
+                        revalidate_ids.add(study.id)
+                        result["scheduling"].append(
+                            dict(
+                                study_code=code,
+                                reason="Çalışma yöneticisi değişti; SD atamaları ve çakışmalar yeniden değerlendirildi",
+                            )
+                        )
+                elif director is None:
                     report(
                         "study_director_name",
                         study.study_director_id,
@@ -339,9 +369,24 @@ def apply_refresh(db, records, markers, user, auto_schedule, **counts):
             )
             # Keep application signatures verbatim; source markers are separate.
             incoming["workflow_markers"] = imported
-            if new:
-                workflow.update(imported)
-        if incoming != previous:
+            for key, entry in imported.items():
+                current = workflow.get(key)
+                excel_owned = (
+                    isinstance(current, dict)
+                    and current.get("source") == "excel"
+                    and set(current).issubset({"source", "marker", "done", "abroad"})
+                )
+                # Application actions (including undo and empty revoked
+                # approvals) own their entries even when they are not done.
+                if (key not in workflow or excel_owned) and current != entry:
+                    workflow[key] = entry
+                    report(
+                        f"workflow.{key}",
+                        current,
+                        entry,
+                        target="SampleRecord.workflow",
+                    )
+        if incoming != previous or workflow != (sample.workflow or {}):
             workflow["_excel_source"] = incoming
             sample.workflow = workflow
         if (
@@ -364,6 +409,16 @@ def apply_refresh(db, records, markers, user, auto_schedule, **counts):
         result["created" if new else "updated" if differences else "unchanged"] += 1
         result["changes"].extend(differences)
         result["reviews"].extend(reviews)
+    # Evaluate after all rows, so two SD changes in one workbook see each
+    # other's final assignments. This remains inside the atomic import.
+    if revalidate_ids:
+        from app.services.scheduling_engine import revalidate_study_conflicts
+
+        db.flush()
+        for study_id in sorted(revalidate_ids):
+            revalidate_study_conflicts(
+                db, db.get(Study, study_id), preserve_weekend_approvals=True
+            )
     result["review_required"] = len({r["study_code"] for r in result["reviews"]})
     if result["created"] or result["updated"]:
         db.add(
