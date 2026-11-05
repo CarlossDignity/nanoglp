@@ -36,7 +36,11 @@ def xml_text(blob):
 
 def media(blob):
     with zipfile.ZipFile(io.BytesIO(blob)) as z:
-        return {n: z.read(n) for n in z.namelist() if n.startswith("word/media/") and not n.endswith("/")}
+        return {
+            n: z.read(n)
+            for n in z.namelist()
+            if n.startswith("word/media/") and not n.endswith("/")
+        }
 
 
 class DocxIsolation(unittest.TestCase):
@@ -181,6 +185,136 @@ class DocxIsolation(unittest.TestCase):
         for v in ("Foreign Product", "FOREIGN-LOT", "OTHER-SAMPLE-LOT"):
             self.assertNotIn(v, text)
 
+    def test_real_x_values_are_preserved_in_records_and_linked_documents(self):
+        for source in ("record", "document"):
+            with self.subTest(source=source):
+                if source == "record":
+                    self.a.test_item_name = "EXXON XXL Product"
+                    self.a.sponsor_name = "EXXON XXL Sponsor"
+                    self.a.test_item_batch = "LOT-XX123"
+                    self.db.commit()
+                else:
+                    self.a.test_item_name = self.a.sponsor_name = (
+                        self.a.test_item_batch
+                    ) = ""
+                    d = self.document(code="DOCX-A")
+                    d.extracted_data = {
+                        "test_item_name": "EXXON XXL Product",
+                        "sponsor_name": "EXXON XXL Sponsor",
+                        "lot_batch_no": "LOT-XX123",
+                    }
+                    self.db.commit()
+                doc = Document(io.BytesIO(self.output()))
+                cells = {
+                    r.cells[0].text.strip(): r.cells[2].text.strip()
+                    for t in doc.tables
+                    for r in t.rows
+                    if len(r.cells) == 3
+                }
+                self.assertEqual(cells["LOT Number"], "LOT-XX123")
+                self.assertEqual(cells["Name of the test item"], "EXXON XXL Product")
+                self.assertEqual(cells["Date of Manufacture"], "TBD")
+                self.assertIn(
+                    "EXXON XXL Sponsor", [p.text.strip() for p in doc.paragraphs]
+                )
+                preparation = next(
+                    p.text
+                    for p in doc.paragraphs
+                    if "Preparation of the test item extract" in p.text
+                )
+                self.assertIn("EXXON XXL Product", preparation)
+                self.assertIn("polar (0.9% NaCl)", preparation)
+                self.assertIn("non-polar (Cottonseed oil)", preparation)
+                self.assertNotIn("ETBDON", preparation)
+
+    def test_real_assignee_names_matching_template_examples_are_preserved(self):
+        self.sd.full_name = "Selin BOLCAN"
+        colleague = User(
+            username="tech",
+            full_name="Dr. Shivadasan ANOOP",
+            email="tech@example.test",
+            role=UserRole.TECHNICIAN,
+        )
+        step = StudyStep(
+            study_id=self.a.id,
+            step_name="Existing",
+            planned_start=datetime(2027, 1, 4, 9),
+            planned_end=datetime(2027, 1, 4, 10),
+            status=StepStatus.PENDING,
+        )
+        step.assignees = [self.sd, colleague]
+        self.db.add(step)
+        self.db.commit()
+        doc = Document(io.BytesIO(self.output()))
+        personnel = next(
+            t for t in doc.tables if t.cell(0, 0).text.strip() == "Personnel"
+        )
+        roles = {r.cells[0].text.strip(): r.cells[1].text for r in personnel.rows}
+        self.assertIn("Name: Selin BOLCAN", roles["Study Director"])
+        self.assertIn("Name: Dr. Shivadasan ANOOP", roles["Study Personnel"])
+        paragraphs = [p.text.strip() for p in doc.paragraphs]
+        for role, expected in (
+            ("Study Director", "Selin BOLCAN"),
+            ("Quality Assurance", "Assigned QA"),
+            ("Management", "TBD"),
+        ):
+            i = next(
+                i
+                for i, p in enumerate(paragraphs)
+                if p.startswith(role + " (Signature")
+            )
+            self.assertEqual(paragraphs[i + 1], "Name: " + expected)
+        schedule = next(
+            t
+            for t in doc.tables
+            if any("Existing" in c.text for r in t.rows for c in r.cells)
+        )
+        self.assertIn("Selin BOLCAN", schedule.cell(1, 4).text)
+        self.assertIn("Dr. Shivadasan ANOOP", schedule.cell(1, 4).text)
+
+    def test_template_roles_and_missing_slots_are_distinct_from_literal_data(self):
+        template = Document(str(export.TEMPLATE_PATH))
+        template.sections[0].header.add_paragraph("Reference author: Selin BOLCAN")
+        template.sections[0].footer.add_paragraph(
+            "Reference author: Dr. Shivadasan ANOOP"
+        )
+        missing = template.sections[0].header.add_paragraph("Missing: ")
+        run = missing.add_run("XXXXX")
+        run.bold = True
+        run.italic = True
+        template.sections[0].header.add_paragraph("Reference product: EXXON XXL")
+        path = Path(TMP.name) / "roles.docx"
+        template.save(path)
+        self.a.test_item_batch = "XX"
+        self.a.test_item_name = "GLP20XX-XXX Original X of X"
+        self.db.commit()
+        with patch.object(export, "TEMPLATE_PATH", path):
+            blob = self.output()
+        doc = Document(io.BytesIO(blob))
+        cells = {
+            r.cells[0].text.strip(): r.cells[2].text.strip()
+            for t in doc.tables
+            for r in t.rows
+            if len(r.cells) == 3
+        }
+        self.assertEqual(cells["LOT Number"], "XX")
+        self.assertEqual(cells["Name of the test item"], "GLP20XX-XXX Original X of X")
+        self.assertEqual(cells["Date of Expiry"], "TBD")
+        text = xml_text(blob)
+        for value in (
+            "Reference author: Selin BOLCAN",
+            "Reference author: Dr. Shivadasan ANOOP",
+            "Reference product: EXXON XXL",
+            "Missing: TBD",
+        ):
+            self.assertIn(value, text)
+        filled = next(
+            p for p in doc.sections[0].header.paragraphs if p.text == "Missing: TBD"
+        )
+        self.assertTrue(filled.runs[1].bold)
+        self.assertTrue(filled.runs[1].italic)
+        self.assertEqual(media(blob), media(path.read_bytes()))
+
     def test_media_nested_tables_and_headers_are_preserved(self):
         template = Document(str(export.TEMPLATE_PATH))
         template.sections[0].header.add_paragraph("Unknown header: XXXXX")
@@ -193,7 +327,6 @@ class DocxIsolation(unittest.TestCase):
         with patch.object(export, "TEMPLATE_PATH", path):
             blob = self.output()
         text = xml_text(blob)
-        self.assertNotRegex(text, r"X{2,}|GLP20XX")
         for v in ("Unknown header: TBD", "Unknown footer: TBD", "Unknown nested: TBD"):
             self.assertIn(v, text)
         self.assertEqual(media(blob), media(path.read_bytes()))
@@ -299,7 +432,8 @@ class DocxIsolation(unittest.TestCase):
             blob = self.output()
         self.assertEqual(drawings(blob), drawings(path.read_bytes()))
         self.assertEqual(media(blob), media(path.read_bytes()))
-        self.assertNotRegex(xml_text(blob), r"X{2,}")
+        header = Document(io.BytesIO(blob)).sections[0].header
+        self.assertEqual(header.paragraphs[-1].text, "TBD")
 
 
 if __name__ == "__main__":

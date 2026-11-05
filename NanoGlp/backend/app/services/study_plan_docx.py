@@ -11,6 +11,7 @@ adımlarının Gün Kodu, Tarih, Saat ve Sorumlu Personelini gösteren Operasyon
 import io
 import re
 from datetime import date
+from uuid import uuid4
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -84,29 +85,56 @@ def _replace_text_in_paragraph(paragraph, old_text: str, new_text: str, count: i
     return replaced
 
 
-def _replace_x_tokens_in_paragraph(paragraph, replacements: List[str]) -> None:
-    """
-    Paragraftaki `X{2,}` (en az 2 ardışık büyük X) yer tutucu bloklarını soldan sağa sırayla
-    `replacements` listesindeki değerlerle (run formatını koruyarak) değiştirir.
-    """
-    for rep in replacements:
-        full_text = "".join(r.text for r in paragraph.runs) if paragraph.runs else paragraph.text
-        m = re.search(r"X{2,}", full_text)
-        if not m:
-            break
-        _replace_span_in_paragraph(paragraph, m.start(), m.end(), str(rep))
+def _story_paragraphs(doc):
+    """Include nested tables and every header/footer variant once."""
+    from docx.text.paragraph import Paragraph
+    stories = [doc.element.body]
+    for section in doc.sections:
+        for attr in ("header", "first_page_header", "even_page_header", "footer", "first_page_footer", "even_page_footer"):
+            stories.append(getattr(section, attr)._element)
+    seen = set()
+    for story in stories:
+        for element in story.xpath(".//w:p"):
+            if element not in seen:
+                seen.add(element)
+                yield Paragraph(element, doc)
 
 
-def _set_cell_x_value(cell, value: str) -> None:
+class _TemplateSlots:
+    """Mark template slots before inserting data; never parse inserted values.
+
+    A per-render namespace separates template provenance from literal XX in
+    records. Text-node edits retain run styling, drawings and field codes.
     """
-    Tablo hücresindeki `X{2,}` yer tutucusunu (ve sonundaki fazla boşlukları) `value` ile değiştirir.
-    """
-    for p in cell.paragraphs:
-        full_text = "".join(r.text for r in p.runs) if p.runs else p.text
-        m = re.search(r"X{2,}\s*", full_text)
-        if m:
-            _replace_span_in_paragraph(p, m.start(), m.end(), str(value))
-            return
+
+    def __init__(self, doc):
+        self.prefix = f"\ue000{uuid4().hex}:"
+        self.code = self.prefix + "study-code\ue001"
+        self.pattern = re.compile(re.escape(self.prefix) + r"X{2,}\ue001")
+        for paragraph in _story_paragraphs(doc):
+            _replace_text_in_paragraph(paragraph, "Original X of X", "Original 1 of 2", count=-1)
+            _replace_text_in_paragraph(paragraph, "GLP20XX-XXX", self.code, count=-1)
+            # Positions belong to the pristine template, not to replacements.
+            for match in reversed(list(re.finditer(r"(?<!\w)X{2,}(?!\w)", paragraph.text))):
+                _replace_span_in_paragraph(paragraph, match.start(), match.end(),
+                                           self.prefix + match.group() + "\ue001")
+
+    def fill(self, paragraph, replacements):
+        matches = list(self.pattern.finditer(paragraph.text))
+        for match, value in reversed(list(zip(matches, replacements))):
+            _replace_span_in_paragraph(paragraph, match.start(), match.end(), str(value))
+
+    def fill_cell(self, cell, value):
+        for paragraph in cell.paragraphs:
+            if self.pattern.search(paragraph.text):
+                self.fill(paragraph, [value])
+                return
+
+    def finish(self, doc, study_code):
+        for paragraph in _story_paragraphs(doc):
+            # Only the marked template slots are eligible for fallback.
+            self.fill(paragraph, ["TBD"] * len(self.pattern.findall(paragraph.text)))
+            _replace_text_in_paragraph(paragraph, self.code, study_code, count=-1)
 
 
 def _extract_contact_parts(contact_raw: str) -> tuple[str, str]:
@@ -535,15 +563,23 @@ def generate_study_plan_docx(db: Session, study: Study) -> bytes:
 
     doc = DocxDocument(str(TEMPLATE_PATH))
 
-    # 1. Altbilgiler (Footers): GLP20XX-XXX -> study_code, Original X of X -> Original 1 of 2
-    for sec in doc.sections:
-        for attr in ("footer", "first_page_footer", "even_page_footer", "header", "first_page_header", "even_page_header"):
-            hf = getattr(sec, attr, None)
-            if not hf:
-                continue
-            for p in hf.paragraphs:
-                _replace_text_in_paragraph(p, "GLP20XX-XXX", study_code)
-                _replace_text_in_paragraph(p, "Original X of X", "Original 1 of 2")
+    # Convert example names only in their original approval-role fields, before
+    # any real data is inserted. Identical names elsewhere are literal content.
+    approval_role = ""
+    in_approvals = False
+    examples = {"Quality Assurance": "Name: Selin BOLCAN",
+                "Management": "Name: Dr. Shivadasan ANOOP"}
+    for paragraph in doc.paragraphs:
+        text = paragraph.text.strip()
+        if text == "STUDY PLAN AGREEMENT (APPROVALS)":
+            in_approvals = True
+        elif paragraph.style.name == "Heading 1":
+            in_approvals = False
+        if in_approvals and "(Signature and Date)" in text:
+            approval_role = text.split(" (Signature and Date)", 1)[0]
+        elif in_approvals and text == examples.get(approval_role):
+            _replace_text_in_paragraph(paragraph, text, "Name: XXXXX")
+    slots = _TemplateSlots(doc)
 
     # 2. Paragraflardaki Yer Tutucuların Doldurulması
     for p in doc.paragraphs:
@@ -552,33 +588,33 @@ def generate_study_plan_docx(db: Session, study: Study) -> bytes:
             continue
 
         # Pozitif kontrol için kayıtlı çalışma numarası yoksa örnek numara üretme.
-        if "Sodium Lauryl Sulphate" in txt and "GLP20XX-XXX" in txt:
-            _replace_text_in_paragraph(p, "GLP20XX-XXX", "TBD")
+        if "Sodium Lauryl Sulphate" in txt and slots.code in txt:
+            _replace_text_in_paragraph(p, slots.code, "TBD")
             continue
 
         # Kapak STUDY NUMBER: GLP20XX-XXX -> study_code
-        if "GLP20XX-XXX" in txt:
-            _replace_text_in_paragraph(p, "GLP20XX-XXX", study_code)
+        if slots.code in txt:
+            _replace_text_in_paragraph(p, slots.code, study_code)
             continue
 
         # Kapak Başlığı & Bölüm 25 Onay Başlığı: Intracutaneous Reactivity Test of XXXXXXX Extract in New Zealand White Rabbits
         if "Intracutaneous Reactivity Test of" in txt and "Extract in New Zealand White Rabbits" in txt:
-            _replace_x_tokens_in_paragraph(p, [test_item_name])
+            slots.fill(p, [test_item_name])
             continue
 
         # Bölüm 1 (STUDY OBJECTIVE): intracutaneous injection of XXXXX and XXXXX extracts of the test item, XXXXXXXXXXXXXX
         if "intracutaneous injection of" in txt and "extracts of the test item" in txt:
-            _replace_x_tokens_in_paragraph(p, [polar_label, non_polar_label, test_item_name])
+            slots.fill(p, [polar_label, non_polar_label, test_item_name])
             continue
 
         # Bölüm 5.2 (Selection of Vehicle): the XXXX solvent as cottonseed oil and XXXXX solvent as normal saline
         if "solvent as cottonseed oil" in txt and "solvent as normal saline" in txt:
-            _replace_x_tokens_in_paragraph(p, ["non-polar", polar_label])
+            slots.fill(p, ["non-polar", polar_label])
             continue
 
         # Bölüm 9.1 (Preparation of Test Item Extract)
         if "Preparation of the test item extract" in txt and "shaking water bath" in txt:
-            _replace_x_tokens_in_paragraph(
+            slots.fill(
                 p,
                 [
                     test_item_name,
@@ -593,20 +629,20 @@ def generate_study_plan_docx(db: Session, study: Study) -> bytes:
 
         # Bölüm 9.3 (Route of Administration)
         if "will be administered intracutaneously; similarly, the" in txt:
-            _replace_x_tokens_in_paragraph(p, [polar_label, "polar", non_polar_label, "non-polar"])
+            slots.fill(p, [polar_label, "polar", non_polar_label, "non-polar"])
             continue
 
         # Bölüm 9.5 (Administration of Test Item - Anterior / Posterior)
         if "anterior part of the left trunk" in txt and "posterior part of the right trunk" in txt:
-            _replace_x_tokens_in_paragraph(p, ["polar", "polar", "non-polar", "non-polar"])
+            slots.fill(p, ["polar", "polar", "non-polar", "non-polar"])
             continue
 
         # Bölüm 23 (Sponsor Representative): E-mail & Telephone
-        if txt.strip().startswith("E-mail:") and "XX" in txt:
-            _replace_x_tokens_in_paragraph(p, [sponsor_email])
+        if txt.strip().startswith("E-mail:") and slots.pattern.search(txt):
+            slots.fill(p, [sponsor_email])
             continue
-        if txt.strip().startswith("Telephone:") and "XX" in txt:
-            _replace_x_tokens_in_paragraph(p, [sponsor_phone])
+        if txt.strip().startswith("Telephone:") and slots.pattern.search(txt):
+            slots.fill(p, [sponsor_phone])
             continue
 
     # İsim ve Sponsor satırlarını bağlamına (önceki başlığa) göre doldur
@@ -625,18 +661,22 @@ def generate_study_plan_docx(db: Session, study: Study) -> bytes:
         if "(Signature and Date)" in txt:
             last_signature_label = txt
 
-        if re.search(r"X{2,}", txt):
-            if last_heading == "SPONSOR" and txt.startswith("XX"):
-                _replace_x_tokens_in_paragraph(p, [sponsor_name])
+        if slots.pattern.search(txt):
+            if last_heading == "SPONSOR" and txt.startswith(slots.prefix):
+                slots.fill(p, [sponsor_name])
             elif last_heading == "SPONSOR REPRESENTATIVE (MONITORING SCIENTIST)" and txt.startswith("Name:"):
-                _replace_x_tokens_in_paragraph(p, [_val(dossier_fields.get("sponsor_representative"))])
+                slots.fill(p, [_val(dossier_fields.get("sponsor_representative"))])
             elif last_heading == "STUDY PLAN AGREEMENT (APPROVALS)":
                 if "Study Director" in last_signature_label and txt.startswith("Name:"):
-                    _replace_x_tokens_in_paragraph(p, [sd_name])
+                    slots.fill(p, [sd_name])
+                elif "Quality Assurance" in last_signature_label and txt.startswith("Name:"):
+                    slots.fill(p, [qa_name])
+                elif "Management" in last_signature_label and txt.startswith("Name:"):
+                    slots.fill(p, [management_name])
                 elif "Sponsor" in last_signature_label and txt.startswith("Name:"):
-                    _replace_x_tokens_in_paragraph(p, [_val(dossier_fields.get("sponsor_representative"))])
-                elif "Sponsor" in last_signature_label and txt.startswith("XX"):
-                    _replace_x_tokens_in_paragraph(p, [sponsor_name])
+                    slots.fill(p, [_val(dossier_fields.get("sponsor_representative"))])
+                elif "Sponsor" in last_signature_label and txt.startswith(slots.prefix):
+                    slots.fill(p, [sponsor_name])
 
     # 3. Tablolardaki Yer Tutucuların Doldurulması
     # Table[1]: Section 4 — STUDY SCHEDULE (TENTATIVE)
@@ -651,7 +691,7 @@ def generate_study_plan_docx(db: Session, study: Study) -> bytes:
         for row in t_sched.rows:
             label = row.cells[0].text.strip()
             if label in sched_map:
-                _set_cell_x_value(row.cells[2], sched_map[label])
+                slots.fill_cell(row.cells[2], sched_map[label])
 
         # Bölüm 4 tablosunun hemen altına Operasyonel Takvim Tablosunu ekle
         _insert_operational_schedule_table(doc, t_sched, steps, g0_date)
@@ -671,14 +711,14 @@ def generate_study_plan_docx(db: Session, study: Study) -> bytes:
             for row in t.rows:
                 lbl = row.cells[0].text.strip()
                 if lbl in item_map:
-                    _set_cell_x_value(row.cells[2], item_map[lbl])
+                    slots.fill_cell(row.cells[2], item_map[lbl])
 
         # Section 6.2 — Test System Details/Characterization
         elif first_cell == "Species":
             for row in t.rows:
                 lbl = row.cells[0].text.strip()
                 if lbl == "Source":
-                    _set_cell_x_value(row.cells[2], animal_source_str)
+                    slots.fill_cell(row.cells[2], animal_source_str)
                 elif lbl == "Number of animals":
                     for p in row.cells[2].paragraphs:
                         if "3 animals" in p.text:
@@ -690,7 +730,7 @@ def generate_study_plan_docx(db: Session, study: Study) -> bytes:
                 lbl = row.cells[0].text.strip()
                 if lbl == "Diet and water":
                     for p in row.cells[2].paragraphs:
-                        _replace_x_tokens_in_paragraph(p, [diet_str])
+                        slots.fill(p, [diet_str])
 
         # Section 22 — LIST OF STUDY PERSONNEL (RESPONSIBILITIES)
         elif first_cell == "Personnel":
@@ -700,20 +740,20 @@ def generate_study_plan_docx(db: Session, study: Study) -> bytes:
                     for p in row.cells[1].paragraphs:
                         ptxt = p.text.strip()
                         if ptxt.startswith("Name:"):
-                            _replace_x_tokens_in_paragraph(p, [sd_name])
+                            slots.fill(p, [sd_name])
                         elif ptxt.startswith("Telephone:"):
-                            _replace_x_tokens_in_paragraph(p, ["TBD"])
+                            slots.fill(p, ["TBD"])
                         elif ptxt.startswith("Email:"):
-                            _replace_x_tokens_in_paragraph(p, [sd_email])
+                            slots.fill(p, [sd_email])
                 elif role_lbl == "Study Personnel":
                     for p in row.cells[1].paragraphs:
                         ptxt = p.text.strip()
                         if ptxt.startswith("Name:"):
-                            _replace_x_tokens_in_paragraph(p, [study_personnel_names])
+                            slots.fill(p, [study_personnel_names])
                         elif ptxt.startswith("Telephone:"):
-                            _replace_x_tokens_in_paragraph(p, ["TBD"])
+                            slots.fill(p, ["TBD"])
                         elif ptxt.startswith("Email:"):
-                            _replace_x_tokens_in_paragraph(p, [personnel_email])
+                            slots.fill(p, [personnel_email])
 
     # FAZ 8.1: ISO 10993-23 dışı şablonlar için başlık / standart / Annex A uyarlaması
     try:
@@ -721,24 +761,7 @@ def generate_study_plan_docx(db: Session, study: Study) -> bytes:
     except Exception:
         pass
 
-    from docx.text.paragraph import Paragraph
-    stories = [doc.element.body]
-    for section in doc.sections:
-        for attr in ("header", "first_page_header", "even_page_header", "footer", "first_page_footer", "even_page_footer"):
-            stories.append(getattr(section, attr)._element)
-    seen = set()
-    for story in stories:
-        for element in story.xpath(".//w:p"):
-            if element in seen:
-                continue
-            seen.add(element)
-            paragraph = Paragraph(element, doc)
-            for old, new in (("Selin BOLCAN", qa_name), ("Dr. Shivadasan ANOOP", management_name)):
-                _replace_text_in_paragraph(paragraph, old, new, count=-1)
-            _replace_text_in_paragraph(paragraph, "GLP20XX-XXX", study_code, count=-1)
-            _replace_text_in_paragraph(paragraph, "Original X of X", "Original 1 of 2", count=-1)
-            tokens = re.findall(r"X{2,}", paragraph.text)
-            _replace_x_tokens_in_paragraph(paragraph, ["TBD"] * len(tokens))
+    slots.finish(doc, study_code)
 
     buf = io.BytesIO()
     doc.save(buf)
