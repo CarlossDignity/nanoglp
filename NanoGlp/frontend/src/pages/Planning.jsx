@@ -545,6 +545,10 @@ export default function Planning({ onScheduled }) {
       setBioRevisionError('Biyolojik plan revizyonunu onaylamak için gerekçe girilmesi zorunludur.');
       return;
     }
+    if (!bioRevisionPreview?.preview_token) {
+      setBioRevisionError('Biyolojik plan revizyonunu onaylamadan önce güncel revizyon önizlemesi alınmalıdır.');
+      return;
+    }
     setApprovingBioRevision(true);
     setBioRevisionError(null);
     setError(null);
@@ -552,7 +556,7 @@ export default function Planning({ onScheduled }) {
     try {
       const res = await approveBiologicalRevision(result.study_id, {
         reason: trimmedReason,
-        preview_token: bioRevisionPreview?.preview_token || undefined,
+        preview_token: bioRevisionPreview.preview_token,
       });
       if (res.data) {
         setResult(res.data);
@@ -1673,7 +1677,8 @@ export default function Planning({ onScheduled }) {
                             data-testid="approve-bio-revision-btn"
                             disabled={
                               approvingBioRevision ||
-                              !bioRevisionPreview.can_approve_revision
+                              !bioRevisionPreview.can_approve_revision ||
+                              !bioRevisionPreview.preview_token
                             }
                             onClick={handleApproveBioRevision}
                             className="inline-flex items-center gap-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-300 disabled:text-slate-500 text-white text-xs font-bold px-4 py-2 rounded-md shadow-xs transition"

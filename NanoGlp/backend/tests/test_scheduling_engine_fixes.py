@@ -3197,13 +3197,37 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
         app_data = r_approve.json()
         self.assertEqual(app_data["target_end_date"], "2027-01-15")
 
-        # (5b) Aynı onayın ikinci kez gönderilmesi (mükerrer gönderim) 409 ile reddedilmeli ve ikinci kez kaydırma yapmamalı
-        r_dup = self.client.post(
+        # (5b) Tokensız onay 422 ile reddedilmeli; aynı token veya onay sonrası yeni token ile mükerrer gönderim 409 ile reddedilmeli
+        r_no_tok = self.client.post(
             f"/api/v1/planning/studies/{st.id}/approve-revision",
             headers=h_ezgi,
             json={"reason": sd_reason},
         )
+        self.assertEqual(r_no_tok.status_code, 422, r_no_tok.text)
+
+        r_dup = self.client.post(
+            f"/api/v1/planning/studies/{st.id}/approve-revision",
+            headers=h_ezgi,
+            json={
+                "reason": sd_reason,
+                "preview_token": prev_midnight["preview_token"],
+            },
+        )
         self.assertEqual(r_dup.status_code, 409, r_dup.text)
+
+        prev_after_app = self.client.get(
+            f"/api/v1/planning/studies/{st.id}/revision-preview",
+            headers=h_ezgi,
+        ).json()
+        r_dup_fresh = self.client.post(
+            f"/api/v1/planning/studies/{st.id}/approve-revision",
+            headers=h_ezgi,
+            json={
+                "reason": sd_reason,
+                "preview_token": prev_after_app["preview_token"],
+            },
+        )
+        self.assertEqual(r_dup_fresh.status_code, 409, r_dup_fresh.text)
 
         self.db.expire_all()
         st_db = self.db.query(Study).filter(Study.id == st.id).first()
@@ -3637,6 +3661,624 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
             server.should_exit = True
             thread.join(timeout=5)
 
+    # ------------------------------------------------------------------
+    # 21. SD Biyolojik Revizyon İnceleme Düzeltmeleri:
+    #     - Önizlemenin kalıcı veri yazmaması (eksik oda ve cihaz tamamlama dalları dahil)
+    #     - Zorunlu ve deterministik preview_token (_LATEST_PREVIEW_SNAPSHOTS bağımsız)
+    #     - DELAYED + tüm actual_* boş adımın açıkça uygunsuz sayılması
+    #     - İki ayrı Session ile simülasyon-uygulama arası eşzamanlı değişiklik koruması
+    # ------------------------------------------------------------------
+    def test_21_biological_revision_review_fixes_isolation_token_delayed_and_concurrency(self):
+        from unittest.mock import patch
+        from app.models.audit_log import AuditLog
+        from app.models.room_capacity import AnimalRoomCapacity, ensure_default_room_capacities
+        from app.seed import seed_default_equipment
+        import app.services.scheduling_engine as se_mod
+        from app.services.scheduling_engine import (
+            _LATEST_PREVIEW_SNAPSHOTS,
+            _evaluate_revision_candidate_obstacles,
+            approve_biological_revision,
+        )
+
+        sd_ezgi = self.people["ezgi"]
+        tech1 = self.people["invivo_1"]
+        h_ezgi = _login_headers(self.client, "ezgi")
+        h_tech1 = _login_headers(self.client, "invivo_1")
+
+        # Test çalışmasını planla ve onayla
+        st = Study(
+            study_code="FIX21-REV-AUDIT",
+            title="Fix 21 Revision Isolation & Concurrency Study",
+            test_item_name="Audit Hydrogel",
+            study_director_id=sd_ezgi.id,
+            status=StudyStatus.DRAFT,
+            animal_species_strain="Tavşan (New Zealand White)",
+            animal_count=3,
+            extraction_polar=True,
+            extraction_non_polar=False,
+        )
+        self.db.add(st)
+        self.db.commit()
+
+        r_sched = self.client.post(
+            "/api/v1/planning/schedule-study",
+            headers=h_ezgi,
+            json={
+                "study_code": "FIX21-REV-AUDIT",
+                "template_code": "ISO_10993_23_IC",
+                "acclimatization_start_date": "2027-02-04",
+            },
+        )
+        self.assertEqual(r_sched.status_code, 200, r_sched.text)
+        r_app = self.client.post(f"/api/v1/planning/studies/{st.id}/approve", headers=h_ezgi)
+        self.assertEqual(r_app.status_code, 200, r_app.text)
+
+        self.db.expire_all()
+        steps = (
+            self.db.query(StudyStep)
+            .filter(StudyStep.study_id == st.id)
+            .order_by(StudyStep.step_order.asc())
+            .all()
+        )
+        day7 = next(s for s in steps if s.study_day == 7)   # G7: Uygulama (09:00-12:00, ref 10:00)
+        day8 = next(s for s in steps if s.study_day == 8)   # G8: 24. Saat Gözlem (10:00-11:00)
+        day9 = next(s for s in steps if s.study_day == 9)   # G9: 48. Saat Gözlem (10:00-11:00)
+        day10 = next(s for s in steps if s.study_day == 10) # G10: 72. Saat Gözlem (10:00-12:00)
+
+        # Kaynak adımı (G7 = 2027-02-11) gece 01:00 (+900 dk -> 2027-02-12 01:00) referansıyla tamamla:
+        # -> G9 (2027-02-13) -> G10 (2027-02-14 01:00), G10 (2027-02-14) -> G11 (2027-02-15 01:00)
+        # -> target_end_date 2027-02-14 -> 2027-02-15 önerisi oluşsun
+        r_complete_d7 = self.client.patch(
+            f"/api/v1/planning/steps/{day7.id}/status",
+            headers=h_tech1,
+            json={
+                "status": "COMPLETED",
+                "actual_start": "2027-02-11T22:00:00",
+                "actual_reference_time": "2027-02-12T01:00:00",
+                "actual_end": "2027-02-12T01:30:00",
+            },
+        )
+        self.assertEqual(r_complete_d7.status_code, 200, r_complete_d7.text)
+
+        # ==================================================================
+        # BULGU 1 & BULGU 3 (Önizleme):
+        # - Varsayılan oda kaydını (RABBIT_ROOM) sil ve cihaz varsayılan tamamlama
+        #   dallarını (EQ-WB-001 kapasite alanları None + EQ-INC-001 eksik) tetikle.
+        # - Ayrıca day8 adımını tüm actual_* alanları boş (None) olacak şekilde DELAYED yap.
+        # - GET revision-preview sonrasında YENİ BİR Session ile hiçbir verinin
+        #   kalıcılaşmadığını ve DELAYED adımın uygunsuz sayıldığını doğrula.
+        # ==================================================================
+        self.db.expire_all()
+        day8_db = self.db.query(StudyStep).filter(StudyStep.id == day8.id).first()
+        day8_db.status = StepStatus.DELAYED
+        day8_db.actual_start = None
+        day8_db.actual_end = None
+        day8_db.actual_reference_time = None
+
+        # Varsayılan oda kaydını sil
+        self.db.query(AnimalRoomCapacity).filter(AnimalRoomCapacity.room_code == "RABBIT_ROOM").delete()
+
+        # Cihaz varsayılanlarını tamamlama dalını tetiklemek için:
+        # 1) EQ-WB-001'in polar/nonpolar/max_concurrent_studies alanlarını None yap
+        wb_eq = self.db.query(Equipment).filter(Equipment.code == "EQ-WB-001").first()
+        if wb_eq:
+            wb_eq.polar_capacity = None
+            wb_eq.nonpolar_capacity = None
+            wb_eq.max_concurrent_studies = None
+        # 2) EQ-INC-001 cihazını başka adımlarda referans varsa temizleyip sil
+        inc_eq = self.db.query(Equipment).filter(Equipment.code == "EQ-INC-001").first()
+        if inc_eq:
+            self.db.query(StudyStep).filter(StudyStep.equipment_id == inc_eq.id).update({"equipment_id": None})
+            self.db.delete(inc_eq)
+        self.db.commit()
+
+        # Önizleme öncesi veritabanı durumunu yeni bir Session ile kaydet
+        snap_before_s = SessionLocal()
+        try:
+            st_before = snap_before_s.query(Study).filter(Study.id == st.id).first()
+            steps_before = {
+                s.id: (s.planned_start, s.planned_end, s.study_day, s.status)
+                for s in snap_before_s.query(StudyStep).filter(StudyStep.study_id == st.id).all()
+            }
+            target_end_before = st_before.target_end_date
+            status_before = st_before.status
+            meta_before = dict(st_before.dossier_metadata or {})
+            confs_before = [
+                (c.id, c.conflict_type, c.title, c.is_resolved)
+                for c in snap_before_s.query(Conflict)
+                .filter(Conflict.study_id == st.id)
+                .order_by(Conflict.id.asc())
+                .all()
+            ]
+            audits_before = [
+                a.id
+                for a in snap_before_s.query(AuditLog).order_by(AuditLog.id.asc()).all()
+            ]
+            self.assertIsNone(
+                snap_before_s.query(AnimalRoomCapacity).filter(AnimalRoomCapacity.room_code == "RABBIT_ROOM").first()
+            )
+            self.assertIsNone(
+                snap_before_s.query(Equipment).filter(Equipment.code == "EQ-INC-001").first()
+            )
+        finally:
+            snap_before_s.close()
+
+        # GET /revision-preview çağrısı yap
+        r_prev = self.client.get(
+            f"/api/v1/planning/studies/{st.id}/revision-preview",
+            headers=h_ezgi,
+        )
+        self.assertEqual(r_prev.status_code, 200, r_prev.text)
+        prev_json = r_prev.json()
+        self.assertTrue(prev_json["can_approve_revision"], prev_json)
+        self.assertTrue(prev_json["target_end_date_changed"])
+        self.assertEqual(prev_json["current_target_end_date"], "2027-02-14")
+        self.assertEqual(prev_json["proposed_target_end_date"], "2027-02-15")
+
+        # BULGU 3 kontrolü (Önizleme): DELAYED + tüm actual_* boş olan day8 uygunsuz olmalı!
+        aff_orders = [x["step_order"] for x in prev_json["affected_steps"]]
+        inelig_by_order = {x["step_order"]: x for x in prev_json["ineligible_steps"]}
+        self.assertNotIn(day8.step_order, aff_orders, "DELAYED adım affected_steps içinde yer almamalı")
+        self.assertIn(day8.step_order, inelig_by_order, "DELAYED adım ineligible_steps içinde yer almalı")
+        self.assertFalse(inelig_by_order[day8.step_order]["eligible"])
+        self.assertIn("DELAYED", inelig_by_order[day8.step_order]["ineligible_reason"])
+
+        # BULGU 1 kontrolü: YENİ BİR Session ile önizlemenin hiçbir kalıcı veri yazmadığını doğrula!
+        snap_after_s = SessionLocal()
+        try:
+            st_after = snap_after_s.query(Study).filter(Study.id == st.id).first()
+            steps_after = {
+                s.id: (s.planned_start, s.planned_end, s.study_day, s.status)
+                for s in snap_after_s.query(StudyStep).filter(StudyStep.study_id == st.id).all()
+            }
+            confs_after = [
+                (c.id, c.conflict_type, c.title, c.is_resolved)
+                for c in snap_after_s.query(Conflict)
+                .filter(Conflict.study_id == st.id)
+                .order_by(Conflict.id.asc())
+                .all()
+            ]
+            audits_after = [
+                a.id
+                for a in snap_after_s.query(AuditLog).order_by(AuditLog.id.asc()).all()
+            ]
+
+            self.assertEqual(steps_after, steps_before, "GET revision-preview adım saatlerini veya günlerini değiştirmemeli")
+            self.assertEqual(st_after.target_end_date, target_end_before, "GET revision-preview target_end_date alanını değiştirmemeli")
+            self.assertEqual(st_after.status, status_before, "GET revision-preview çalışma durumunu değiştirmemeli")
+            self.assertEqual(dict(st_after.dossier_metadata or {}), meta_before, "GET revision-preview dossier_metadata alanını değiştirmemeli")
+            self.assertNotIn("__PREVIEW_SIMULATION__", st_after.dossier_metadata or {})
+            self.assertEqual(confs_after, confs_before, "GET revision-preview Conflict kayıtlarını değiştirmemeli")
+            self.assertEqual(audits_after, audits_before, "GET revision-preview AuditLog kaydı üretmemeli")
+            self.assertIsNone(
+                snap_after_s.query(AnimalRoomCapacity).filter(AnimalRoomCapacity.room_code == "RABBIT_ROOM").first(),
+                "GET revision-preview eksik oda varsayılanını veritabanına commit etmemeli",
+            )
+            self.assertIsNone(
+                snap_after_s.query(Equipment).filter(Equipment.code == "EQ-INC-001").first(),
+                "GET revision-preview eksik cihaz varsayılanını veritabanına commit etmemeli",
+            )
+            wb_after = snap_after_s.query(Equipment).filter(Equipment.code == "EQ-WB-001").first()
+            self.assertIsNone(wb_after.polar_capacity, "GET revision-preview cihaz alanlarını veritabanına commit etmemeli")
+        finally:
+            snap_after_s.close()
+
+        # Sonraki test adımları için varsayılan oda ve cihaz kayıtlarını geri yükle
+        ensure_default_room_capacities(self.db, commit=True)
+        seed_default_equipment(self.db, commit=True)
+
+        # ==================================================================
+        # BULGU 2:
+        # - Onay isteğinde geçerli preview_token zorunlu olsun.
+        # - Bellek içi _LATEST_PREVIEW_SNAPSHOTS temizlendiğinde ve ayrı Session
+        #   kullanıldığında da deterministik çalışsın:
+        #   1) Tokensız / boş token istekleri 422 ile veri değiştirmeden reddedilsin.
+        #   2) Kaynak referans değişince eski token 409 dönsün.
+        #   3) Güncel token (_LATEST_PREVIEW_SNAPSHOTS boşken bile) kabul edilsin.
+        # ==================================================================
+        token_0100 = prev_json["preview_token"]
+        self.assertTrue(token_0100)
+
+        # Bellek içi önbelleği tamamen temizle
+        _LATEST_PREVIEW_SNAPSHOTS.clear()
+
+        # 2a) Tokensız ve boş tokenlı onay istekleri reddedilmeli (422)
+        for bad_payload in [
+            {"reason": "Tokensız onay denemesi"},
+            {"reason": "Null token denemesi", "preview_token": None},
+            {"reason": "Boş string token denemesi", "preview_token": ""},
+            {"reason": "Boşluk token denemesi", "preview_token": "   "},
+        ]:
+            r_bad_tok = self.client.post(
+                f"/api/v1/planning/studies/{st.id}/approve-revision",
+                headers=h_ezgi,
+                json=bad_payload,
+            )
+            self.assertEqual(r_bad_tok.status_code, 422, f"Payload reddedilmeliydi: {bad_payload} -> {r_bad_tok.text}")
+
+        # Ayrı bir Session ile doğrudan servis katmanında da boş tokenın ValueError fırlattığını doğrula
+        s_tok_check = SessionLocal()
+        try:
+            with self.assertRaises(ValueError):
+                approve_biological_revision(
+                    s_tok_check,
+                    st.id,
+                    reason="Serviste tokensız çağrı",
+                    user=sd_ezgi,
+                    preview_token=None,
+                )
+            d9_check = s_tok_check.query(StudyStep).filter(StudyStep.id == day9.id).first()
+            self.assertEqual(d9_check.planned_start, datetime(2027, 2, 13, 10, 0))
+        finally:
+            s_tok_check.close()
+
+        # 2b) Kaynak referans saati (01:00 -> 02:00) değiştiğinde eski token (token_0100) 409 ile reddedilmeli!
+        r_shift_0200 = self.client.patch(
+            f"/api/v1/planning/steps/{day7.id}/status",
+            headers=h_tech1,
+            json={
+                "actual_reference_time": "2027-02-12T02:00:00",
+                "actual_end": "2027-02-12T02:30:00",
+            },
+        )
+        self.assertEqual(r_shift_0200.status_code, 200, r_shift_0200.text)
+
+        _LATEST_PREVIEW_SNAPSHOTS.clear()
+        r_stale_tok = self.client.post(
+            f"/api/v1/planning/studies/{st.id}/approve-revision",
+            headers=h_ezgi,
+            json={
+                "reason": "Eski 01:00 önizleme tokenı ile onay denemesi",
+                "preview_token": token_0100,
+            },
+        )
+        self.assertEqual(r_stale_tok.status_code, 409, r_stale_tok.text)
+
+        # Eski token reddedildiğinde hiçbir adımın değişmediğini ayrı Session ile doğrula
+        s_verify_stale = SessionLocal()
+        try:
+            d9_stale = s_verify_stale.query(StudyStep).filter(StudyStep.id == day9.id).first()
+            st_stale = s_verify_stale.query(Study).filter(Study.id == st.id).first()
+            self.assertEqual(d9_stale.planned_start, datetime(2027, 2, 13, 10, 0))
+            self.assertEqual(st_stale.target_end_date, date(2027, 2, 14))
+            self.assertEqual(len((st_stale.dossier_metadata or {}).get("biological_revisions") or []), 0)
+        finally:
+            s_verify_stale.close()
+
+        # ==================================================================
+        # BULGU 4:
+        # - Simülasyon yardımcısının çağıranın transaction'ını kapatmadığını doğrula.
+        # - İki ayrı Session kullanan kontrollü eşzamanlılık testleri:
+        #   4a) Simülasyondan hemen sonra kaynak referans saati değişirse eski öneri uygulanmamalı (409).
+        #   4b) Simülasyondan hemen sonra önerilen pencereye personel engeli eklenirse revizyon kaydedilmemeli (409).
+        #   4c) Simülasyondan hemen sonra önerilen pencereye cihaz engeli eklenirse revizyon kaydedilmemeli (409).
+        #   Reddedilen işlemlerde adım planları, revizyon geçmişi ve AuditLog kısmi oluşmamalı.
+        # ==================================================================
+        # Önce güncel 02:00 durumu için geçerli preview_token al ve önbelleği temizle
+        prev_0200 = self.client.get(
+            f"/api/v1/planning/studies/{st.id}/revision-preview",
+            headers=h_ezgi,
+        ).json()
+        token_0200 = prev_0200["preview_token"]
+        _LATEST_PREVIEW_SNAPSHOTS.clear()
+
+        # 4.0) _evaluate_revision_candidate_obstacles çağıranın transaction'ını rollback ile kapatmamalı
+        s_tx_check = SessionLocal()
+        try:
+            st_tx = s_tx_check.query(Study).filter(Study.id == st.id).first()
+            steps_tx = (
+                s_tx_check.query(StudyStep)
+                .filter(StudyStep.study_id == st.id)
+                .order_by(StudyStep.step_order.asc())
+                .all()
+            )
+            # Çağıran session içinde flush edilmiş geçici bir AuditLog oluştur
+            marker_log = AuditLog(
+                user_id=sd_ezgi.id,
+                action="CALLER_TX_MARKER",
+                entity_name="Study",
+                entity_id=st.id,
+                reason="Transaction korunuyor mu kontrolü",
+            )
+            s_tx_check.add(marker_log)
+            s_tx_check.flush()
+            marker_id = marker_log.id
+            self.assertIsNotNone(marker_id)
+
+            _evaluate_revision_candidate_obstacles(
+                s_tx_check,
+                st_tx,
+                steps_tx,
+                [
+                    {
+                        "step_id": day9.id,
+                        "expected_start": "2027-02-14T02:00:00",
+                        "expected_end": "2027-02-14T03:00:00",
+                        "proposed_study_day": 10,
+                    }
+                ],
+                [
+                    {
+                        "source_step_id": day7.id,
+                        "actual_reference_time": "2027-02-12T02:00:00",
+                    }
+                ],
+                date(2027, 2, 15),
+            )
+            # Çağıranın flush ettiği marker_log hala aynı transaction içinde durmalı (rollback edilmemiş olmalı!)
+            still_in_tx = s_tx_check.query(AuditLog).filter(AuditLog.id == marker_id).first()
+            self.assertIsNotNone(
+                still_in_tx,
+                "_evaluate_revision_candidate_obstacles çağıranın transaction'ını rollback ile kapatmamalı!",
+            )
+            s_tx_check.rollback()
+        finally:
+            s_tx_check.close()
+
+        # 4a) Simülasyondan hemen sonra ikinci bir Session ile kaynak referans saati (02:00 -> 03:00) değiştirilirse:
+        orig_eval = _evaluate_revision_candidate_obstacles
+
+        def eval_then_concurrent_ref_change(*args, **kwargs):
+            res = orig_eval(*args, **kwargs)
+            s_concurrent = SessionLocal()
+            try:
+                d7_c = s_concurrent.query(StudyStep).filter(StudyStep.id == day7.id).first()
+                d7_c.actual_reference_time = datetime(2027, 2, 12, 3, 0)
+                d7_c.actual_end = datetime(2027, 2, 12, 3, 30)
+                s_concurrent.commit()
+            finally:
+                s_concurrent.close()
+            return res
+
+        with patch.object(se_mod, "_evaluate_revision_candidate_obstacles", side_effect=eval_then_concurrent_ref_change):
+            r_race_ref = self.client.post(
+                f"/api/v1/planning/studies/{st.id}/approve-revision",
+                headers=h_ezgi,
+                json={
+                    "reason": "Simülasyon sonrası eşzamanlı referans değişimi testi",
+                    "preview_token": token_0200,
+                },
+            )
+        self.assertEqual(r_race_ref.status_code, 409, r_race_ref.text)
+
+        # Reddedilen işlemde kısmi veri (adım planı, dossier_metadata, AuditLog) oluşmadığını yeni Session ile doğrula
+        s_ver_4a = SessionLocal()
+        try:
+            st_4a = s_ver_4a.query(Study).filter(Study.id == st.id).first()
+            d9_4a = s_ver_4a.query(StudyStep).filter(StudyStep.id == day9.id).first()
+            d10_4a = s_ver_4a.query(StudyStep).filter(StudyStep.id == day10.id).first()
+            self.assertEqual(d9_4a.planned_start, datetime(2027, 2, 13, 10, 0), "Eski öneri uygulanmamalı")
+            self.assertEqual(d10_4a.planned_start, datetime(2027, 2, 14, 10, 0), "Eski öneri uygulanmamalı")
+            self.assertEqual(st_4a.target_end_date, date(2027, 2, 14))
+            self.assertEqual(len((st_4a.dossier_metadata or {}).get("biological_revisions") or []), 0)
+            self.assertEqual(
+                s_ver_4a.query(AuditLog)
+                .filter(AuditLog.entity_name == "Study", AuditLog.entity_id == st.id, AuditLog.action == "APPROVE_BIOLOGICAL_REVISION")
+                .count(),
+                0,
+            )
+        finally:
+            s_ver_4a.close()
+
+        # 4b) Simülasyondan hemen sonra ikinci bir Session ile önerilen pencereye (2027-02-14 03:00-04:00)
+        #     PERSONEL ENGELİ (aynı teknisyene başka aktif çalışmada adım) eklenirse revizyon kaydedilmemeli (409)!
+        prev_0300 = self.client.get(
+            f"/api/v1/planning/studies/{st.id}/revision-preview",
+            headers=h_ezgi,
+        ).json()
+        self.assertTrue(prev_0300["can_approve_revision"], prev_0300)
+        token_0300 = prev_0300["preview_token"]
+        _LATEST_PREVIEW_SNAPSHOTS.clear()
+
+        # Rakip çalışma oluştur ve day9'un atanmış teknisyenini bul
+        s_setup_other = SessionLocal()
+        try:
+            d9_for_tech = s_setup_other.query(StudyStep).filter(StudyStep.id == day9.id).first()
+            target_tech_id = d9_for_tech.assignees[0].id if d9_for_tech.assignees else tech1.id
+            other_study = Study(
+                study_code="FIX21-RIVAL-STUDY",
+                title="Rival Concurrent Study",
+                test_item_name="Rival Item",
+                study_director_id=sd_ezgi.id,
+                status=StudyStatus.APPROVED,
+                acclimatization_start_date=date(2027, 2, 4),
+                target_end_date=date(2027, 2, 20),
+            )
+            s_setup_other.add(other_study)
+            s_setup_other.commit()
+            other_study_id = other_study.id
+        finally:
+            s_setup_other.close()
+
+        rival_step_id_holder = []
+
+        def eval_then_concurrent_personnel_obstacle(*args, **kwargs):
+            res = orig_eval(*args, **kwargs)
+            s_concurrent = SessionLocal()
+            try:
+                tech_c = s_concurrent.query(User).filter(User.id == target_tech_id).first()
+                rival_step = StudyStep(
+                    study_id=other_study_id,
+                    step_name="Eşzamanlı Eklenen Rakip Gözlem",
+                    step_order=99,
+                    study_day=10,
+                    planned_start=datetime(2027, 2, 14, 3, 0),
+                    planned_end=datetime(2027, 2, 14, 4, 0),
+                    status=StepStatus.PENDING,
+                )
+                rival_step.assignees.append(tech_c)
+                s_concurrent.add(rival_step)
+                s_concurrent.commit()
+                rival_step_id_holder.append(rival_step.id)
+            finally:
+                s_concurrent.close()
+            return res
+
+        with patch.object(se_mod, "_evaluate_revision_candidate_obstacles", side_effect=eval_then_concurrent_personnel_obstacle):
+            r_race_pers = self.client.post(
+                f"/api/v1/planning/studies/{st.id}/approve-revision",
+                headers=h_ezgi,
+                json={
+                    "reason": "Simülasyon sonrası eşzamanlı personel çakışması testi",
+                    "preview_token": token_0300,
+                },
+            )
+        self.assertEqual(r_race_pers.status_code, 409, r_race_pers.text)
+
+        # Reddedilen işlemde kısmi veri oluşmadığını ve çakışma durumunun bozulmadığını doğrula
+        s_ver_4b = SessionLocal()
+        try:
+            st_4b = s_ver_4b.query(Study).filter(Study.id == st.id).first()
+            d9_4b = s_ver_4b.query(StudyStep).filter(StudyStep.id == day9.id).first()
+            d10_4b = s_ver_4b.query(StudyStep).filter(StudyStep.id == day10.id).first()
+            self.assertEqual(d9_4b.planned_start, datetime(2027, 2, 13, 10, 0), "Personel engeli varken adım kaydırılmamalı")
+            self.assertEqual(d10_4b.planned_start, datetime(2027, 2, 14, 10, 0), "Personel engeli varken adım kaydırılmamalı")
+            self.assertEqual(st_4b.target_end_date, date(2027, 2, 14))
+            self.assertEqual(len((st_4b.dossier_metadata or {}).get("biological_revisions") or []), 0)
+            self.assertEqual(
+                s_ver_4b.query(AuditLog)
+                .filter(AuditLog.entity_name == "Study", AuditLog.entity_id == st.id, AuditLog.action == "APPROVE_BIOLOGICAL_REVISION")
+                .count(),
+                0,
+            )
+            # Rakip adımı temizle
+            for rsid in rival_step_id_holder:
+                rs_obj = s_ver_4b.query(StudyStep).filter(StudyStep.id == rsid).first()
+                if rs_obj:
+                    rs_obj.assignees.clear()
+                    s_ver_4b.delete(rs_obj)
+            s_ver_4b.commit()
+        finally:
+            s_ver_4b.close()
+
+        # 4c) Simülasyondan hemen sonra ikinci bir Session ile önerilen pencereye (2027-02-14 03:00-04:00)
+        #     CİHAZ ENGELİ (aynı cihazı kullanan başka adım) eklenirse revizyon kaydedilmemeli (409)!
+        s_eq_setup = SessionLocal()
+        try:
+            eq_inc = s_eq_setup.query(Equipment).filter(Equipment.code == "EQ-INC-001").first()
+            d9_eq = s_eq_setup.query(StudyStep).filter(StudyStep.id == day9.id).first()
+            d9_eq.equipment_id = eq_inc.id
+            s_eq_setup.commit()
+            eq_inc_id = eq_inc.id
+        finally:
+            s_eq_setup.close()
+
+        prev_0300_eq = self.client.get(
+            f"/api/v1/planning/studies/{st.id}/revision-preview",
+            headers=h_ezgi,
+        ).json()
+        self.assertTrue(prev_0300_eq["can_approve_revision"], prev_0300_eq)
+        token_0300_eq = prev_0300_eq["preview_token"]
+        _LATEST_PREVIEW_SNAPSHOTS.clear()
+
+        rival_eq_step_holder = []
+
+        def eval_then_concurrent_equipment_obstacle(*args, **kwargs):
+            res = orig_eval(*args, **kwargs)
+            s_concurrent = SessionLocal()
+            try:
+                rival_eq_step = StudyStep(
+                    study_id=other_study_id,
+                    step_name="Eşzamanlı Eklenen Cihaz İşgali",
+                    step_order=100,
+                    study_day=10,
+                    planned_start=datetime(2027, 2, 14, 3, 0),
+                    planned_end=datetime(2027, 2, 14, 4, 0),
+                    status=StepStatus.PENDING,
+                    equipment_id=eq_inc_id,
+                )
+                s_concurrent.add(rival_eq_step)
+                s_concurrent.commit()
+                rival_eq_step_holder.append(rival_eq_step.id)
+            finally:
+                s_concurrent.close()
+            return res
+
+        with patch.object(se_mod, "_evaluate_revision_candidate_obstacles", side_effect=eval_then_concurrent_equipment_obstacle):
+            r_race_eq = self.client.post(
+                f"/api/v1/planning/studies/{st.id}/approve-revision",
+                headers=h_ezgi,
+                json={
+                    "reason": "Simülasyon sonrası eşzamanlı cihaz çakışması testi",
+                    "preview_token": token_0300_eq,
+                },
+            )
+        self.assertEqual(r_race_eq.status_code, 409, r_race_eq.text)
+
+        s_ver_4c = SessionLocal()
+        try:
+            st_4c = s_ver_4c.query(Study).filter(Study.id == st.id).first()
+            d9_4c = s_ver_4c.query(StudyStep).filter(StudyStep.id == day9.id).first()
+            self.assertEqual(d9_4c.planned_start, datetime(2027, 2, 13, 10, 0), "Cihaz engeli varken adım kaydırılmamalı")
+            self.assertEqual(st_4c.target_end_date, date(2027, 2, 14))
+            self.assertEqual(len((st_4c.dossier_metadata or {}).get("biological_revisions") or []), 0)
+            self.assertEqual(
+                s_ver_4c.query(AuditLog)
+                .filter(AuditLog.entity_name == "Study", AuditLog.entity_id == st.id, AuditLog.action == "APPROVE_BIOLOGICAL_REVISION")
+                .count(),
+                0,
+            )
+            for rsid in rival_eq_step_holder:
+                s_ver_4c.query(StudyStep).filter(StudyStep.id == rsid).delete()
+            s_ver_4c.commit()
+        finally:
+            s_ver_4c.close()
+
+        # ==================================================================
+        # SON DOĞRULAMA (BULGU 2 + BULGU 3 Onay):
+        # - Engel temizlendikten sonra, _LATEST_PREVIEW_SNAPSHOTS boşken ve ayrı
+        #   Session üzerinde geçerli token_0300_eq ile onay başarılı olmalı!
+        # - Onay sonrasında DELAYED + tüm actual_* boş olan day8 kesinlikle
+        #   değişmemeli; yalnızca PENDING olan day9 ve day10 güncellenmeli!
+        # ==================================================================
+        _LATEST_PREVIEW_SNAPSHOTS.clear()
+        s_approve_separate = SessionLocal()
+        try:
+            sd_in_sep = s_approve_separate.query(User).filter(User.id == sd_ezgi.id).first()
+            approved_res = approve_biological_revision(
+                s_approve_separate,
+                st.id,
+                reason="Ayrı Session ve temiz önbellek ile geçerli token onayı",
+                user=sd_in_sep,
+                preview_token=token_0300_eq,
+            )
+            self.assertEqual(approved_res["target_end_date"], "2027-02-15")
+        finally:
+            s_approve_separate.close()
+
+        s_final = SessionLocal()
+        try:
+            d8_final = s_final.query(StudyStep).filter(StudyStep.id == day8.id).first()
+            d9_final = s_final.query(StudyStep).filter(StudyStep.id == day9.id).first()
+            d10_final = s_final.query(StudyStep).filter(StudyStep.id == day10.id).first()
+            st_final = s_final.query(Study).filter(Study.id == st.id).first()
+
+            # DELAYED + tüm actual_* boş olan day8 korunmuş olmalı
+            self.assertEqual(d8_final.status, StepStatus.DELAYED)
+            self.assertIsNone(d8_final.actual_start)
+            self.assertIsNone(d8_final.actual_end)
+            self.assertIsNone(d8_final.actual_reference_time)
+            self.assertEqual(d8_final.planned_start, datetime(2027, 2, 12, 10, 0), "DELAYED adımın plan saati değişmemeli")
+            self.assertEqual(d8_final.planned_end, datetime(2027, 2, 12, 11, 0), "DELAYED adımın plan bitişi değişmemeli")
+            self.assertEqual(d8_final.study_day, 8, "DELAYED adımın çalışma günü değişmemeli")
+
+            # PENDING olan day9 ve day10 ise 03:00 referansına göre güncellenmiş olmalı
+            self.assertEqual(d9_final.planned_start, datetime(2027, 2, 14, 3, 0))
+            self.assertEqual(d9_final.planned_end, datetime(2027, 2, 14, 4, 0))
+            self.assertEqual(d9_final.study_day, 10)
+            self.assertEqual(d10_final.planned_start, datetime(2027, 2, 15, 3, 0))
+            self.assertEqual(d10_final.planned_end, datetime(2027, 2, 15, 5, 0))
+            self.assertEqual(d10_final.study_day, 11)
+            self.assertEqual(st_final.target_end_date, date(2027, 2, 15))
+            self.assertEqual(len((st_final.dossier_metadata or {}).get("biological_revisions") or []), 1)
+            self.assertEqual(
+                s_final.query(AuditLog)
+                .filter(AuditLog.entity_name == "Study", AuditLog.entity_id == st.id, AuditLog.action == "APPROVE_BIOLOGICAL_REVISION")
+                .count(),
+                1,
+            )
+        finally:
+            s_final.close()
 
 
 if __name__ == "__main__":

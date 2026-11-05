@@ -84,7 +84,12 @@ def _working_hours_issue(start: datetime, end: datetime) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # KURAL 1: 9 SAAT İŞ YÜKÜ
 # ---------------------------------------------------------------------------
-def calculate_personnel_workload(db: Session, personnel_id: int, target_date: date) -> Dict[str, Any]:
+def calculate_personnel_workload(
+    db: Session,
+    personnel_id: int,
+    target_date: date,
+    study_steps_override: Optional[Tuple[Study, List[StudyStep]]] = None,
+) -> Dict[str, Any]:
     """
     SALT-OKUNUR iş yükü hesabı: Personelin hedef gündeki aktif görevlerinin o güne düşen
     dakikalarını toplar. Conflict tablosuna YAZMAZ (dashboard / personel ekranı için).
@@ -93,7 +98,7 @@ def calculate_personnel_workload(db: Session, personnel_id: int, target_date: da
     day_start = datetime.combine(target_date, time.min)
     day_end = datetime.combine(target_date, time.max)
 
-    steps = (
+    query = (
         db.query(StudyStep)
         .join(StudyStep.assignees)
         .join(StudyStep.study)
@@ -104,21 +109,37 @@ def calculate_personnel_workload(db: Session, personnel_id: int, target_date: da
             StudyStep.planned_start <= day_end,
             StudyStep.planned_end >= day_start,
         )
-        .order_by(StudyStep.planned_start)
-        .all()
     )
+    if study_steps_override is not None:
+        ov_study, _ = study_steps_override
+        query = query.filter(StudyStep.study_id != ov_study.id)
+
+    steps = list(query.order_by(StudyStep.planned_start).all())
+    if study_steps_override is not None:
+        ov_study, ov_steps = study_steps_override
+        if ov_study.status != StudyStatus.CANCELLED:
+            for s in ov_steps:
+                if (
+                    s.status != StepStatus.CANCELLED
+                    and any(u.id == personnel_id for u in s.assignees)
+                    and s.planned_start <= day_end
+                    and s.planned_end >= day_start
+                ):
+                    steps.append(s)
+        steps.sort(key=lambda x: x.planned_start)
 
     total_minutes = 0
     tasks = []
     for step in steps:
+        st_obj = study_steps_override[0] if (study_steps_override and step.study_id == study_steps_override[0].id) else step.study
         # Görevin o gün içerisine düşen süresi (gece yarısını aşan görevler bölünür)
         minutes = _overlap_minutes(step.planned_start, step.planned_end, day_start, day_end + timedelta(microseconds=1))
         total_minutes += minutes
         tasks.append({
             "step_id": step.id,
             "study_id": step.study_id,
-            "study_code": step.study.study_code,
-            "study_status": step.study.status.value,
+            "study_code": st_obj.study_code,
+            "study_status": st_obj.status.value,
             "step_name": step.step_name,
             "study_day": step.study_day,
             "planned_start": step.planned_start.isoformat(),
@@ -143,22 +164,27 @@ def _build_workload_conflict(
     target_date: date,
     study_id: Optional[int],
     step_id: Optional[int] = None,
+    study_steps_override: Optional[Tuple[Study, List[StudyStep]]] = None,
+    persist_conflict: bool = True,
 ) -> Optional[Conflict]:
     """540 dk aşılmışsa CRITICAL PERSONNEL_OVERLAP oluşturur (commit etmez)."""
-    workload = calculate_personnel_workload(db, personnel.id, target_date)
+    workload = calculate_personnel_workload(
+        db, personnel.id, target_date, study_steps_override=study_steps_override
+    )
     total = workload["total_minutes"]
     if total <= MAX_DAILY_WORKLOAD_MINUTES:
         return None
 
     title = f"9 Saat İş Yükü Aşımı: {personnel.full_name} — {target_date:%d.%m.%Y}"
-    existing = db.query(Conflict).filter(
-        Conflict.conflict_type == ConflictType.PERSONNEL_OVERLAP,
-        Conflict.is_resolved == False,  # noqa: E712
-        Conflict.title == title,
-        Conflict.study_id == study_id,
-    ).first()
-    if existing:
-        return existing
+    if persist_conflict:
+        existing = db.query(Conflict).filter(
+            Conflict.conflict_type == ConflictType.PERSONNEL_OVERLAP,
+            Conflict.is_resolved == False,  # noqa: E712
+            Conflict.title == title,
+            Conflict.study_id == study_id,
+        ).first()
+        if existing:
+            return existing
 
     details = ", ".join(
         f"{t['study_code']} ({t['study_status']}) / '{t['step_name']}' {t['minutes']} dk" for t in workload["tasks"]
@@ -177,7 +203,8 @@ def _build_workload_conflict(
         step_id=step_id,
         is_resolved=False,
     )
-    db.add(conflict)
+    if persist_conflict:
+        db.add(conflict)
     return conflict
 
 
@@ -214,6 +241,7 @@ def register_biological_time_violation(
     title: Optional[str] = None,
     severity: ConflictSeverity = ConflictSeverity.CRITICAL,
     commit: bool = True,
+    persist_conflict: bool = True,
 ) -> Conflict:
     """
     is_biological_fixed_time == True olan bir görevin TARİHİ/SAATİ değiştirilemez.
@@ -237,10 +265,11 @@ def register_biological_time_violation(
         related_study_id=related_study_id,
         is_resolved=False,
     )
-    db.add(conflict)
-    if commit:
-        db.commit()
-        db.refresh(conflict)
+    if persist_conflict:
+        db.add(conflict)
+        if commit:
+            db.commit()
+            db.refresh(conflict)
     return conflict
 
 
@@ -787,6 +816,17 @@ def check_step_revision_eligibility(
             False,
             "Adım başlamış / devam ediyor (IN_PROGRESS) olduğu için planlanan saati değiştirilemez.",
         )
+    if step.status == StepStatus.DELAYED:
+        return (
+            False,
+            "Adım gecikmede / işlem görmüş (DELAYED) durumunda olduğu için yalnızca PENDING adımlar revize edilebilir; planlanan saati değiştirilemez.",
+        )
+    if step.status != StepStatus.PENDING:
+        st_label = step.status.value if hasattr(step.status, "value") else str(step.status)
+        return (
+            False,
+            f"Adım durumu PENDING olmadığı ({st_label}) için planlanan saati değiştirilemez.",
+        )
     has_actual_start = step.actual_start is not None
     has_actual_end = step.actual_end is not None
     has_actual_ref = getattr(step, "actual_reference_time", None) is not None
@@ -1157,6 +1197,7 @@ def evaluate_study_conflicts(
     unfilled_roles: Optional[List[UserRole]] = None,
     template: Any = None,
     preserve_approved_weekend_step_ids: Optional[set] = None,
+    persist_conflicts: bool = True,
 ) -> List[Tuple[Conflict, List[int]]]:
     """
     FAZ 6.4 (Madde 3): Bir çalışmanın tüm adımları için hafta sonu/mesai dışı kontrolü,
@@ -1191,7 +1232,8 @@ def evaluate_study_conflicts(
     recorded_overlap_keys: set = set()
 
     def record(conflict: Conflict, step_ids: List[int]):
-        db.add(conflict)
+        if persist_conflicts:
+            db.add(conflict)
         findings.append((conflict, step_ids))
 
     # 6.0) Şablonun gerektirdiği roller ile mevcut adım atamalarını (eksik, pasif veya uygunsuz rol) her doğrulamada denetle
@@ -1273,6 +1315,7 @@ def evaluate_study_conflicts(
                     db,
                     step,
                     commit=False,
+                    persist_conflict=persist_conflicts,
                     severity=ConflictSeverity.WARNING,
                     title=f"Biyolojik Kilit Mesai Dışında (Hafta Sonu Görevi): Gün {step.study_day} — {step.step_name}",
                     reason=f"Adım {issue}. Saat ötelenemez; nöbetçi / hafta sonu personeli onaylanmalı veya ekstraksiyon Cuma'ya hizalanmalıdır.",
@@ -1763,7 +1806,8 @@ def evaluate_study_conflicts(
                 [anchor_id] if anchor_id else [],
             )
 
-    db.flush()
+    if persist_conflicts:
+        db.flush()
 
     # 6d) KURAL 1: kişi-gün bazında 9 saat kontrolü (tüm çalışmalar dahil)
     person_days: Dict[Tuple[int, date], Tuple[User, List[int]]] = {}
@@ -1773,11 +1817,20 @@ def evaluate_study_conflicts(
         for person in step.assignees:
             person_days.setdefault((person.id, step.planned_start.date()), (person, []))[1].append(step.id)
     for (_, day), (person, step_ids) in sorted(person_days.items(), key=lambda kv: (kv[0][1], kv[0][0])):
-        conflict = _build_workload_conflict(db, person, day, study.id, step_id=step_ids[0])
+        conflict = _build_workload_conflict(
+            db,
+            person,
+            day,
+            study.id,
+            step_id=step_ids[0],
+            study_steps_override=(study, steps),
+            persist_conflict=persist_conflicts,
+        )
         if conflict is not None:
             findings.append((conflict, step_ids))
 
-    db.flush()
+    if persist_conflicts:
+        db.flush()
     return findings
 
 
@@ -1802,7 +1855,7 @@ def revalidate_study_conflicts(
 
     now = datetime.utcnow()
     base_day0 = study.acclimatization_start_date or study.target_start_date or date.today()
-    water_bath = seed_default_equipment(db)
+    water_bath = seed_default_equipment(db, commit=False)
     template = get_template(getattr(study, "template_code", None) or DEFAULT_TEMPLATE_CODE, db=db)
 
     approved_wk_steps = set()
@@ -2494,8 +2547,11 @@ def _get_preview_snapshot_key(db: Session, study: Study) -> Tuple[int, int, str]
 def _build_biological_revision_snapshot(study: Study, steps: List[StudyStep]) -> Dict[str, Any]:
     import hashlib
 
+    raw_meta = study.dossier_metadata if isinstance(study.dossier_metadata, dict) else {}
+    rev_count = len(raw_meta.get("biological_revisions") or [])
+    end_iso = study.target_end_date.isoformat() if study.target_end_date else ""
     parts = [
-        f"study:{study.id}:{study.status.value if hasattr(study.status, 'value') else study.status}",
+        f"study:{study.id}:{study.status.value if hasattr(study.status, 'value') else study.status}:{end_iso}:{rev_count}",
     ]
     step_snapshots: Dict[int, Dict[str, Any]] = {}
     source_refs: Dict[int, str] = {}
@@ -2506,12 +2562,16 @@ def _build_biological_revision_snapshot(study: Study, steps: List[StudyStep]) ->
         a_start = s.actual_start.isoformat() if s.actual_start else ""
         a_end = s.actual_end.isoformat() if s.actual_end else ""
         a_ref = s.actual_reference_time.isoformat() if getattr(s, "actual_reference_time", None) else ""
-        parts.append(f"step:{s.id}:{s.step_order}:{st_val}:{p_start}:{p_end}:{a_start}:{a_end}:{a_ref}")
+        ass_str = ",".join(str(uid) for uid in sorted(s.assignee_ids))
+        parts.append(
+            f"step:{s.id}:{s.step_order}:{s.study_day}:{st_val}:{p_start}:{p_end}:{a_start}:{a_end}:{a_ref}:{s.equipment_id}:{ass_str}"
+        )
         if a_ref:
             source_refs[s.step_order] = a_ref
         step_snapshots[s.id] = {
             "step_id": s.id,
             "step_order": s.step_order,
+            "study_day": s.study_day,
             "status": st_val,
             "planned_start": p_start or None,
             "planned_end": p_end or None,
@@ -2529,6 +2589,24 @@ def _build_biological_revision_snapshot(study: Study, steps: List[StudyStep]) ->
     }
 
 
+def _is_non_blocking_past_observation_violation(conflict: Conflict, revised_step_ids: set) -> bool:
+    """
+    Revize edilmeyen (daha önce gerçekleşmiş veya uygun olmayan) adımların geçmiş biyolojik
+    pencere/eksik saat bulguları korunur, ancak kalan uygun PENDING adımların yeni saatlerindeki
+    revizyonunu engellemez.
+    """
+    return bool(
+        conflict.conflict_type == ConflictType.BIOLOGICAL_TIME_VIOLATION
+        and conflict.step_id not in revised_step_ids
+        and (
+            "Gerçekleşen Gözlem Biyolojik Pencere İhlali" in (conflict.title or "")
+            or "Eksik Biyolojik Gözlem Saati" in (conflict.title or "")
+            or "Eksik Biyolojik Referans Saati" in (conflict.title or "")
+            or "Bağımlı Biyolojik Adım Sapması" in (conflict.title or "")
+        )
+    )
+
+
 def _evaluate_revision_candidate_obstacles(
     db: Session,
     study: Study,
@@ -2538,9 +2616,10 @@ def _evaluate_revision_candidate_obstacles(
     template: Any,
 ) -> Dict[str, Any]:
     """
-    Önerilen biyolojik revizyon saatlerini veritabanını kalıcı olarak değiştirmeden
-    (nested savepoint + bellek geri yükleme ile) simüle eder; personel çakışmalarını,
-    9 saat iş yükü aşımını, cihaz/oda/kafes kapasitesini ve eksik rol atamalarını döner.
+    Önerilen biyolojik revizyon saatlerini veritabanına hiçbir yazma (flush/commit) yapmadan
+    ve çağıranın transaction durumunu kapatmadan (`no_autoflush` + bellek geri yükleme ile)
+    simüle eder; personel çakışmalarını, 9 saat iş yükü aşımını, cihaz/oda/kafes kapasitesini
+    ve eksik rol atamalarını döner.
     """
     import copy
 
@@ -2559,130 +2638,123 @@ def _evaluate_revision_candidate_obstacles(
     cap_verified = False
     proposed_end_date = orig_target_end_date
 
-    savepoint = db.begin_nested()
-    try:
-        for prop in proposals:
-            st_obj = step_by_id.get(prop["step_id"])
-            if st_obj is not None:
-                st_obj.planned_start = datetime.fromisoformat(prop["expected_start"])
-                st_obj.planned_end = datetime.fromisoformat(prop["expected_end"])
-                st_obj.study_day = int(prop["proposed_study_day"])
+    orig_db_commit = db.commit
+    orig_db_flush = db.flush
 
-        if steps:
-            proposed_end_date = max((s.planned_end.date() for s in steps if s.planned_end), default=orig_target_end_date)
-            study.target_end_date = proposed_end_date
+    def _forbid_commit(*_args, **_kwargs):
+        raise RuntimeError("Önizleme simülasyonu sırasında db.commit() çağrılmasına izin verilmez.")
 
-        sim_meta = copy.deepcopy(orig_meta) if isinstance(orig_meta, dict) else {}
-        sim_revs = list(sim_meta.get("biological_revisions") or [])
-        for src_dev in source_deviations:
-            if src_dev.get("actual_reference_time"):
-                sim_revs.append(
-                    {
-                        "source_step_id": src_dev.get("step_id"),
-                        "source_step_order": src_dev.get("step_order"),
-                        "source_actual_reference_time": src_dev.get("actual_reference_time"),
-                        "approved_for_actual_reference_time": src_dev.get("actual_reference_time"),
-                        "reason": "__PREVIEW_SIMULATION__",
-                    }
+    def _forbid_flush(*_args, **_kwargs):
+        raise RuntimeError("Önizleme simülasyonu sırasında db.flush() çağrılmasına izin verilmez.")
+
+    with db.no_autoflush:
+        db.commit = _forbid_commit  # type: ignore[method-assign]
+        db.flush = _forbid_flush  # type: ignore[method-assign]
+        try:
+            for prop in proposals:
+                st_obj = step_by_id.get(prop["step_id"])
+                if st_obj is not None:
+                    st_obj.planned_start = datetime.fromisoformat(prop["expected_start"])
+                    st_obj.planned_end = datetime.fromisoformat(prop["expected_end"])
+                    st_obj.study_day = int(prop["proposed_study_day"])
+
+            if steps:
+                proposed_end_date = max(
+                    (s.planned_end.date() for s in steps if s.planned_end),
+                    default=orig_target_end_date,
                 )
-        sim_meta["biological_revisions"] = sim_revs
-        study.dossier_metadata = sim_meta
-        db.flush()
+                study.target_end_date = proposed_end_date
 
-        cap_info = _safe_capacity_report(db, study, template)
-        cap_verified = bool(cap_info and cap_info.get("verified") is True)
+            sim_meta = copy.deepcopy(orig_meta) if isinstance(orig_meta, dict) else {}
+            sim_revs = list(sim_meta.get("biological_revisions") or [])
+            for src_dev in source_deviations:
+                if src_dev.get("actual_reference_time"):
+                    sim_revs.append(
+                        {
+                            "source_step_id": src_dev.get("step_id"),
+                            "source_step_order": src_dev.get("step_order"),
+                            "source_actual_reference_time": src_dev.get("actual_reference_time"),
+                            "approved_for_actual_reference_time": src_dev.get("actual_reference_time"),
+                        }
+                    )
+            sim_meta["biological_revisions"] = sim_revs
+            study.dossier_metadata = sim_meta
 
-        water_bath = seed_default_equipment(db)
-        others = db.query(Study).filter(Study.id != study.id, Study.status.in_(COMPARED_STUDY_STATUSES)).all()
-        other_ids = [s.id for s in others]
-        existing_steps: List[StudyStep] = []
-        if other_ids:
-            existing_steps = (
-                db.query(StudyStep)
-                .options(selectinload(StudyStep.assignees), selectinload(StudyStep.study))
-                .filter(StudyStep.study_id.in_(other_ids), StudyStep.status != StepStatus.CANCELLED)
+            cap_info = _safe_capacity_report(db, study, template)
+            cap_verified = bool(cap_info and cap_info.get("verified") is True)
+
+            water_bath = seed_default_equipment(db, commit=False)
+            others = db.query(Study).filter(Study.id != study.id, Study.status.in_(COMPARED_STUDY_STATUSES)).all()
+            other_ids = [s.id for s in others]
+            existing_steps: List[StudyStep] = []
+            if other_ids:
+                existing_steps = (
+                    db.query(StudyStep)
+                    .options(selectinload(StudyStep.assignees), selectinload(StudyStep.study))
+                    .filter(StudyStep.study_id.in_(other_ids), StudyStep.status != StepStatus.CANCELLED)
+                    .all()
+                )
+            existing_assignees = {ex.id: {u.id for u in ex.assignees} for ex in existing_steps}
+
+            prev_approved = (
+                db.query(Conflict)
+                .filter(
+                    Conflict.study_id == study.id,
+                    Conflict.is_resolved == True,  # noqa: E712
+                    Conflict.conflict_type == ConflictType.BIOLOGICAL_TIME_VIOLATION,
+                    or_(
+                        Conflict.resolution_notes.like("GLP Hafta Sonu Nöbetçi Personel Onayı%"),
+                        Conflict.resolution_notes.like("Plan Onayı%"),
+                    ),
+                )
                 .all()
             )
-        existing_assignees = {ex.id: {u.id for u in ex.assignees} for ex in existing_steps}
+            approved_wk_steps = {c.step_id for c in prev_approved if c.step_id is not None}
 
-        prev_approved = (
-            db.query(Conflict)
-            .filter(
-                Conflict.study_id == study.id,
-                Conflict.is_resolved == True,  # noqa: E712
-                Conflict.conflict_type == ConflictType.BIOLOGICAL_TIME_VIOLATION,
-                or_(
-                    Conflict.resolution_notes.like("GLP Hafta Sonu Nöbetçi Personel Onayı%"),
-                    Conflict.resolution_notes.like("Plan Onayı%"),
-                ),
+            sim_findings = evaluate_study_conflicts(
+                db=db,
+                study=study,
+                steps=steps,
+                existing_steps=existing_steps,
+                existing_assignees=existing_assignees,
+                water_bath=water_bath,
+                template=template,
+                preserve_approved_weekend_step_ids=approved_wk_steps,
+                persist_conflicts=False,
             )
-            .all()
-        )
-        approved_wk_steps = {c.step_id for c in prev_approved if c.step_id is not None}
 
-        sim_findings = evaluate_study_conflicts(
-            db=db,
-            study=study,
-            steps=steps,
-            existing_steps=existing_steps,
-            existing_assignees=existing_assignees,
-            water_bath=water_bath,
-            template=template,
-            preserve_approved_weekend_step_ids=approved_wk_steps,
-        )
-
-        for c, sids in sim_findings:
-            c_dict = {
-                "type": c.conflict_type.value if hasattr(c.conflict_type, "value") else str(c.conflict_type),
-                "severity": c.severity.value if hasattr(c.severity, "value") else str(c.severity),
-                "title": c.title,
-                "description": c.description,
-                "step_id": c.step_id,
-                "step_ids": sids,
-                "related_study_id": c.related_study_id,
-            }
-            if c.severity == ConflictSeverity.CRITICAL:
-                # Daha önce gerçekleşmiş gözlem adımlarının geçmiş pencere/eksik saat ihlalleri
-                # korunur ancak kalan uygun PENDING adımların revizyonunu engellemez;
-                # buna karşılık personel çakışması, 9 saat iş yükü aşımı, cihaz kapasitesi aşımı,
-                # oda/kafes kapasitesi aşımı, eksik zorunlu rol ataması veya revize edilen adımdaki
-                # kritik ihlaller revizyonu kesin olarak engeller.
-                is_past_observation_violation = (
-                    c.conflict_type == ConflictType.BIOLOGICAL_TIME_VIOLATION
-                    and c.step_id not in revised_step_ids
-                    and (
-                        "Gerçekleşen Gözlem Biyolojik Pencere İhlali" in (c.title or "")
-                        or "Eksik Biyolojik Gözlem Saati" in (c.title or "")
-                        or "Eksik Biyolojik Referans Saati" in (c.title or "")
-                        or "Bağımlı Biyolojik Adım Sapması" in (c.title or "")
-                    )
-                )
-                if not is_past_observation_violation:
-                    blocking_conflicts.append(c_dict)
-            else:
-                warning_conflicts.append(c_dict)
-
-        if not cap_verified:
-            blocking_conflicts.append(
-                {
-                    "type": ConflictType.ROOM_CAPACITY_EXCEEDED.value,
-                    "severity": ConflictSeverity.CRITICAL.value,
-                    "title": "Kapasite Doğrulama Hatası",
-                    "description": (cap_info or {}).get("error") or "Oda/kafes ve uzun süreli cihaz kapasitesi doğrulanamadı.",
-                    "step_id": None,
-                    "step_ids": [],
-                    "related_study_id": None,
+            for c, sids in sim_findings:
+                c_dict = {
+                    "type": c.conflict_type.value if hasattr(c.conflict_type, "value") else str(c.conflict_type),
+                    "severity": c.severity.value if hasattr(c.severity, "value") else str(c.severity),
+                    "title": c.title,
+                    "description": c.description,
+                    "step_id": c.step_id,
+                    "step_ids": sids,
+                    "related_study_id": c.related_study_id,
                 }
-            )
-    finally:
-        if savepoint.is_active:
-            savepoint.rollback()
-        db.rollback()
-        try:
-            db.refresh(study)
-            for s in steps:
-                db.refresh(s)
-        except Exception:
+                if c.severity == ConflictSeverity.CRITICAL:
+                    if not _is_non_blocking_past_observation_violation(c, revised_step_ids):
+                        blocking_conflicts.append(c_dict)
+                else:
+                    warning_conflicts.append(c_dict)
+
+            if not cap_verified:
+                blocking_conflicts.append(
+                    {
+                        "type": ConflictType.ROOM_CAPACITY_EXCEEDED.value,
+                        "severity": ConflictSeverity.CRITICAL.value,
+                        "title": "Kapasite Doğrulama Hatası",
+                        "description": (cap_info or {}).get("error")
+                        or "Oda/kafes ve uzun süreli cihaz kapasitesi doğrulanamadı.",
+                        "step_id": None,
+                        "step_ids": [],
+                        "related_study_id": None,
+                    }
+                )
+        finally:
+            db.commit = orig_db_commit  # type: ignore[method-assign]
+            db.flush = orig_db_flush  # type: ignore[method-assign]
             study.target_end_date = orig_target_end_date
             study.dossier_metadata = orig_meta
             for s in steps:
@@ -2868,75 +2940,17 @@ def _check_biological_revision_authorization(study: Study, user: Optional[User])
     )
 
 
-def approve_biological_revision(
-    db: Session,
-    study_id: int,
-    user: User,
-    reason: Optional[str] = None,
-    preview_token: Optional[str] = None,
+def _validate_snapshot_expectations(
+    snapshot: Dict[str, Any],
+    clean_token: str,
     expected_source_reference_time: Optional[Any] = None,
     expected_steps: Optional[List[Dict[str, Any]]] = None,
-    _fail_mid_transaction_for_test: bool = False,
-) -> Dict[str, Any]:
-    """
-    SD Onaylı Biyolojik Plan Revizyonunu atomik olarak uygular:
-      1) Yetki (atanmış SD veya TFM/SYSADMIN) ve zorunlu gerekçe (`reason`) doğrulaması yapar.
-      2) Çalışma durumunun `APPROVED` veya `IN_PROGRESS` olduğunu doğrular.
-      3) Canlı veriyi yeniden kontrol ederek bayat önizleme (stale preview) ve mükerrer gönderimi (idempotency) engeller.
-      4) Yalnızca uygun (`PENDING` ve gerçekleşen verisi olmayan) bağımlı adımların `planned_start`, `planned_end`
-         ve `study_day` alanlarını günceller; kaynak adımın orijinal planını ve gerçek sapmasını korur.
-      5) Yeni saatlerde kritik personel çakışması, 9 saat iş yükü aşımı, cihaz/oda/kafes kapasitesi aşımı,
-         eksik zorunlu rol ataması veya kapasite doğrulama hatası varsa işlemi tamamen geri alır.
-      6) Tek veritabanı işlemi (savepoint + commit) içinde adım güncellemelerini, çalışma meta verisini,
-         çakışma yeniden doğrulamasını ve AuditLog kaydını yazar.
-    """
-    import copy
-    from app.models.sample import SampleRecord
-
-    study = db.query(Study).filter(Study.id == study_id).first()
-    if not study:
-        raise LookupError(f"ID={study_id} olan çalışma bulunamadı.")
-
-    _check_biological_revision_authorization(study, user)
-
-    clean_reason = (reason or "").strip()
-    if not clean_reason:
-        raise ValueError("Biyolojik plan revizyonu onayı için gerekçe (reason) girilmesi zorunludur.")
-
-    if study.status not in (StudyStatus.APPROVED, StudyStatus.IN_PROGRESS):
+) -> None:
+    if clean_token != snapshot["preview_token"]:
         raise RuntimeError(
-            f"Biyolojik plan revizyonu yalnızca APPROVED veya IN_PROGRESS durumundaki çalışmalarda uygulanabilir "
-            f"(Mevcut durum: {study.status.value})."
+            "Önizleme sonrasında çalışma adımları veya biyolojik referans saati değişti (stale preview). "
+            "Lütfen revizyon önizlemesini yenileyip tekrar onaylayın."
         )
-
-    steps = (
-        db.query(StudyStep)
-        .options(selectinload(StudyStep.assignees))
-        .filter(StudyStep.study_id == study.id, StudyStep.status != StepStatus.CANCELLED)
-        .order_by(StudyStep.step_order.asc())
-        .all()
-    )
-    template = get_template(getattr(study, "template_code", None) or DEFAULT_TEMPLATE_CODE, db=db)
-    base_day0 = study.acclimatization_start_date or study.target_start_date or date.today()
-
-    current_snapshot = _build_biological_revision_snapshot(study, steps)
-    snap_key = _get_preview_snapshot_key(db, study)
-    cached_snapshot = _LATEST_PREVIEW_SNAPSHOTS.get(snap_key)
-
-    # 1) Bayat önizleme (Stale Preview) kontrolü
-    if preview_token is not None and str(preview_token).strip():
-        if str(preview_token).strip() != current_snapshot["preview_token"]:
-            raise RuntimeError(
-                "Önizleme sonrasında çalışma adımları veya biyolojik referans saati değişti (stale preview). "
-                "Lütfen revizyon önizlemesini yenileyip tekrar onaylayın."
-            )
-    elif cached_snapshot is not None:
-        if cached_snapshot.get("preview_token") != current_snapshot["preview_token"]:
-            raise RuntimeError(
-                "Önizleme sonrasında çalışma adımları veya biyolojik referans saati değişti (stale preview). "
-                "Lütfen revizyon önizlemesini yenileyip tekrar onaylayın."
-            )
-
     if expected_source_reference_time is not None:
         exp_ref_dt = (
             datetime.fromisoformat(expected_source_reference_time)
@@ -2944,15 +2958,14 @@ def approve_biological_revision(
             else expected_source_reference_time
         )
         exp_ref_iso = exp_ref_dt.isoformat() if hasattr(exp_ref_dt, "isoformat") else str(exp_ref_dt)
-        current_refs = set(current_snapshot["source_references"].values())
+        current_refs = set(snapshot["source_references"].values())
         if exp_ref_iso not in current_refs:
             raise RuntimeError(
                 "Önizlemedeki kaynak biyolojik referans saati güncel veritabanı durumuyla uyuşmuyor (stale preview). "
                 "Lütfen önizlemeyi yenileyin."
             )
-
     if expected_steps is not None:
-        step_map = current_snapshot["steps"]
+        step_map = snapshot["steps"]
         for exp_s in expected_steps:
             sid = exp_s.get("step_id") or exp_s.get("id")
             cur_s = step_map.get(sid)
@@ -2975,12 +2988,71 @@ def approve_biological_revision(
                             "Lütfen revizyon önizlemesini yenileyin."
                         )
 
+
+def approve_biological_revision(
+    db: Session,
+    study_id: int,
+    user: User,
+    reason: Optional[str] = None,
+    preview_token: Optional[str] = None,
+    expected_source_reference_time: Optional[Any] = None,
+    expected_steps: Optional[List[Dict[str, Any]]] = None,
+    _fail_mid_transaction_for_test: bool = False,
+) -> Dict[str, Any]:
+    """
+    SD Onaylı Biyolojik Plan Revizyonunu atomik olarak uygular:
+      1) Yetki (atanmış SD veya TFM/SYSADMIN), zorunlu gerekçe (`reason`) ve zorunlu `preview_token` doğrulaması yapar.
+      2) Çalışma durumunun `APPROVED` veya `IN_PROGRESS` olduğunu doğrular.
+      3) Canlı veriyi süreç belleğine bağımlı olmadan kontrol ederek bayat önizleme (`stale preview`) ve
+         mükerrer gönderimi (`idempotency`) engeller.
+      4) Yalnızca uygun (`PENDING` ve gerçekleşen verisi olmayan) bağımlı adımların `planned_start`, `planned_end`
+         ve `study_day` alanlarını günceller; kaynak adımın orijinal planını ve gerçek sapmasını korur.
+      5) Hem simülasyonda hem de son `revalidate_study_conflicts` / kapasite doğrulamasında kritik personel çakışması,
+         9 saat iş yükü aşımı, cihaz/oda/kafes kapasitesi aşımı, eksik zorunlu rol ataması veya kapasite doğrulama
+         hatası varsa işlemi tamamen geri alır.
+    """
+    import copy
+    from app.models.sample import SampleRecord
+
+    caller_had_pending_tx = bool(db.new or db.dirty or db.deleted or db.in_nested_transaction())
+
+    study = db.query(Study).filter(Study.id == study_id).first()
+    if not study:
+        raise LookupError(f"ID={study_id} olan çalışma bulunamadı.")
+
+    _check_biological_revision_authorization(study, user)
+
+    clean_reason = (reason or "").strip()
+    if not clean_reason:
+        raise ValueError("Biyolojik plan revizyonu onayı için gerekçe (reason) girilmesi zorunludur.")
+
+    clean_token = (preview_token or "").strip()
+    if not clean_token:
+        raise ValueError(
+            "Biyolojik plan revizyonu onayı için geçerli bir önizleme anahtarı (preview_token) zorunludur. "
+            "Lütfen önce revizyon önizlemesini çalıştırın."
+        )
+
+    if study.status not in (StudyStatus.APPROVED, StudyStatus.IN_PROGRESS):
+        raise RuntimeError(
+            f"Biyolojik plan revizyonu yalnızca APPROVED veya IN_PROGRESS durumundaki çalışmalarda uygulanabilir "
+            f"(Mevcut durum: {study.status.value})."
+        )
+
+    steps = (
+        db.query(StudyStep)
+        .options(selectinload(StudyStep.assignees))
+        .filter(StudyStep.study_id == study.id, StudyStep.status != StepStatus.CANCELLED)
+        .order_by(StudyStep.step_order.asc())
+        .all()
+    )
+    template = get_template(getattr(study, "template_code", None) or DEFAULT_TEMPLATE_CODE, db=db)
+
     bio_info = compute_biological_dependency_info(study, steps, template)
     proposals = list(bio_info["revision_proposals"])
-    ineligible_steps = list(bio_info["ineligible_revision_steps"])
     source_deviations = list(bio_info["source_deviations"])
 
-    # 2) Mükerrer gönderim (Idempotency) ve uygun adım kontrolü
+    # 1) Mükerrer gönderim (Idempotency) ve kaynak referans kontrolü
     if not source_deviations or not any(sd.get("actual_reference_time") for sd in source_deviations):
         raise RuntimeError("Bu çalışmada kaydedilmiş gerçek biyolojik referans saati bulunmamaktadır.")
 
@@ -2994,7 +3066,16 @@ def approve_biological_revision(
             "Revize edilebilecek uygun (PENDING ve gerçekleşen verisi olmayan) bağımlı adım bulunmamaktadır."
         )
 
-    # 3) Önerilen yeni saatlerde engel (çakışma / kapasite) kontrolü
+    # 2) Zorunlu preview_token ve bayat önizleme (Stale Preview) kontrolü (süreç belleğine bağımlı değildir)
+    initial_snapshot = _build_biological_revision_snapshot(study, steps)
+    _validate_snapshot_expectations(
+        initial_snapshot,
+        clean_token,
+        expected_source_reference_time=expected_source_reference_time,
+        expected_steps=expected_steps,
+    )
+
+    # 3) Önerilen yeni saatlerde ön simülasyon kontrolü (kalıcı yazma yapmaz ve çağıranın transaction'ını kapatmaz)
     sim_result = _evaluate_revision_candidate_obstacles(
         db=db,
         study=study,
@@ -3009,30 +3090,68 @@ def approve_biological_revision(
             f"Önerilen yeni saatlerde kritik planlama/kapasite engeli bulunduğu için revizyon reddedildi: {titles}"
         )
 
-    # 4) Atomik uygulama (tek veritabanı işlemi / savepoint)
-    orig_target_end_date = study.target_end_date
-    orig_meta = copy.deepcopy(study.dossier_metadata) if isinstance(study.dossier_metadata, dict) else study.dossier_metadata
-    orig_step_state = {
-        s.id: (s.planned_start, s.planned_end, s.study_day)
-        for s in steps
-    }
-    sample_rec = db.query(SampleRecord).filter(SampleRecord.study_code == study.study_code).first()
-    orig_sample_planned_end = sample_rec.planned_end if sample_rec else None
-    open_conflicts_before = (
-        db.query(Conflict)
-        .filter(Conflict.study_id == study.id, Conflict.is_resolved == False)  # noqa: E712
-        .all()
-    )
-    orig_conflict_state = {
-        c.id: (c.is_resolved, c.resolved_by_id, c.resolved_at, c.resolution_notes)
-        for c in open_conflicts_before
-    }
-
-    step_by_id = {s.id: s for s in steps}
-    now = datetime.utcnow()
+    # 4) Atomik uygulama ve son doğrulama (simülasyon ile uygulama arasındaki eşzamanlı değişiklikleri yakalar)
+    if not caller_had_pending_tx:
+        # Okuma aşamasındaki snapshot'ı sonlandır ki başka bir Session simülasyon sırasında commit yaptıysa
+        # yazma işlemi güncel veritabanı durumunu görsün.
+        db.rollback()
 
     savepoint = db.begin_nested()
     try:
+        db.expire_all()
+        study = db.query(Study).filter(Study.id == study_id).first()
+        if not study:
+            raise LookupError(f"ID={study_id} olan çalışma bulunamadı.")
+        if study.status not in (StudyStatus.APPROVED, StudyStatus.IN_PROGRESS):
+            raise RuntimeError(
+                f"Biyolojik plan revizyonu yalnızca APPROVED veya IN_PROGRESS durumundaki çalışmalarda uygulanabilir "
+                f"(Mevcut durum: {study.status.value})."
+            )
+
+        steps = (
+            db.query(StudyStep)
+            .options(selectinload(StudyStep.assignees))
+            .filter(StudyStep.study_id == study.id, StudyStep.status != StepStatus.CANCELLED)
+            .order_by(StudyStep.step_order.asc())
+            .all()
+        )
+        base_day0 = study.acclimatization_start_date or study.target_start_date or date.today()
+
+        # Simülasyon sonrasında kaynak referans veya adımlar eşzamanlı değiştiyse preview_token uyuşmaz -> 409
+        live_snapshot = _build_biological_revision_snapshot(study, steps)
+        _validate_snapshot_expectations(
+            live_snapshot,
+            clean_token,
+            expected_source_reference_time=expected_source_reference_time,
+            expected_steps=expected_steps,
+        )
+
+        live_bio_info = compute_biological_dependency_info(study, steps, template)
+        proposals = list(live_bio_info["revision_proposals"])
+        ineligible_steps = list(live_bio_info["ineligible_revision_steps"])
+        source_deviations = list(live_bio_info["source_deviations"])
+        if not proposals:
+            raise RuntimeError(
+                "Uygulama anında güncellenmeye uygun (PENDING ve gerçekleşen verisi olmayan) bağımlı adım kalmadı."
+            )
+
+        orig_target_end_date = study.target_end_date
+        orig_meta = (
+            copy.deepcopy(study.dossier_metadata)
+            if isinstance(study.dossier_metadata, dict)
+            else study.dossier_metadata
+        )
+        sample_rec = db.query(SampleRecord).filter(SampleRecord.study_code == study.study_code).first()
+        open_conflicts_before = (
+            db.query(Conflict)
+            .filter(Conflict.study_id == study.id, Conflict.is_resolved == False)  # noqa: E712
+            .all()
+        )
+
+        step_by_id = {s.id: s for s in steps}
+        revised_step_ids = {p["step_id"] for p in proposals}
+        now = datetime.utcnow()
+
         old_step_values: List[Dict[str, Any]] = []
         new_step_values: List[Dict[str, Any]] = []
 
@@ -3040,7 +3159,6 @@ def approve_biological_revision(
             st_obj = step_by_id.get(prop["step_id"])
             if st_obj is None:
                 raise RuntimeError(f"Hedef adım (ID={prop['step_id']}) bulunamadı.")
-            # Canlı uygunluk doğrulaması (savunma amaçlı ikinci kontrol)
             elig_ok, elig_reason = check_step_revision_eligibility(
                 st_obj,
                 prop["schedule_deviation_minutes"],
@@ -3080,14 +3198,17 @@ def approve_biological_revision(
                 }
             )
 
-        new_target_end_date = max((s.planned_end.date() for s in steps if s.planned_end), default=study.target_end_date)
+        new_target_end_date = max(
+            (s.planned_end.date() for s in steps if s.planned_end),
+            default=study.target_end_date,
+        )
         study.target_end_date = new_target_end_date
         if sample_rec is not None and new_target_end_date is not None:
             sample_rec.planned_end = new_target_end_date
 
         primary_source = source_deviations[0]
         revision_entry = {
-            "revision_id": f"REV-{study.id}-{int(now.timestamp())}-{len( (orig_meta or {}).get('biological_revisions', []) ) + 1}",
+            "revision_id": f"REV-{study.id}-{int(now.timestamp())}-{len((orig_meta or {}).get('biological_revisions', [])) + 1}",
             "source_step_id": primary_source.get("step_id"),
             "source_step_order": primary_source.get("step_order"),
             "source_step_name": primary_source.get("step_name"),
@@ -3144,7 +3265,26 @@ def approve_biological_revision(
             raise RuntimeError("Test amaçlı işlem ortası kontrollü hata (atomik rollback testi).")
 
         # Çalışmanın çakışmalarını yeni plan saatleriyle yeniden doğrula
-        revalidate_study_conflicts(db, study, preserve_weekend_approvals=True)
+        final_findings = revalidate_study_conflicts(db, study, preserve_weekend_approvals=True)
+        final_cap_info = _safe_capacity_report(db, study, template)
+        final_cap_verified = bool(final_cap_info and final_cap_info.get("verified") is True)
+
+        # Son revalidate_study_conflicts sonucundaki yeni kritik engeller commit öncesinde reddetme koşuludur
+        final_blocking_titles: List[str] = []
+        for c_fin, _sids_fin in final_findings:
+            if c_fin.severity == ConflictSeverity.CRITICAL and not _is_non_blocking_past_observation_violation(
+                c_fin, revised_step_ids
+            ):
+                final_blocking_titles.append(c_fin.title)
+        if not final_cap_verified:
+            final_blocking_titles.append(
+                (final_cap_info or {}).get("error") or "Kapasite Doğrulama Hatası"
+            )
+        if final_blocking_titles:
+            raise RuntimeError(
+                f"Uygulama sırasında önerilen yeni saatlerde kritik planlama/kapasite engeli tespit edildiği için "
+                f"revizyon geri alındı: {', '.join(final_blocking_titles[:3])}"
+            )
 
         # Bu çalışmayla ilişkili açık çakışması olan diğer çalışmaları da yeniden doğrula
         related_study_ids = {
@@ -3200,9 +3340,11 @@ def approve_biological_revision(
     except Exception:
         if savepoint.is_active:
             savepoint.rollback()
-        db.rollback()
+        if not caller_had_pending_tx:
+            db.rollback()
         raise
 
+    snap_key = _get_preview_snapshot_key(db, study)
     _LATEST_PREVIEW_SNAPSHOTS.pop(snap_key, None)
 
     res = get_study_schedule_detail(db, study)

@@ -30,8 +30,9 @@ REAL_PERSONNEL = (
 MAX_DAILY_HOURS = 9
 
 
-def seed_default_equipment(db: Session) -> Equipment:
+def seed_default_equipment(db: Session, commit: bool = True) -> Equipment:
     """Varsayılan kritik cihaz olan Çalkalamalı Su Banyosu 1 (EQ-WB-001) kaydını oluşturur."""
+    read_only = (not commit) or db.in_nested_transaction()
     eq = db.query(Equipment).filter(Equipment.code == "EQ-WB-001").first()
     if eq is None:
         eq = Equipment(
@@ -41,23 +42,26 @@ def seed_default_equipment(db: Session) -> Equipment:
             status=EquipmentStatus.AVAILABLE,
             polar_capacity=3,
             non_polar_capacity=1,
+            max_concurrent_studies=4,
             notes="Polar Max Kapasite: 3 çalışma, Apolar/Non-Polar Max Kapasite: 1 çalışma (72 Saatlik Ekstraksiyon)",
         )
-        db.add(eq)
-        db.commit()
-        db.refresh(eq)
-    else:
-        changed = False
-        if eq.polar_capacity is None:
-            eq.polar_capacity = 3
-            changed = True
-        if eq.non_polar_capacity is None:
-            eq.non_polar_capacity = 1
-            changed = True
-        if changed:
+        if not read_only:
+            db.add(eq)
             db.commit()
             db.refresh(eq)
-    seed_long_duration_equipment(db)
+    else:
+        if not read_only:
+            changed = False
+            if eq.polar_capacity is None:
+                eq.polar_capacity = 3
+                changed = True
+            if eq.non_polar_capacity is None:
+                eq.non_polar_capacity = 1
+                changed = True
+            if changed:
+                db.commit()
+                db.refresh(eq)
+    seed_long_duration_equipment(db, commit=commit)
     return eq
 
 
@@ -71,8 +75,14 @@ LONG_DURATION_EQUIPMENT = (
 )
 
 
-def seed_long_duration_equipment(db: Session) -> None:
+def seed_long_duration_equipment(db: Session, commit: bool = True) -> None:
     """EQ-INC-001 (CO2 İnkübatörü) ve EQ-OVN-001 (Etüv/İnkübatör) kayıtlarını (yoksa) oluşturur."""
+    from app.models.room_capacity import ensure_default_room_capacities
+
+    read_only = (not commit) or db.in_nested_transaction()
+    if read_only:
+        ensure_default_room_capacities(db, commit=False)
+        return
     existing = {e.code: e for e in db.query(Equipment).filter(Equipment.code.in_([c[0] for c in LONG_DURATION_EQUIPMENT])).all()}
     changed = False
     for code, name, category, cap, notes in LONG_DURATION_EQUIPMENT:
@@ -94,8 +104,7 @@ def seed_long_duration_equipment(db: Session) -> None:
         changed = True
     if changed:
         db.commit()
-    from app.models.room_capacity import ensure_default_room_capacities
-    ensure_default_room_capacities(db)
+    ensure_default_room_capacities(db, commit=commit)
 
 
 def reset_schema() -> None:

@@ -48,15 +48,25 @@ class AnimalRoomCapacity(Base):
         return compute_planning_capacity(self.physical_cages, self.flexibility_pct)
 
 
-def ensure_default_room_capacities(db: Session) -> List[AnimalRoomCapacity]:
+def ensure_default_room_capacities(db: Session, commit: bool = True) -> List[AnimalRoomCapacity]:
     """Eksik oda kayıtlarını varsayılanlarla tamamlar; mevcut (düzenlenmiş) değerlere dokunmaz."""
+    read_only = (not commit) or db.in_nested_transaction()
     try:
         rows = db.query(AnimalRoomCapacity).all()
     except Exception:
-        db.rollback()
-        Base.metadata.create_all(bind=db.get_bind(), tables=[AnimalRoomCapacity.__table__])
-        rows = db.query(AnimalRoomCapacity).all()
+        if not read_only:
+            db.rollback()
+            Base.metadata.create_all(bind=db.get_bind(), tables=[AnimalRoomCapacity.__table__])
+            rows = db.query(AnimalRoomCapacity).all()
+        else:
+            raise
     existing = {r.room_code for r in rows}
+    if read_only:
+        transient_rows = list(rows)
+        for item in DEFAULT_ROOM_CAPACITIES:
+            if item["room_code"] not in existing:
+                transient_rows.append(AnimalRoomCapacity(**item))
+        return sorted(transient_rows, key=lambda r: (r.id is None, r.id or 0, r.room_code))
     added = False
     for item in DEFAULT_ROOM_CAPACITIES:
         if item["room_code"] not in existing:

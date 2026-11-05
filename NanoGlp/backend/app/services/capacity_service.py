@@ -218,13 +218,23 @@ def _equipment_window(tpl_win: Tuple[str, int, str, int], g0: date, offset: int)
 def _equipment_eval(
     db: Session, tpl: StudyTemplate, others: List[Dict[str, Any]], g0: date, offset: int
 ) -> List[Dict[str, Any]]:
+    from app.seed import LONG_DURATION_EQUIPMENT
+
+    default_eq_map = {c[0]: (c[1], c[3]) for c in LONG_DURATION_EQUIPMENT}
     results: List[Dict[str, Any]] = []
     for win in tpl.equipment_windows:
         code = win[0]
         eq = db.query(Equipment).filter(Equipment.code == code).first()
         if eq is None:
-            continue
-        cap = int(eq.max_concurrent_studies or 1)
+            if code in default_eq_map:
+                eq_name, default_cap = default_eq_map[code]
+                cap = int(default_cap or 1)
+            else:
+                continue
+        else:
+            eq_name = eq.name
+            default_cap = default_eq_map.get(code, (eq.name, 1))[1]
+            cap = int(eq.max_concurrent_studies or default_cap or 1)
         start, end = _equipment_window(win, g0, offset)
         concurrent: List[str] = []
         for o in others:
@@ -239,7 +249,7 @@ def _equipment_eval(
             {
                 "kind": "EQUIPMENT",
                 "equipment_code": code,
-                "equipment_name": eq.name,
+                "equipment_name": eq_name,
                 "window_start": start.isoformat(),
                 "window_end": end.isoformat(),
                 "hours": win[3],
@@ -269,7 +279,10 @@ def _cage_message(c: Dict[str, Any]) -> str:
 
 
 def build_capacity_report(
-    db: Session, study: Study, template: Optional[StudyTemplate] = None
+    db: Session,
+    study: Study,
+    template: Optional[StudyTemplate] = None,
+    commit_defaults: bool = False,
 ) -> Dict[str, Any]:
     """Planlama yanıtında gösterilecek kafes + uzun süreli cihaz kapasite raporu (engellemeyen bilgi etiketleri dahil)."""
     tpl = template or _tpl_for(study.template_code)
@@ -280,7 +293,7 @@ def build_capacity_report(
     offset = study.extraction_start_offset_days or 0
     others = _collect_others(db, study)
     if tpl.animal_room and tpl.cage_count > 0:
-        rooms = {r.room_code: r for r in ensure_default_room_capacities(db)}
+        rooms = {r.room_code: r for r in ensure_default_room_capacities(db, commit=commit_defaults)}
         room = rooms.get(tpl.animal_room)
         if room is not None:
             cage = _cage_eval(room, tpl, others, g0, offset, end_date=study.target_end_date)
@@ -291,18 +304,26 @@ def build_capacity_report(
         e["level"] == "EXCEEDED" for e in report["equipment"]
     )
     if needs_redirect:
-        report["first_free_g0"] = find_first_free_g0(db, study, tpl, g0, offset)
+        report["first_free_g0"] = find_first_free_g0(
+            db, study, tpl, g0, offset, commit_defaults=commit_defaults
+        )
         if report["cage"] and report["cage"]["level"] == "EXCEEDED":
             report["cage"]["first_free_date"] = report["first_free_g0"]
     return report
 
 
 def find_first_free_g0(
-    db: Session, study: Study, tpl: StudyTemplate, from_g0: date, offset: int, max_days: int = 240
+    db: Session,
+    study: Study,
+    tpl: StudyTemplate,
+    from_g0: date,
+    offset: int,
+    max_days: int = 240,
+    commit_defaults: bool = False,
 ) -> Optional[str]:
     """Kafes (≤ Planlama Kapasitesi) ve uzun süreli cihaz kapasitesi uygun olan ilk Gün 0 (iş günü) tarihini bulur."""
     others = _collect_others(db, study)
-    rooms = {r.room_code: r for r in ensure_default_room_capacities(db)}
+    rooms = {r.room_code: r for r in ensure_default_room_capacities(db, commit=commit_defaults)}
     room = rooms.get(tpl.animal_room) if tpl.animal_room else None
     restrictions = db.query(TestRestriction).filter(TestRestriction.is_active == True).all()  # noqa: E712
     cand = from_g0
