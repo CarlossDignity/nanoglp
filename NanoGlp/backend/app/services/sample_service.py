@@ -831,14 +831,18 @@ def plan_sample(
     allow_non_draft: bool = False,
     existing_study: Optional[Study] = None,
 ) -> Dict[str, Any]:
-    from app.services.scheduling_engine import schedule_new_study  # döngüsel içe aktarmayı önlemek için yerel
+    from app.services.scheduling_engine import ensure_no_execution_for_full_replan, schedule_new_study
+
+    study = existing_study if existing_study is not None else find_study(db, sample.study_code)
+    if study is not None:
+        # Must precede field updates, the DRAFT override and the early commit.
+        ensure_no_execution_for_full_replan(db, study)
 
     tpl_code = resolve_template_code(sample.template_code) or infer_template_code(sample.requested_analysis) or DEFAULT_TEMPLATE_CODE
     if tpl_code not in TEMPLATES:
         tpl_code = DEFAULT_TEMPLATE_CODE
     tpl = get_template(tpl_code, db=db)
 
-    study = existing_study if existing_study is not None else find_study(db, sample.study_code)
     if study is not None and study.status != StudyStatus.DRAFT and not allow_non_draft:
         raise PermissionError(
             f"'{sample.study_code}' çalışması {study.status.value} durumundadır; onaylı çalışmaların takvimi "
