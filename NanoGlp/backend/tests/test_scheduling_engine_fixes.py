@@ -3671,13 +3671,17 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
     def test_21_biological_revision_review_fixes_isolation_token_delayed_and_concurrency(self):
         from unittest.mock import patch
         from app.models.audit_log import AuditLog
+        from app.models.calibration import SystemCalibration
         from app.models.room_capacity import AnimalRoomCapacity, ensure_default_room_capacities
         from app.seed import seed_default_equipment
+        from app.services.templates import ensure_default_calibrations
         import app.services.scheduling_engine as se_mod
         from app.services.scheduling_engine import (
             _LATEST_PREVIEW_SNAPSHOTS,
+            _build_biological_revision_snapshot,
             _evaluate_revision_candidate_obstacles,
             approve_biological_revision,
+            preview_biological_revision,
         )
 
         sd_ezgi = self.people["ezgi"]
@@ -3685,7 +3689,7 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
         h_ezgi = _login_headers(self.client, "ezgi")
         h_tech1 = _login_headers(self.client, "invivo_1")
 
-        # Test çalışmasını planla ve onayla
+        # Test çalışmasını ve ilişkili SampleRecord kaydını planla ve onayla
         st = Study(
             study_code="FIX21-REV-AUDIT",
             title="Fix 21 Revision Isolation & Concurrency Study",
@@ -3697,7 +3701,14 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
             extraction_polar=True,
             extraction_non_polar=False,
         )
-        self.db.add(st)
+        sr = SampleRecord(
+            study_code="FIX21-REV-AUDIT",
+            test_item_name="Audit Hydrogel",
+            planned_start=date(2027, 2, 4),
+            planned_end=date(2027, 2, 14),
+            stored_status="ONGOING",
+        )
+        self.db.add_all([st, sr])
         self.db.commit()
 
         r_sched = self.client.post(
@@ -3742,18 +3753,26 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
 
         # ==================================================================
         # BULGU 1 & BULGU 3 (Önizleme):
-        # - Varsayılan oda kaydını (RABBIT_ROOM) sil ve cihaz varsayılan tamamlama
+        # - Varsayılan kalibrasyon kaydını (ISO_10993_23_IC step_order=5),
+        #   varsayılan oda kaydını (RABBIT_ROOM) sil ve cihaz varsayılan tamamlama
         #   dallarını (EQ-WB-001 kapasite alanları None + EQ-INC-001 eksik) tetikle.
         # - Ayrıca day8 adımını tüm actual_* alanları boş (None) olacak şekilde DELAYED yap.
-        # - GET revision-preview sonrasında YENİ BİR Session ile hiçbir verinin
-        #   kalıcılaşmadığını ve DELAYED adımın uygunsuz sayıldığını doğrula.
+        # - GET revision-preview sonrasında YENİ BİR Session ile kalibrasyon dahil
+        #   hiçbir verinin kalıcılaşmadığını ve DELAYED adımın uygunsuz sayıldığını doğrula.
         # ==================================================================
+        ensure_default_calibrations(self.db, commit=True)
         self.db.expire_all()
         day8_db = self.db.query(StudyStep).filter(StudyStep.id == day8.id).first()
         day8_db.status = StepStatus.DELAYED
         day8_db.actual_start = None
         day8_db.actual_end = None
         day8_db.actual_reference_time = None
+
+        # Varsayılan SystemCalibration satırlarından birini sil
+        self.db.query(SystemCalibration).filter(
+            SystemCalibration.template_code == "ISO_10993_23_IC",
+            SystemCalibration.step_order == 5,
+        ).delete()
 
         # Varsayılan oda kaydını sil
         self.db.query(AnimalRoomCapacity).filter(AnimalRoomCapacity.room_code == "RABBIT_ROOM").delete()
@@ -3776,11 +3795,13 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
         snap_before_s = SessionLocal()
         try:
             st_before = snap_before_s.query(Study).filter(Study.id == st.id).first()
+            sr_before = snap_before_s.query(SampleRecord).filter(SampleRecord.study_code == st.study_code).first()
             steps_before = {
                 s.id: (s.planned_start, s.planned_end, s.study_day, s.status)
                 for s in snap_before_s.query(StudyStep).filter(StudyStep.study_id == st.id).all()
             }
             target_end_before = st_before.target_end_date
+            sr_end_before = sr_before.planned_end
             status_before = st_before.status
             meta_before = dict(st_before.dossier_metadata or {})
             confs_before = [
@@ -3794,6 +3815,18 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
                 a.id
                 for a in snap_before_s.query(AuditLog).order_by(AuditLog.id.asc()).all()
             ]
+            cals_before = [
+                (c.id, c.template_code, c.step_order)
+                for c in snap_before_s.query(SystemCalibration).order_by(SystemCalibration.id.asc()).all()
+            ]
+            self.assertIsNone(
+                snap_before_s.query(SystemCalibration)
+                .filter(
+                    SystemCalibration.template_code == "ISO_10993_23_IC",
+                    SystemCalibration.step_order == 5,
+                )
+                .first()
+            )
             self.assertIsNone(
                 snap_before_s.query(AnimalRoomCapacity).filter(AnimalRoomCapacity.room_code == "RABBIT_ROOM").first()
             )
@@ -3823,10 +3856,11 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
         self.assertFalse(inelig_by_order[day8.step_order]["eligible"])
         self.assertIn("DELAYED", inelig_by_order[day8.step_order]["ineligible_reason"])
 
-        # BULGU 1 kontrolü: YENİ BİR Session ile önizlemenin hiçbir kalıcı veri yazmadığını doğrula!
+        # BULGU 1 kontrolü: YENİ BİR Session ile önizlemenin kalibrasyon dahil hiçbir kalıcı veri yazmadığını doğrula!
         snap_after_s = SessionLocal()
         try:
             st_after = snap_after_s.query(Study).filter(Study.id == st.id).first()
+            sr_after = snap_after_s.query(SampleRecord).filter(SampleRecord.study_code == st.study_code).first()
             steps_after = {
                 s.id: (s.planned_start, s.planned_end, s.study_day, s.status)
                 for s in snap_after_s.query(StudyStep).filter(StudyStep.study_id == st.id).all()
@@ -3842,14 +3876,29 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
                 a.id
                 for a in snap_after_s.query(AuditLog).order_by(AuditLog.id.asc()).all()
             ]
+            cals_after = [
+                (c.id, c.template_code, c.step_order)
+                for c in snap_after_s.query(SystemCalibration).order_by(SystemCalibration.id.asc()).all()
+            ]
 
             self.assertEqual(steps_after, steps_before, "GET revision-preview adım saatlerini veya günlerini değiştirmemeli")
             self.assertEqual(st_after.target_end_date, target_end_before, "GET revision-preview target_end_date alanını değiştirmemeli")
+            self.assertEqual(sr_after.planned_end, sr_end_before, "GET revision-preview SampleRecord.planned_end alanını değiştirmemeli")
             self.assertEqual(st_after.status, status_before, "GET revision-preview çalışma durumunu değiştirmemeli")
             self.assertEqual(dict(st_after.dossier_metadata or {}), meta_before, "GET revision-preview dossier_metadata alanını değiştirmemeli")
             self.assertNotIn("__PREVIEW_SIMULATION__", st_after.dossier_metadata or {})
             self.assertEqual(confs_after, confs_before, "GET revision-preview Conflict kayıtlarını değiştirmemeli")
             self.assertEqual(audits_after, audits_before, "GET revision-preview AuditLog kaydı üretmemeli")
+            self.assertEqual(cals_after, cals_before, "GET revision-preview SystemCalibration kayıtlarını değiştirmemeli")
+            self.assertIsNone(
+                snap_after_s.query(SystemCalibration)
+                .filter(
+                    SystemCalibration.template_code == "ISO_10993_23_IC",
+                    SystemCalibration.step_order == 5,
+                )
+                .first(),
+                "GET revision-preview eksik SystemCalibration satırını veritabanına commit etmemeli",
+            )
             self.assertIsNone(
                 snap_after_s.query(AnimalRoomCapacity).filter(AnimalRoomCapacity.room_code == "RABBIT_ROOM").first(),
                 "GET revision-preview eksik oda varsayılanını veritabanına commit etmemeli",
@@ -3863,7 +3912,63 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
         finally:
             snap_after_s.close()
 
-        # Sonraki test adımları için varsayılan oda ve cihaz kayıtlarını geri yükle
+        # BULGU 1 ek kontrolü: preview_biological_revision çağıranın bekleyen işlemlerini (hem flush edilmiş hem flush edilmemiş)
+        # kaydetmemeli (commit etmemeli) veya geri almamalı (rollback etmemeli)!
+        s_caller_pending = SessionLocal()
+        try:
+            flushed_marker = AuditLog(
+                user_id=sd_ezgi.id,
+                action="CALLER_PENDING_FLUSHED",
+                entity_name="Study",
+                entity_id=st.id,
+                reason="Önizleme çağıranın flush edilmiş işlemini commit veya rollback etmemeli",
+            )
+            s_caller_pending.add(flushed_marker)
+            s_caller_pending.flush()
+            flushed_marker_id = flushed_marker.id
+
+            unflushed_marker = AuditLog(
+                user_id=sd_ezgi.id,
+                action="CALLER_PENDING_UNFLUSHED",
+                entity_name="Study",
+                entity_id=st.id,
+                reason="Önizleme çağıranın henüz flush edilmemiş işlemini flush/commit/rollback etmemeli",
+            )
+            s_caller_pending.add(unflushed_marker)
+
+            # Kalibrasyon satırı hala eksikken doğrudan preview_biological_revision çağır
+            prev_direct = preview_biological_revision(s_caller_pending, st.id)
+            self.assertEqual(prev_direct["preview_token"], prev_json["preview_token"])
+
+            # 1) Başka bir Session'dan bakıldığında çağıranın bekleyen işlemleri commit edilmemiş olmalı!
+            s_ext_check = SessionLocal()
+            try:
+                self.assertIsNone(
+                    s_ext_check.query(AuditLog).filter(AuditLog.id == flushed_marker_id).first(),
+                    "preview_biological_revision çağıranın bekleyen işlemini commit etmemeli!",
+                )
+                self.assertEqual(
+                    s_ext_check.query(AuditLog).filter(AuditLog.action == "CALLER_PENDING_UNFLUSHED").count(),
+                    0,
+                    "preview_biological_revision çağıranın bekleyen işlemini flush/commit etmemeli!",
+                )
+            finally:
+                s_ext_check.close()
+
+            # 2) Çağıran Session içinde ise hem flush edilmiş işlem hem de s.new içindeki nesne korunmuş olmalı (rollback edilmemiş olmalı)
+            #    ve s.dirty içine simülasyondan hiçbir kirli nesne kalmamış olmalı!
+            self.assertIn(unflushed_marker, s_caller_pending.new)
+            self.assertEqual(set(s_caller_pending.dirty), set(), "Önizleme sonrasında Session.dirty içinde kirli nesne kalmamalı")
+            self.assertIsNotNone(
+                s_caller_pending.query(AuditLog).filter(AuditLog.id == flushed_marker_id).first(),
+                "preview_biological_revision çağıranın bekleyen işlemini rollback ile geri almamalı!",
+            )
+            s_caller_pending.rollback()
+        finally:
+            s_caller_pending.close()
+
+        # Sonraki test adımları için varsayılan kalibrasyon, oda ve cihaz kayıtlarını geri yükle
+        ensure_default_calibrations(self.db, commit=True)
         ensure_default_room_capacities(self.db, commit=True)
         seed_default_equipment(self.db, commit=True)
 
@@ -4096,6 +4201,11 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
             res = orig_eval(*args, **kwargs)
             s_concurrent = SessionLocal()
             try:
+                # İkinci Session bir SystemCalibration satırını silsin VE önerilen pencereye personel engeli eklesin!
+                s_concurrent.query(SystemCalibration).filter(
+                    SystemCalibration.template_code == "ISO_10993_23_IC",
+                    SystemCalibration.step_order == 6,
+                ).delete()
                 tech_c = s_concurrent.query(User).filter(User.id == target_tech_id).first()
                 rival_step = StudyStep(
                     study_id=other_study_id,
@@ -4119,21 +4229,29 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
                 f"/api/v1/planning/studies/{st.id}/approve-revision",
                 headers=h_ezgi,
                 json={
-                    "reason": "Simülasyon sonrası eşzamanlı personel çakışması testi",
+                    "reason": "Simülasyon sonrası eşzamanlı kalibrasyon silme + personel çakışması testi",
                     "preview_token": token_0300,
                 },
             )
         self.assertEqual(r_race_pers.status_code, 409, r_race_pers.text)
 
-        # Reddedilen işlemde kısmi veri oluşmadığını ve çakışma durumunun bozulmadığını doğrula
+        # Reddedilen işlemde yeni Session ile adım saatlerinin, target_end_date, SampleRecord.planned_end,
+        # biological_revisions ve onay AuditLog kayıtlarının değişmediğini; ikinci Session'ın kendi yaptığı
+        # değişikliklerin (silinen SystemCalibration satırı ve eklenen rival_step) ise korunduğunu doğrula!
         s_ver_4b = SessionLocal()
         try:
             st_4b = s_ver_4b.query(Study).filter(Study.id == st.id).first()
+            sr_4b = s_ver_4b.query(SampleRecord).filter(SampleRecord.study_code == st.study_code).first()
             d9_4b = s_ver_4b.query(StudyStep).filter(StudyStep.id == day9.id).first()
             d10_4b = s_ver_4b.query(StudyStep).filter(StudyStep.id == day10.id).first()
             self.assertEqual(d9_4b.planned_start, datetime(2027, 2, 13, 10, 0), "Personel engeli varken adım kaydırılmamalı")
+            self.assertEqual(d9_4b.planned_end, datetime(2027, 2, 13, 11, 0))
+            self.assertEqual(d9_4b.study_day, 9)
             self.assertEqual(d10_4b.planned_start, datetime(2027, 2, 14, 10, 0), "Personel engeli varken adım kaydırılmamalı")
-            self.assertEqual(st_4b.target_end_date, date(2027, 2, 14))
+            self.assertEqual(d10_4b.planned_end, datetime(2027, 2, 14, 12, 0))
+            self.assertEqual(d10_4b.study_day, 10)
+            self.assertEqual(st_4b.target_end_date, date(2027, 2, 14), "target_end_date değişmemeli")
+            self.assertEqual(sr_4b.planned_end, date(2027, 2, 14), "SampleRecord.planned_end değişmemeli")
             self.assertEqual(len((st_4b.dossier_metadata or {}).get("biological_revisions") or []), 0)
             self.assertEqual(
                 s_ver_4b.query(AuditLog)
@@ -4141,13 +4259,29 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
                 .count(),
                 0,
             )
-            # Rakip adımı temizle
+            # İkinci Session'ın kendi yaptığı değişiklikler korunmalı!
+            self.assertEqual(len(rival_step_id_holder), 1)
+            self.assertIsNotNone(
+                s_ver_4b.query(StudyStep).filter(StudyStep.id == rival_step_id_holder[0]).first(),
+                "İkinci Session'ın eklediği rival_step korunmalı",
+            )
+            self.assertIsNone(
+                s_ver_4b.query(SystemCalibration)
+                .filter(
+                    SystemCalibration.template_code == "ISO_10993_23_IC",
+                    SystemCalibration.step_order == 6,
+                )
+                .first(),
+                "İkinci Session'ın sildiği SystemCalibration satırı get_template tarafından yeniden commit edilmemeli!",
+            )
+            # Rakip adımı temizle ve kalibrasyonu geri yükle
             for rsid in rival_step_id_holder:
                 rs_obj = s_ver_4b.query(StudyStep).filter(StudyStep.id == rsid).first()
                 if rs_obj:
                     rs_obj.assignees.clear()
                     s_ver_4b.delete(rs_obj)
             s_ver_4b.commit()
+            ensure_default_calibrations(s_ver_4b, commit=True)
         finally:
             s_ver_4b.close()
 
@@ -4225,11 +4359,103 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
             s_ver_4c.close()
 
         # ==================================================================
-        # SON DOĞRULAMA (BULGU 2 + BULGU 3 Onay):
-        # - Engel temizlendikten sonra, _LATEST_PREVIEW_SNAPSHOTS boşken ve ayrı
-        #   Session üzerinde geçerli token_0300_eq ile onay başarılı olmalı!
+        # BULGU 2 EK DOĞRULAMA:
+        # - preview_token öneriyi belirleyen bağlamı (Gün 0, template_code) ve
+        #   hesaplanan önerilerin kararlı temsilini (hedef adım kimliği, önerilen
+        #   başlangıç/bitiş, önerilen study_day ve önerilen çalışma bitişi) içermeli;
+        #   aynı veri aynı token'ı üretmeli.
+        # - Önizleme sonrasında YALNIZCA Gün 0 (acclimatization_start_date) değiştiğinde
+        #   önerilen çalışma günlerinin değiştiğini ve eski token'ın hiçbir veri
+        #   yazılmadan 409 ile reddedildiğini, güncel önizlemeyle ise normal onayın
+        #   çalıştığını doğrula.
+        # ==================================================================
+        prev_g0_a = self.client.get(
+            f"/api/v1/planning/studies/{st.id}/revision-preview",
+            headers=h_ezgi,
+        ).json()
+        prev_g0_b = self.client.get(
+            f"/api/v1/planning/studies/{st.id}/revision-preview",
+            headers=h_ezgi,
+        ).json()
+        self.assertEqual(prev_g0_a["preview_token"], prev_g0_b["preview_token"], "Aynı veri aynı preview_token üretmeli")
+        token_before_g0_change = prev_g0_a["preview_token"]
+        aff_before_g0 = {x["step_order"]: x for x in prev_g0_a["affected_steps"]}
+        self.assertEqual(aff_before_g0[day9.step_order]["proposed_study_day"], 10)
+        self.assertEqual(aff_before_g0[day10.step_order]["proposed_study_day"], 11)
+
+        # Yalnızca Gün 0'ı (acclimatization_start_date: 2027-02-04 -> 2027-02-03) değiştir
+        s_change_g0 = SessionLocal()
+        try:
+            st_g0 = s_change_g0.query(Study).filter(Study.id == st.id).first()
+            snap_check = _build_biological_revision_snapshot(
+                st_g0,
+                s_change_g0.query(StudyStep)
+                .filter(StudyStep.study_id == st.id, StudyStep.status != StepStatus.CANCELLED)
+                .order_by(StudyStep.step_order.asc())
+                .all(),
+            )
+            self.assertEqual(snap_check["template_code"], "ISO_10993_23_IC")
+            self.assertEqual(snap_check["acclimatization_start_date"], "2027-02-04")
+            self.assertEqual(snap_check["proposed_target_end_date"], "2027-02-15")
+            self.assertEqual(len(snap_check["proposals"]), 2)
+
+            st_g0.acclimatization_start_date = date(2027, 2, 3)
+            s_change_g0.commit()
+        finally:
+            s_change_g0.close()
+
+        # Yeni önizlemede önerilen çalışma günleri (10->11 ve 11->12) ve preview_token değişmiş olmalı!
+        prev_after_g0 = self.client.get(
+            f"/api/v1/planning/studies/{st.id}/revision-preview",
+            headers=h_ezgi,
+        ).json()
+        aff_after_g0 = {x["step_order"]: x for x in prev_after_g0["affected_steps"]}
+        self.assertEqual(aff_after_g0[day9.step_order]["proposed_study_day"], 11)
+        self.assertEqual(aff_after_g0[day10.step_order]["proposed_study_day"], 12)
+        self.assertNotEqual(
+            prev_after_g0["preview_token"],
+            token_before_g0_change,
+            "Gün 0 ve önerilen study_day değiştiğinde preview_token değişmeli",
+        )
+
+        # Eski token (token_before_g0_change) hiçbir veri yazılmadan 409 ile reddedilmeli!
+        _LATEST_PREVIEW_SNAPSHOTS.clear()
+        r_old_g0_tok = self.client.post(
+            f"/api/v1/planning/studies/{st.id}/approve-revision",
+            headers=h_ezgi,
+            json={
+                "reason": "Gün 0 değişimi öncesi eski token ile onay denemesi",
+                "preview_token": token_before_g0_change,
+            },
+        )
+        self.assertEqual(r_old_g0_tok.status_code, 409, r_old_g0_tok.text)
+
+        s_ver_g0 = SessionLocal()
+        try:
+            d9_g0 = s_ver_g0.query(StudyStep).filter(StudyStep.id == day9.id).first()
+            st_g0_ver = s_ver_g0.query(Study).filter(Study.id == st.id).first()
+            sr_g0_ver = s_ver_g0.query(SampleRecord).filter(SampleRecord.study_code == st.study_code).first()
+            self.assertEqual(d9_g0.planned_start, datetime(2027, 2, 13, 10, 0), "Eski token reddedildiğinde adım saati değişmemeli")
+            self.assertEqual(d9_g0.study_day, 9, "Eski token reddedildiğinde study_day değişmemeli")
+            self.assertEqual(st_g0_ver.target_end_date, date(2027, 2, 14))
+            self.assertEqual(sr_g0_ver.planned_end, date(2027, 2, 14))
+            self.assertEqual(len((st_g0_ver.dossier_metadata or {}).get("biological_revisions") or []), 0)
+            self.assertEqual(
+                s_ver_g0.query(AuditLog)
+                .filter(AuditLog.entity_name == "Study", AuditLog.entity_id == st.id, AuditLog.action == "APPROVE_BIOLOGICAL_REVISION")
+                .count(),
+                0,
+            )
+        finally:
+            s_ver_g0.close()
+
+        # ==================================================================
+        # SON DOĞRULAMA (Güncel Önizlemeyle Normal Onay + BULGU 3 Onay):
+        # - _LATEST_PREVIEW_SNAPSHOTS boşken ve ayrı Session üzerinde güncel
+        #   prev_after_g0["preview_token"] ile onay başarılı olmalı!
         # - Onay sonrasında DELAYED + tüm actual_* boş olan day8 kesinlikle
-        #   değişmemeli; yalnızca PENDING olan day9 ve day10 güncellenmeli!
+        #   değişmemeli; yalnızca PENDING olan day9 ve day10 yeni saatlere ve
+        #   yeni Gün 0'a göre hesaplanan study_day (11 ve 12) değerlerine güncellenmeli!
         # ==================================================================
         _LATEST_PREVIEW_SNAPSHOTS.clear()
         s_approve_separate = SessionLocal()
@@ -4238,9 +4464,9 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
             approved_res = approve_biological_revision(
                 s_approve_separate,
                 st.id,
-                reason="Ayrı Session ve temiz önbellek ile geçerli token onayı",
+                reason="Ayrı Session ve temiz önbellek ile güncel önizleme tokenı onayı",
                 user=sd_in_sep,
-                preview_token=token_0300_eq,
+                preview_token=prev_after_g0["preview_token"],
             )
             self.assertEqual(approved_res["target_end_date"], "2027-02-15")
         finally:
@@ -4252,6 +4478,7 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
             d9_final = s_final.query(StudyStep).filter(StudyStep.id == day9.id).first()
             d10_final = s_final.query(StudyStep).filter(StudyStep.id == day10.id).first()
             st_final = s_final.query(Study).filter(Study.id == st.id).first()
+            sr_final = s_final.query(SampleRecord).filter(SampleRecord.study_code == st.study_code).first()
 
             # DELAYED + tüm actual_* boş olan day8 korunmuş olmalı
             self.assertEqual(d8_final.status, StepStatus.DELAYED)
@@ -4262,14 +4489,15 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
             self.assertEqual(d8_final.planned_end, datetime(2027, 2, 12, 11, 0), "DELAYED adımın plan bitişi değişmemeli")
             self.assertEqual(d8_final.study_day, 8, "DELAYED adımın çalışma günü değişmemeli")
 
-            # PENDING olan day9 ve day10 ise 03:00 referansına göre güncellenmiş olmalı
+            # PENDING olan day9 ve day10 ise 03:00 referansı ve güncel Gün 0 (2027-02-03) ile güncellenmiş olmalı
             self.assertEqual(d9_final.planned_start, datetime(2027, 2, 14, 3, 0))
             self.assertEqual(d9_final.planned_end, datetime(2027, 2, 14, 4, 0))
-            self.assertEqual(d9_final.study_day, 10)
+            self.assertEqual(d9_final.study_day, 11)
             self.assertEqual(d10_final.planned_start, datetime(2027, 2, 15, 3, 0))
             self.assertEqual(d10_final.planned_end, datetime(2027, 2, 15, 5, 0))
-            self.assertEqual(d10_final.study_day, 11)
+            self.assertEqual(d10_final.study_day, 12)
             self.assertEqual(st_final.target_end_date, date(2027, 2, 15))
+            self.assertEqual(sr_final.planned_end, date(2027, 2, 15))
             self.assertEqual(len((st_final.dossier_metadata or {}).get("biological_revisions") or []), 1)
             self.assertEqual(
                 s_final.query(AuditLog)

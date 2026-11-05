@@ -973,16 +973,21 @@ def _parse_hhmm(val: str, fallback: time) -> time:
         return fallback
 
 
-def ensure_default_calibrations(db: Session) -> List[Any]:
+def ensure_default_calibrations(db: Session, commit: bool = True) -> List[Any]:
     """
     Veritabanındaki `system_calibrations` tablosunu kontrol eder; şablon adımları eksikse
-    varsayılan kalibrasyon kayıtlarını oluşturur.
+    `commit=True` (ve aktif bir iç transaction yoksa) varsayılan kalibrasyon kayıtlarını oluşturur.
+    Salt-okunur / doğrulama / önizleme akışlarında (`commit=False` veya `db.in_nested_transaction()`)
+    Session üzerine hiçbir kayıt eklemez (`db.add` / `db.commit` yapmaz) ve eksik satırları
+    bellek içi geçici (transient) nesneler olarak tamamlayıp döner.
     """
     from app.models.calibration import SystemCalibration
 
-    existing = db.query(SystemCalibration).order_by(SystemCalibration.id.asc()).all()
+    can_persist = bool(commit and not db.in_nested_transaction())
+    with db.no_autoflush:
+        existing = db.query(SystemCalibration).order_by(SystemCalibration.id.asc()).all()
     existing_keys = {(c.template_code, c.step_order) for c in existing}
-    added = False
+    missing_rows: List[SystemCalibration] = []
     for tpl in TEMPLATES.values():
         for st in tpl.steps:
             if (tpl.code, st.order) not in existing_keys:
@@ -997,15 +1002,18 @@ def ensure_default_calibrations(db: Session) -> List[Any]:
                     tolerance_minutes=st.tolerance_minutes,
                     is_biological_fixed_time=st.is_biological_fixed_time,
                 )
-                db.add(row)
-                added = True
-    if added:
+                missing_rows.append(row)
+                if can_persist:
+                    db.add(row)
+    if not missing_rows:
+        return existing
+    if can_persist:
         db.commit()
-        existing = db.query(SystemCalibration).order_by(SystemCalibration.id.asc()).all()
-    return existing
+        return db.query(SystemCalibration).order_by(SystemCalibration.id.asc()).all()
+    return list(existing) + missing_rows
 
 
-def get_template(code: str, db: Optional[Session] = None) -> StudyTemplate:
+def get_template(code: str, db: Optional[Session] = None, commit_defaults: bool = False) -> StudyTemplate:
     code = resolve_template_code(code)
     try:
         base_tpl = TEMPLATES[code]
@@ -1018,13 +1026,15 @@ def get_template(code: str, db: Optional[Session] = None) -> StudyTemplate:
     try:
         from app.models.calibration import SystemCalibration
 
-        ensure_default_calibrations(db)
-        cal_rows = (
-            db.query(SystemCalibration)
-            .filter(SystemCalibration.template_code == base_tpl.code)
-            .order_by(SystemCalibration.step_order.asc())
-            .all()
-        )
+        if commit_defaults and not db.in_nested_transaction():
+            ensure_default_calibrations(db, commit=True)
+        with db.no_autoflush:
+            cal_rows = (
+                db.query(SystemCalibration)
+                .filter(SystemCalibration.template_code == base_tpl.code)
+                .order_by(SystemCalibration.step_order.asc())
+                .all()
+            )
         if not cal_rows:
             return base_tpl
         cal_by_order = {c.step_order: c for c in cal_rows}
@@ -1052,5 +1062,5 @@ def get_template(code: str, db: Optional[Session] = None) -> StudyTemplate:
         return base_tpl
 
 
-def get_all_templates_calibrated(db: Optional[Session] = None) -> List[StudyTemplate]:
-    return [get_template(code, db=db) for code in TEMPLATES]
+def get_all_templates_calibrated(db: Optional[Session] = None, commit_defaults: bool = False) -> List[StudyTemplate]:
+    return [get_template(code, db=db, commit_defaults=commit_defaults) for code in TEMPLATES]
