@@ -279,6 +279,36 @@ def register_biological_time_violation(
 # ---------------------------------------------------------------------------
 # KURAL 3 & 4: YENİ ÇALIŞMA (ŞABLONDAN) — NON-DESTRUCTIVE, TASLAK ↔ TASLAK KONTROLLÜ
 # ---------------------------------------------------------------------------
+def ensure_no_execution_for_full_replan(db: Session, study: Study) -> None:
+    """Reject destructive replanning before callers change or commit study fields.
+
+    Study status alone is insufficient: imported/manual execution evidence may
+    exist on a DRAFT. No status override may bypass this step-level protection.
+    This check is deliberately separate from the SD biological revision flow.
+    """
+    with db.no_autoflush:
+        executed = (
+            db.query(StudyStep.id, StudyStep.step_name)
+            .filter(
+                StudyStep.study_id == study.id,
+                or_(
+                    StudyStep.actual_start.isnot(None),
+                    StudyStep.actual_end.isnot(None),
+                    StudyStep.actual_reference_time.isnot(None),
+                    StudyStep.status.in_((StepStatus.IN_PROGRESS, StepStatus.COMPLETED)),
+                ),
+            )
+            .order_by(StudyStep.id)
+            .first()
+        )
+    if executed is not None:
+        raise PermissionError(
+            f"'{study.study_code}' çalışması tam yeniden planlanamaz: "
+            f"'{executed.step_name}' (adım ID={executed.id}) başlamış/tamamlanmış "
+            "veya gerçekleşme kaydı içeriyor. Mevcut görevler, atamalar ve gerçekleşmeler korunmalıdır."
+        )
+
+
 def _supersede_previous_plan(db: Session, study: Study, now: datetime) -> Tuple[int, int]:
     """
     Taslak yeniden planlanırken eski adımları kaldırır. Eski çakışma kayıtları SİLİNMEZ (denetim izi);
@@ -2018,6 +2048,7 @@ def schedule_new_study(
             f"'{study.study_code}' çalışması {study.status.value} durumundadır. Yalnızca DRAFT çalışmalar "
             f"(yeniden) planlanabilir; onaylanmış çalışmaların görev saatleri değiştirilemez (Non-Destructive kuralı)."
         )
+    ensure_no_execution_for_full_replan(db, study)
     resolved_template_code = template_code or getattr(study, "template_code", None) or DEFAULT_TEMPLATE_CODE
     template = get_template(resolved_template_code, db=db)
     study.template_code = template.code

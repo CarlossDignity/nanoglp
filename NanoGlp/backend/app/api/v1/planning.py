@@ -38,6 +38,7 @@ from app.services.scheduling_engine import (
     recompute_all_conflicts,
     revalidate_study_conflicts,
     schedule_new_study,
+    ensure_no_execution_for_full_replan,
     sync_historical_completion_and_conflicts,
     MAX_DAILY_WORKLOAD_MINUTES,
 )
@@ -329,6 +330,8 @@ def _resolve_or_create_draft_study(db: Session, payload: ScheduleStudyRequest) -
         study = db.query(Study).filter(Study.id == payload.study_id).first()
         if not study:
             raise HTTPException(status_code=404, detail="GLP çalışması bulunamadı.")
+        # Check before dossier changes and their early commit, for both ID/code lookup.
+        ensure_no_execution_for_full_replan(db, study)
         if study.status == StudyStatus.DRAFT:
             _apply_dossier_fields_to_study(study, payload)
             db.commit()
@@ -338,6 +341,8 @@ def _resolve_or_create_draft_study(db: Session, payload: ScheduleStudyRequest) -
     code = payload.study_code.strip()
     study = db.query(Study).filter(Study.study_code == code).first()
     if study:
+        # Check before dossier changes and their early commit, for both ID/code lookup.
+        ensure_no_execution_for_full_replan(db, study)
         if study.status == StudyStatus.DRAFT:
             if not payload.title:
                 study.title = f"{template.standard} {template.title} ({code})"
@@ -395,8 +400,8 @@ def api_schedule_new_study(
     yeni çalışmanın adımlarını ve çakışmalarını (9 saat iş yükü, biyolojik kilitler, kaynak çakışmaları)
     tespit eder ve Conflict tablosuna kaydeder.
     """
-    study = _resolve_or_create_draft_study(db, payload)
     try:
+        study = _resolve_or_create_draft_study(db, payload)
         result = schedule_new_study(
             db=db,
             study_id=study.id,
