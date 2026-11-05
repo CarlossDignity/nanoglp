@@ -23,6 +23,17 @@ const STATUS_BADGE = {
   DELAYED: { label: 'Gecikti', cls: 'bg-red-50 text-red-700 border-red-200' },
 };
 
+// Missing/unknown study statuses are previews too: only explicit approval permits execution.
+function canExecuteTask(task) {
+  return task?.study_status === 'APPROVED' || task?.study_status === 'IN_PROGRESS';
+}
+
+function executionRestriction(task) {
+  return task.study_status === 'DRAFT'
+    ? 'Plan onayı bekleniyor'
+    : 'Çalışma durumu görev yürütmeye uygun değil';
+}
+
 function toLocalInputValue(isoStr) {
   if (!isoStr) return '';
   return String(isoStr).slice(0, 16);
@@ -106,6 +117,7 @@ export default function MyTasks() {
       typeof taskOrId === 'object' && taskOrId !== null
         ? taskOrId
         : (data?.all_assigned_tasks || []).find((x) => x.id === taskOrId) || { id: taskOrId };
+    if (!canExecuteTask(taskObj)) return;
     const stepId = taskObj.id;
     const startVal = (startInputs[stepId] || '').trim();
     const endVal = (endInputs[stepId] || '').trim();
@@ -162,7 +174,7 @@ export default function MyTasks() {
   };
 
   const handleSaveReferenceTime = async (task) => {
-    if (isReadOnly) return;
+    if (isReadOnly || !canExecuteTask(task)) return;
     const stepId = task.id;
     const refVal = (refInputs[stepId] || '').trim();
     if (!refVal) {
@@ -241,6 +253,7 @@ export default function MyTasks() {
             <input
               type="datetime-local"
               data-testid={`actual-start-input-${task.id}`}
+              disabled={!canExecuteTask(task)}
               value={startInputs[task.id] || ''}
               onChange={(e) =>
                 setStartInputs((prev) => ({
@@ -257,6 +270,7 @@ export default function MyTasks() {
             <input
               type="datetime-local"
               data-testid={`actual-end-input-${task.id}`}
+              disabled={!canExecuteTask(task)}
               value={endInputs[task.id] || ''}
               onChange={(e) =>
                 setEndInputs((prev) => ({
@@ -272,6 +286,7 @@ export default function MyTasks() {
             <input
               type="checkbox"
               data-testid={`preserve-missing-actuals-${task.id}`}
+              disabled={!canExecuteTask(task)}
               checked={Boolean(preserveMissingInputs[task.id])}
               onChange={(e) =>
                 setPreserveMissingInputs((prev) => ({
@@ -369,6 +384,7 @@ export default function MyTasks() {
               <input
                 type="datetime-local"
                 data-testid={`ref-time-input-${task.id}`}
+                disabled={!canExecuteTask(task)}
                 value={refInputs[task.id] || ''}
                 onChange={(e) =>
                   setRefInputs((prev) => ({
@@ -382,6 +398,7 @@ export default function MyTasks() {
             <input
               type="text"
               data-testid={`deviation-note-input-${task.id}`}
+              disabled={!canExecuteTask(task)}
               placeholder="Sapma / GLP açıklama notu (opsiyonel)"
               value={noteInputs[task.id] || ''}
               onChange={(e) =>
@@ -394,7 +411,7 @@ export default function MyTasks() {
             />
             <button
               type="button"
-              disabled={busy}
+              disabled={busy || !canExecuteTask(task)}
               data-testid={`save-ref-time-btn-${task.id}`}
               onClick={() => handleSaveReferenceTime(task)}
               className="inline-flex items-center gap-1 text-xs font-semibold px-3 py-1.5 rounded bg-blue-600 hover:bg-blue-700 text-white disabled:opacity-50"
@@ -609,7 +626,7 @@ export default function MyTasks() {
                       <div className="flex flex-wrap items-center gap-2">
                         <button
                           type="button"
-                          disabled={busy}
+                          disabled={busy || !canExecuteTask(task)}
                           data-testid={`toggle-actual-times-btn-${task.id}`}
                           onClick={() =>
                             setLatePanelOpen((prev) => ({
@@ -624,7 +641,7 @@ export default function MyTasks() {
                         {task.status === 'PENDING' && (
                           <button
                             type="button"
-                            disabled={busy}
+                            disabled={busy || !canExecuteTask(task)}
                             data-testid={`start-task-btn-${task.id}`}
                             onClick={() => handleStatusChange(task, 'IN_PROGRESS')}
                             className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-md bg-slate-900 hover:bg-slate-800 text-white disabled:opacity-50"
@@ -635,7 +652,7 @@ export default function MyTasks() {
                         {task.status !== 'COMPLETED' && (
                           <button
                             type="button"
-                            disabled={busy}
+                            disabled={busy || !canExecuteTask(task)}
                             data-testid={`complete-task-btn-${task.id}`}
                             onClick={() => handleStatusChange(task, 'COMPLETED')}
                             className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-md bg-emerald-600 hover:bg-emerald-700 text-white disabled:opacity-50"
@@ -646,6 +663,9 @@ export default function MyTasks() {
                       </div>
                     )}
                   </div>
+                  {!canExecuteTask(task) && (
+                    <p className="mt-2 text-xs text-amber-800">{executionRestriction(task)}</p>
+                  )}
                   {renderActualTimesPanel(task)}
                   {renderReferenceTimePanel(task)}
                 </li>
@@ -706,6 +726,9 @@ export default function MyTasks() {
                       </td>
                       <td className="px-5 py-3 font-mono text-xs text-slate-700">
                         {t.study_code}
+                        {!canExecuteTask(t) && (
+                          <p className="mt-1 font-sans text-xs text-amber-800">{executionRestriction(t)}</p>
+                        )}
                         {t.study_status === 'DRAFT' && (
                           <span className="ml-1.5 font-sans text-[10px] px-1.5 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-200">
                             TASLAK
@@ -736,7 +759,7 @@ export default function MyTasks() {
                           {t.status !== 'COMPLETED' ? (
                             <button
                               type="button"
-                              disabled={busy}
+                              disabled={busy || !canExecuteTask(t)}
                               onClick={() =>
                                 handleStatusChange(t, t.status === 'PENDING' ? 'IN_PROGRESS' : 'COMPLETED')
                               }
