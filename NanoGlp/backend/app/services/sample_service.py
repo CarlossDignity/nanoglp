@@ -21,6 +21,7 @@ from app.models.sample import APPROVAL_ROLES, WORKFLOW_STEPS, SampleRecord
 from app.models.study import Study, StudyStatus
 from app.models.study_step import StepStatus, StudyStep
 from app.models.user import User, UserRole
+from app.utils.facility_time import facility_today
 from app.services.capacity_service import get_auto_schedule_notice, next_business_day
 from app.services.templates import DEFAULT_TEMPLATE_CODE, TEMPLATES, get_template, resolve_template_code
 
@@ -200,7 +201,7 @@ def _approvals_done(state: Dict[str, Any]) -> bool:
     return all(k in ap for k in APPROVAL_ROLES)
 
 
-REFERENCE_DATE = date(2026, 11, 3)
+REFERENCE_DATE = date(2026, 11, 3)  # Historical compatibility boundary, never the live clock.
 
 # FAZ 9.3: Excel 4. Sekme (SPONSOR SÖZLŞ.-SPONSOR AGREEM.) firma sözleşme ve taahhüt tarihleri kataloğu
 SPONSOR_AGREEMENT_CATALOG: Dict[str, Dict[str, Any]] = {
@@ -430,9 +431,10 @@ def compute_next_study_codes(db: Session) -> Dict[str, str]:
 
 
 def build_stepper(
-    sample: SampleRecord, study: Optional[Study], has_schedule: bool, perms: Dict[str, Any]
+    sample: SampleRecord, study: Optional[Study], has_schedule: bool, perms: Dict[str, Any],
+    today: Optional[date] = None,
 ) -> List[Dict[str, Any]]:
-    today = date.today()
+    today = today or facility_today()
     wf = _wf(sample)
     start, end = sample.planned_start, sample.planned_end
     anim_info = classify_animal_consumable_status(sample.animal_consumable_status)
@@ -538,8 +540,8 @@ def build_stepper(
     return out
 
 
-def effective_status(sample: SampleRecord, stepper: List[Dict[str, Any]]) -> str:
-    today = date.today()
+def effective_status(sample: SampleRecord, stepper: List[Dict[str, Any]], today: Optional[date] = None) -> str:
+    today = today or facility_today()
     stored = (sample.stored_status or "").upper()
     if stored == "CANCELLED":
         return "CANCELLED"
@@ -559,8 +561,8 @@ def effective_status(sample: SampleRecord, stepper: List[Dict[str, Any]]) -> str
     return "EXPECTED"
 
 
-def overdue_reasons(sample: SampleRecord, status: str, stepper: List[Dict[str, Any]]) -> List[str]:
-    today = date.today()
+def overdue_reasons(sample: SampleRecord, status: str, stepper: List[Dict[str, Any]], today: Optional[date] = None) -> List[str]:
+    today = today or facility_today()
     reasons: List[str] = []
     if status in ("COMPLETED", "CANCELLED"):
         return reasons
@@ -581,14 +583,16 @@ def serialize_sample(
     all_samples: Optional[List[SampleRecord]] = None,
     detailed: bool = True,
     sync_schedule_dates: bool = True,
+    today: Optional[date] = None,
 ) -> Dict[str, Any]:
+    today = today or facility_today()
     study = find_study(db, s.study_code)
     has_schedule = _study_has_steps(db, study)
     if has_schedule and sync_schedule_dates:
         sync_dates_from_study(db, s, study)
-    stepper = build_stepper(s, study, has_schedule, perms)
-    status = effective_status(s, stepper)
-    reasons = overdue_reasons(s, status, stepper)
+    stepper = build_stepper(s, study, has_schedule, perms, today=today)
+    status = effective_status(s, stepper, today=today)
+    reasons = overdue_reasons(s, status, stepper, today=today)
     end = s.planned_end
 
     # FAZ 9.3: Hayvan / Sarf durumu ve Karantina (+7g) TAT hesabı
@@ -609,7 +613,7 @@ def serialize_sample(
     ongoing_phase = None
     ongoing_phase_label = None
     if status == "ONGOING":
-        if s.experiment_end_date and s.experiment_end_date < REFERENCE_DATE:
+        if s.experiment_end_date and s.experiment_end_date < today:
             ongoing_phase = "IN_REPORTING_QA"
             ongoing_phase_label = "Rapor / QA Bekliyor"
         else:
@@ -620,7 +624,7 @@ def serialize_sample(
         status == "ONGOING"
         and (s.glp_type or "GLP") == "GLP"
         and s.draft_report_date is not None
-        and s.draft_report_date < REFERENCE_DATE
+        and s.draft_report_date < today
     )
 
     # FAZ 9.3: Sponsor sözleşme ve müşteri taahhüt (planlanan gönderim) tarihi eşleştirmesi
@@ -634,7 +638,7 @@ def serialize_sample(
         and (
             (draft_dt is not None and draft_dt > commit_dt)
             or (final_dt is not None and final_dt > commit_dt)
-            or (REFERENCE_DATE > commit_dt)
+            or (today > commit_dt)
         )
     )
     if is_contract_deadline_exceeded:
@@ -1985,7 +1989,8 @@ def export_samples_workbook_bytes(db: Session, perms: Dict[str, Any]) -> bytes:
         )
         .all()
     )
-    rows = [serialize_sample(db, s, perms) for s in samples]
+    today = facility_today()
+    rows = [serialize_sample(db, s, perms, today=today) for s in samples]
 
     wb = Workbook()
     ws = wb.active

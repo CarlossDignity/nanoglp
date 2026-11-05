@@ -52,6 +52,8 @@ def workbook(code="GLP2026-901", lot="LOT-A", duplicate=False, blank=False):
 
 class ExcelUpdates(unittest.TestCase):
     def setUp(self):
+        # Live indicators must not depend on the machine's calendar date.
+        self.enterContext(patch("app.utils.facility_time.facility_now", return_value=datetime(2026, 11, 5, 12)))
         reset_schema()
         self.db = SessionLocal()
         self.user = seed_personnel(self.db)[1]
