@@ -29,10 +29,13 @@ from app.services.templates import DEFAULT_TEMPLATE_CODE, TemplateStep, get_temp
 from app.services.capacity_service import (
     apply_restriction_shift,
     build_capacity_report,
+    compute_peak_concurrent_details,
     evaluate_capacity_conflicts,
+    evaluate_study_capacity_conflicts,
     find_first_free_g0,
     get_auto_schedule_notice,
     is_capacity_conflict,
+    peak_concurrent_usage,
     persist_auto_schedule_notice,
 )
 
@@ -79,6 +82,30 @@ def _working_hours_issue(start: datetime, end: datetime) -> Optional[str]:
         return (f"mesai saatleri ({WORKDAY_START:%H:%M}–{WORKDAY_END:%H:%M}) dışına taşıyor "
                 f"({start:%H:%M}–{end:%H:%M})")
     return None
+
+
+def _get_human_task_window(step: StudyStep) -> Tuple[datetime, datetime]:
+    """
+    Bir adımın insan (teknisyen) iş yükü ve mesai/personel çakışma penceresini döner.
+    Eğer adım doğrudan 24s/72s gibi uzun süreli bir cihaz/ekstraksiyon penceresi taşıyorsa
+    (`planned_end - planned_start >= 24 saat`), cihaz o süre boyunca çalışırken teknisyen
+    yalnız başlangıçtaki kurulum süresinde (90 dk) fiziksel olarak görev yapar.
+    """
+    s_dt = step.planned_start
+    e_dt = step.planned_end
+    if (
+        s_dt is not None
+        and e_dt is not None
+        and (e_dt - s_dt) >= timedelta(hours=24)
+        and (
+            step.equipment_id is not None
+            or step.step_type == "Ekstraksiyon"
+            or "Ekstraksiyon" in (step.step_name or "")
+            or "İnkübatör" in (step.step_name or "")
+        )
+    ):
+        return s_dt, s_dt + timedelta(minutes=90)
+    return s_dt, e_dt
 
 
 # ---------------------------------------------------------------------------
@@ -132,8 +159,11 @@ def calculate_personnel_workload(
     tasks = []
     for step in steps:
         st_obj = study_steps_override[0] if (study_steps_override and step.study_id == study_steps_override[0].id) else step.study
+        h_start, h_end = _get_human_task_window(step)
         # Görevin o gün içerisine düşen süresi (gece yarısını aşan görevler bölünür)
-        minutes = _overlap_minutes(step.planned_start, step.planned_end, day_start, day_end + timedelta(microseconds=1))
+        minutes = _overlap_minutes(h_start, h_end, day_start, day_end + timedelta(microseconds=1))
+        if minutes <= 0:
+            continue
         total_minutes += minutes
         tasks.append({
             "step_id": step.id,
@@ -142,8 +172,8 @@ def calculate_personnel_workload(
             "study_status": st_obj.status.value,
             "step_name": step.step_name,
             "study_day": step.study_day,
-            "planned_start": step.planned_start.isoformat(),
-            "planned_end": step.planned_end.isoformat(),
+            "planned_start": h_start.isoformat(),
+            "planned_end": h_end.isoformat(),
             "minutes": minutes,
             "is_biological_fixed_time": step.is_biological_fixed_time,
         })
@@ -534,6 +564,43 @@ def get_study_extraction_usage(study: Optional[Study], has_extraction_step: bool
     }
 
 
+def _get_water_bath_window(step: StudyStep) -> Tuple[datetime, datetime]:
+    """
+    Bir ekstraksiyon adımının Çalkalamalı Su Banyosu (EQ-WB-001) rezervasyon penceresini `[start, end)` döner:
+      - Adımın `planned_end - planned_start` süresi >= 4 saat ise (doğrudan 24s veya 72s pencere
+        olarak tanımlanmışsa) `[planned_start, planned_end)` kullanılır.
+      - Adım yalnız teknisyen kurulum süresini (örn. 90 dk) taşıyorsa, adım adında '24 saat'
+        geçiyorsa +24 saat, aksi halde standart +72 saat rezervasyon penceresi kullanılır.
+    """
+    wb_start = step.planned_start
+    if step.planned_end is not None and (step.planned_end - wb_start) >= timedelta(hours=4):
+        return wb_start, step.planned_end
+    name_low = (step.step_name or "").lower()
+    if "24 saat" in name_low or "24h" in name_low or "24 s" in name_low:
+        return wb_start, wb_start + timedelta(hours=24)
+    return wb_start, wb_start + timedelta(hours=72)
+
+
+def _is_water_bath_extraction_step(
+    step: StudyStep,
+    water_bath: Optional[Equipment] = None,
+    study_ext_usage: Optional[Dict[str, Any]] = None,
+) -> bool:
+    if step.step_type == "Ekstraksiyon" or "Ekstraksiyon" in (step.step_name or ""):
+        return True
+    ext_u = study_ext_usage or get_study_extraction_usage(getattr(step, "study", None))
+    if (
+        water_bath is not None
+        and step.equipment_id == water_bath.id
+        and (ext_u.get("uses_polar") or ext_u.get("uses_apolar"))
+        and step.planned_start is not None
+        and step.planned_end is not None
+        and (step.planned_end - step.planned_start) >= timedelta(hours=4)
+    ):
+        return True
+    return False
+
+
 def _find_next_available_water_bath_offset(
     db: Session,
     study: Study,
@@ -544,32 +611,59 @@ def _find_next_available_water_bath_offset(
 ) -> Tuple[int, date]:
     """
     Çalkalamalı Su Banyosu 1 (EQ-WB-001) cihazının bu çalışmanın Polar/Apolar ekstraksiyonu için
-    72 saat boyunca müsait olduğu ilk günü (ve G4'e göre gün ofsetini) bulur.
+    yarı-açık `[start, end)` aralığında tepe eşzamanlı kullanım (`peak_concurrent_usage`) kapasitesini
+    aşmadan müsait olduğu ilk günü (ve G4'e göre gün ofsetini) bulur.
     """
     max_polar = water_bath.polar_capacity or 3
     max_apolar = water_bath.non_polar_capacity or 1
     study_ext = get_study_extraction_usage(study)
-    ex_steps = [ex for ex in existing_steps if ex.step_type == "Ekstraksiyon" or "Ekstraksiyon" in ex.step_name]
+    ex_steps = [
+        ex
+        for ex in existing_steps
+        if ex.status != StepStatus.CANCELLED
+        and not is_historical_unverified_step(ex, getattr(ex, "study", None))
+        and (not getattr(ex, "study", None) or ex.study.status not in (StudyStatus.COMPLETED, StudyStatus.CANCELLED))
+        and _is_water_bath_extraction_step(ex, water_bath=water_bath)
+    ]
+
+    apolar_intervals: List[Tuple[datetime, datetime, Any, Any]] = []
+    polar_intervals: List[Tuple[datetime, datetime, Any, Any]] = []
+    for ex in ex_steps:
+        other_start, other_end = _get_water_bath_window(ex)
+        ex_ext = get_study_extraction_usage(getattr(ex, "study", None))
+        key_id = ex.study_id if ex.study_id is not None else ex.id
+        if ex_ext["uses_apolar"]:
+            apolar_intervals.append((other_start, other_end, ex.study or ex, key_id))
+        if ex_ext["uses_polar"]:
+            polar_intervals.append((other_start, other_end, ex.study or ex, key_id))
+
+    own_ex_step = (
+        db.query(StudyStep)
+        .filter(StudyStep.study_id == study.id, StudyStep.status != StepStatus.CANCELLED)
+        .order_by(StudyStep.step_order.asc())
+        .all()
+        if getattr(study, "id", None) is not None
+        else []
+    )
+    own_wb_hours = 72.0
+    own_start_tod = time(8, 0)
+    for os_step in own_ex_step:
+        if _is_water_bath_extraction_step(os_step, water_bath=water_bath, study_ext_usage=study_ext):
+            s_w, e_w = _get_water_bath_window(os_step)
+            own_start_tod = s_w.time()
+            own_wb_hours = max(1.0, (e_w - s_w).total_seconds() / 3600.0)
+            break
 
     for candidate_offset in range(max(0, current_offset) + 1, max(0, current_offset) + 60):
         cand_ex_date = acclimatization_start_date + timedelta(days=4 + candidate_offset)
-        wb_start = datetime.combine(cand_ex_date, time(8, 0))
-        wb_end = wb_start + timedelta(hours=72)
+        wb_start = datetime.combine(cand_ex_date, own_start_tod)
+        wb_end = wb_start + timedelta(hours=own_wb_hours)
 
-        apolar_busy = 0
-        polar_busy = 0
-        for ex in ex_steps:
-            other_start = ex.planned_start
-            other_end = other_start + timedelta(hours=72)
-            if _overlap_minutes(wb_start, wb_end, other_start, other_end) > 0:
-                ex_ext = get_study_extraction_usage(getattr(ex, "study", None))
-                if ex_ext["uses_apolar"]:
-                    apolar_busy += 1
-                if ex_ext["uses_polar"]:
-                    polar_busy += 1
+        apolar_peak = peak_concurrent_usage(wb_start, wb_end, apolar_intervals, include_self=True)
+        polar_peak = peak_concurrent_usage(wb_start, wb_end, polar_intervals, include_self=True)
 
-        apolar_ok = (not study_ext["uses_apolar"]) or (1 + apolar_busy <= max_apolar)
-        polar_ok = (not study_ext["uses_polar"]) or (1 + polar_busy <= max_polar)
+        apolar_ok = (not study_ext["uses_apolar"]) or (apolar_peak <= max_apolar)
+        polar_ok = (not study_ext["uses_polar"]) or (polar_peak <= max_polar)
         if apolar_ok and polar_ok:
             return candidate_offset, cand_ex_date
 
@@ -1308,8 +1402,9 @@ def evaluate_study_conflicts(
             continue
 
         if step.status != StepStatus.COMPLETED:
+            step_h_start, step_h_end = _get_human_task_window(step)
             # 6a) Biyolojik kilitli adım mesai dışı / hafta sonu → WARNING (Nöbetçi personel onayı veya Cuma hizalama sunulur)
-            issue = _working_hours_issue(step.planned_start, step.planned_end)
+            issue = _working_hours_issue(step_h_start, step_h_end)
             if step.is_biological_fixed_time and issue and step.id not in approved_wk_steps:
                 conflict = register_biological_time_violation(
                     db,
@@ -1328,14 +1423,15 @@ def evaluate_study_conflicts(
                     if person.id not in existing_assignees.get(ex.id, set()):
                         continue
                     other = ex.study
-                    ov = _overlap_minutes(step.planned_start, step.planned_end, ex.planned_start, ex.planned_end)
+                    ex_h_start, ex_h_end = _get_human_task_window(ex)
+                    ov = _overlap_minutes(step_h_start, step_h_end, ex_h_start, ex_h_end)
                     if ov > 0:
                         pair_key = ("PLANNED", step.id, ex.id, person.id)
                         if pair_key not in recorded_overlap_keys:
                             recorded_overlap_keys.add(pair_key)
                             context = (
                                 f"{person.full_name}, {other.study_code} ({other.status.value}) çalışmasının "
-                                f"'{ex.step_name}' görevinde ({_fmt(ex.planned_start)}–{ex.planned_end:%H:%M}) zaten "
+                                f"'{ex.step_name}' görevinde ({_fmt(ex_h_start)}–{ex_h_end:%H:%M}) zaten "
                                 f"görevli; {ov} dk örtüşme."
                             )
                             if step.is_biological_fixed_time:
@@ -1345,7 +1441,7 @@ def evaluate_study_conflicts(
                                         severity=ConflictSeverity.CRITICAL,
                                         title=f"Personel Çakışması (Biyolojik Kilitli Adım): Gün {step.study_day} — {person.full_name}",
                                         description=(
-                                            f"'{step.step_name}' biyolojik kilitli (planlanan: {_fmt(step.planned_start)}, "
+                                            f"'{step.step_name}' biyolojik kilitli (planlanan: {_fmt(step_h_start)}, "
                                             f"tolerans ±{step.biological_tolerance_minutes} dk). {context} "
                                             f"Bu rolde o saatte boşta başka yetkin personel bulunamadı."
                                         ),
@@ -1373,7 +1469,7 @@ def evaluate_study_conflicts(
                     ex_shifted = other_shifted_windows.get(ex.id)
                     if ex_shifted is not None:
                         ex_exp_start, ex_exp_end = ex_shifted
-                        ov_exp = _overlap_minutes(step.planned_start, step.planned_end, ex_exp_start, ex_exp_end)
+                        ov_exp = _overlap_minutes(step_h_start, step_h_end, ex_exp_start, ex_exp_end)
                         if ov_exp > 0:
                             pair_key_exp = ("EXPECTED_OTHER", step.id, ex.id, person.id)
                             if pair_key_exp not in recorded_overlap_keys:
@@ -1387,7 +1483,7 @@ def evaluate_study_conflicts(
                                             f"Gün {step.study_day} — {person.full_name}"
                                         ),
                                         description=(
-                                            f"'{step.step_name}' görevi ({_fmt(step.planned_start)}–{step.planned_end:%H:%M}), "
+                                            f"'{step.step_name}' görevi ({_fmt(step_h_start)}–{step_h_end:%H:%M}), "
                                             f"{person.full_name} personelinin {other.study_code} ({other.status.value}) "
                                             f"çalışmasındaki '{ex.step_name}' adımının referans gecikmesi sonrası beklenen "
                                             f"biyolojik penceresiyle ({_fmt(ex_exp_start)}–{ex_exp_end:%H:%M}) {ov_exp} dk çakışıyor."
@@ -1409,8 +1505,9 @@ def evaluate_study_conflicts(
                         continue
                     if not any(u.id == person.id for u in own_other.assignees):
                         continue
+                    own_h_start, own_h_end = _get_human_task_window(own_other)
                     ov_own = _overlap_minutes(
-                        step.planned_start, step.planned_end, own_other.planned_start, own_other.planned_end
+                        step_h_start, step_h_end, own_h_start, own_h_end
                     )
                     if ov_own > 0:
                         intra_planned_key = (
@@ -1427,8 +1524,8 @@ def evaluate_study_conflicts(
                                     severity=ConflictSeverity.CRITICAL,
                                     title=f"Personel Çakışması (Çalışma İçi): Gün {step.study_day} — {person.full_name}",
                                     description=(
-                                        f"Aynı çalışmadaki '{step.step_name}' ({_fmt(step.planned_start)}–{step.planned_end:%H:%M}) "
-                                        f"ve '{own_other.step_name}' ({_fmt(own_other.planned_start)}–{own_other.planned_end:%H:%M}) "
+                                        f"Aynı çalışmadaki '{step.step_name}' ({_fmt(step_h_start)}–{step_h_end:%H:%M}) "
+                                        f"ve '{own_other.step_name}' ({_fmt(own_h_start)}–{own_h_end:%H:%M}) "
                                         f"adımları {person.full_name} personeli için {ov_own} dk çakışıyor."
                                     ),
                                     study_id=study.id,
@@ -1438,38 +1535,41 @@ def evaluate_study_conflicts(
                                 [step.id, own_other.id],
                             )
 
-        # 6c) Cihaz çakışması — Çalkalamalı Su Banyosu 1 (EQ-WB-001) Polar & Apolar 72s Kapasite Kilidi
-        # Kurulum adımı (90 dk) COMPLETED olsa bile 72 saatlik su banyosu rezervasyonu devam eder.
+        # 6c) Cihaz çakışması — Çalkalamalı Su Banyosu 1 (EQ-WB-001) Polar & Apolar Kapasite Kilidi
+        # ve Genel / Uzun Süreli Cihaz Eşzamanlı Tepe Kullanım (Peak Concurrent Usage) Denetimi:
+        # Kurulum adımı (90 dk) COMPLETED olsa bile su banyosu / uzun süreli cihaz rezervasyonu devam eder.
         # Bilinmeyen (None) ekstraksiyon bilgisi ASLA True (kesin polar kullanımı) olarak varsayılmaz.
-        is_extraction = step.step_type == "Ekstraksiyon" or "Ekstraksiyon" in step.step_name
+        # Yarı-açık aralık kuralına (`[start, end)`) göre hedef pencereyle kesişen diğer çalışmalar
+        # doğrudan toplanmaz; herhangi bir `t` anındaki maksimum eşzamanlı kullanım (`peak_concurrent_usage`) baz alınır.
+        is_extraction = _is_water_bath_extraction_step(step, water_bath=water_bath, study_ext_usage=study_ext_usage)
         study_uses_polar = study_ext_usage["uses_polar"]
         study_uses_apolar = study_ext_usage["uses_apolar"]
         if is_extraction and (study_uses_polar or study_uses_apolar):
-            wb_start = step.planned_start
-            wb_end = step.planned_start + timedelta(hours=72)
-            overlapping_apolar: List[Study] = []
-            overlapping_polar: List[Study] = []
+            wb_start, wb_end = _get_water_bath_window(step)
+            apolar_intervals: List[Tuple[datetime, datetime, Study, Any]] = []
+            polar_intervals: List[Tuple[datetime, datetime, Study, Any]] = []
 
             for ex in active_equipment_steps:
-                ex_is_extraction = ex.step_type == "Ekstraksiyon" or "Ekstraksiyon" in ex.step_name
-                if not ex_is_extraction:
+                if not _is_water_bath_extraction_step(ex, water_bath=water_bath):
                     continue
-                other_wb_start = ex.planned_start
-                other_wb_end = ex.planned_start + timedelta(hours=72)
+                other_wb_start, other_wb_end = _get_water_bath_window(ex)
                 if _overlap_minutes(wb_start, wb_end, other_wb_start, other_wb_end) > 0:
                     ex_usage = get_study_extraction_usage(getattr(ex, "study", None))
-                    ex_uses_apolar = ex_usage["uses_apolar"]
-                    ex_uses_polar = ex_usage["uses_polar"]
-                    if ex_uses_apolar and ex.study not in overlapping_apolar:
-                        overlapping_apolar.append(ex.study)
-                    if ex_uses_polar and ex.study not in overlapping_polar:
-                        overlapping_polar.append(ex.study)
+                    ex_key = ex.study_id if ex.study_id is not None else ex.id
+                    if ex_usage["uses_apolar"] and ex.study is not None:
+                        apolar_intervals.append((other_wb_start, other_wb_end, ex.study, ex_key))
+                    if ex_usage["uses_polar"] and ex.study is not None:
+                        polar_intervals.append((other_wb_start, other_wb_end, ex.study, ex_key))
 
             max_apolar = water_bath.non_polar_capacity or 1
             max_polar = water_bath.polar_capacity or 3
 
-            if study_uses_apolar and (1 + len(overlapping_apolar) > max_apolar):
-                other_codes = ", ".join(f"{s.study_code} ({s.status.value})" for s in overlapping_apolar)
+            apolar_peak_info = compute_peak_concurrent_details(wb_start, wb_end, apolar_intervals)
+            polar_peak_info = compute_peak_concurrent_details(wb_start, wb_end, polar_intervals)
+
+            if study_uses_apolar and apolar_peak_info["peak_total"] > max_apolar:
+                peak_apolar_studies = apolar_peak_info["peak_items"] or apolar_peak_info["overlapping_items"]
+                other_codes = ", ".join(f"{s.study_code} ({s.status.value})" for s in peak_apolar_studies)
                 record(
                     Conflict(
                         conflict_type=ConflictType.EQUIPMENT_OVERLAP,
@@ -1478,18 +1578,19 @@ def evaluate_study_conflicts(
                         description=(
                             f"'{water_bath.name} ({water_bath.code})' cihazında {_fmt(wb_start)} – {_fmt(wb_end)} "
                             f"(72 saatlik ekstraksiyon) penceresinde Apolar/Non-Polar kapasitesi (Max: {max_apolar} çalışma) "
-                            f"aşıldı. Bu çalışma ile birlikte eşzamanlı {1 + len(overlapping_apolar)} Apolar çalışma "
+                            f"aşıldı. Bu çalışma ile birlikte eşzamanlı {apolar_peak_info['peak_total']} Apolar çalışma "
                             f"({other_codes}) çakışıyor."
                         ),
                         study_id=study.id,
                         step_id=step.id,
-                        related_study_id=overlapping_apolar[0].id,
+                        related_study_id=peak_apolar_studies[0].id if peak_apolar_studies else None,
                     ),
                     [step.id],
                 )
 
-            if study_uses_polar and (1 + len(overlapping_polar) > max_polar):
-                other_codes = ", ".join(f"{s.study_code} ({s.status.value})" for s in overlapping_polar)
+            if study_uses_polar and polar_peak_info["peak_total"] > max_polar:
+                peak_polar_studies = polar_peak_info["peak_items"] or polar_peak_info["overlapping_items"]
+                other_codes = ", ".join(f"{s.study_code} ({s.status.value})" for s in peak_polar_studies)
                 record(
                     Conflict(
                         conflict_type=ConflictType.EQUIPMENT_OVERLAP,
@@ -1498,20 +1599,47 @@ def evaluate_study_conflicts(
                         description=(
                             f"'{water_bath.name} ({water_bath.code})' cihazında {_fmt(wb_start)} – {_fmt(wb_end)} "
                             f"(72 saatlik ekstraksiyon) penceresinde Polar kapasitesi (Max: {max_polar} çalışma) "
-                            f"aşıldı. Bu çalışma ile birlikte eşzamanlı {1 + len(overlapping_polar)} Polar çalışma "
+                            f"aşıldı. Bu çalışma ile birlikte eşzamanlı {polar_peak_info['peak_total']} Polar çalışma "
                             f"({other_codes}) çakışıyor."
                         ),
                         study_id=study.id,
                         step_id=step.id,
-                        related_study_id=overlapping_polar[0].id,
+                        related_study_id=peak_polar_studies[0].id if peak_polar_studies else None,
                     ),
                     [step.id],
                 )
-        elif step.equipment_id and not is_extraction and step.status != StepStatus.COMPLETED:
-            for ex in active_equipment_steps:
-                if ex.equipment_id == step.equipment_id and _overlap_minutes(
-                    step.planned_start, step.planned_end, ex.planned_start, ex.planned_end
-                ) > 0:
+        elif step.equipment_id and not is_extraction and (
+            step.status != StepStatus.COMPLETED
+            or (step.planned_end is not None and step.planned_start is not None and (step.planned_end - step.planned_start) >= timedelta(hours=4))
+        ):
+            eq_obj = db.query(Equipment).filter(Equipment.id == step.equipment_id).first()
+            raw_cap = int((getattr(eq_obj, "max_concurrent_studies", None) if eq_obj else None) or 1)
+            step_is_long = bool(
+                step.planned_start is not None
+                and step.planned_end is not None
+                and (step.planned_end - step.planned_start) >= timedelta(hours=4)
+            )
+            overlapping_other_eq = [
+                ex
+                for ex in active_equipment_steps
+                if ex.equipment_id == step.equipment_id
+                and _overlap_minutes(step.planned_start, step.planned_end, ex.planned_start, ex.planned_end) > 0
+            ]
+            any_long_overlap = step_is_long or any(
+                (ex.planned_end - ex.planned_start) >= timedelta(hours=4)
+                for ex in overlapping_other_eq
+                if ex.planned_start and ex.planned_end
+            )
+            # 1-2 saatlik kısa adım çakışmalarında varsayılan 4 kapasiteli uzun süreli cihazlar (EQ-WB-001 / EQ-INC-001)
+            # tekil adım ekipmanı olarak atanmışsa 1 kapasiteyle denetlenir; uzun süreli (>= 4s) veya özel kapasiteli
+            # cihazlarda ise `max_concurrent_studies` ve sweep-line `peak_concurrent_usage` kullanılır.
+            if not any_long_overlap and eq_obj is not None and eq_obj.code in ("EQ-WB-001", "EQ-INC-001") and raw_cap == 4:
+                eq_cap = 1
+            else:
+                eq_cap = max(1, raw_cap)
+
+            if eq_cap == 1:
+                for ex in overlapping_other_eq:
                     record(
                         Conflict(
                             conflict_type=ConflictType.EQUIPMENT_OVERLAP,
@@ -1524,28 +1652,68 @@ def evaluate_study_conflicts(
                         ),
                         [step.id],
                     )
-            for own_eq in steps:
-                if (
-                    own_eq.id != step.id
-                    and own_eq.status not in (StepStatus.COMPLETED, StepStatus.CANCELLED)
-                    and own_eq.equipment_id == step.equipment_id
-                    and _overlap_minutes(step.planned_start, step.planned_end, own_eq.planned_start, own_eq.planned_end) > 0
-                ):
-                    eq_intra_key = ("EQ_INTRA", min(step.id, own_eq.id), max(step.id, own_eq.id), step.equipment_id)
-                    if eq_intra_key not in recorded_overlap_keys:
-                        recorded_overlap_keys.add(eq_intra_key)
-                        record(
-                            Conflict(
-                                conflict_type=ConflictType.EQUIPMENT_OVERLAP,
-                                severity=ConflictSeverity.CRITICAL,
-                                title=f"Cihaz Çakışması (Çalışma İçi): Gün {step.study_day} — Ekipman #{step.equipment_id}",
-                                description=f"Cihaz aynı çalışmanın '{own_eq.step_name}' adımında eşzamanlı kullanımda.",
-                                study_id=study.id,
-                                step_id=step.id,
-                                related_study_id=study.id,
+                for own_eq in steps:
+                    if (
+                        own_eq.id != step.id
+                        and own_eq.status not in (StepStatus.COMPLETED, StepStatus.CANCELLED)
+                        and own_eq.equipment_id == step.equipment_id
+                        and _overlap_minutes(step.planned_start, step.planned_end, own_eq.planned_start, own_eq.planned_end) > 0
+                    ):
+                        eq_intra_key = ("EQ_INTRA", min(step.id, own_eq.id), max(step.id, own_eq.id), step.equipment_id)
+                        if eq_intra_key not in recorded_overlap_keys:
+                            recorded_overlap_keys.add(eq_intra_key)
+                            record(
+                                Conflict(
+                                    conflict_type=ConflictType.EQUIPMENT_OVERLAP,
+                                    severity=ConflictSeverity.CRITICAL,
+                                    title=f"Cihaz Çakışması (Çalışma İçi): Gün {step.study_day} — Ekipman #{step.equipment_id}",
+                                    description=f"Cihaz aynı çalışmanın '{own_eq.step_name}' adımında eşzamanlı kullanımda.",
+                                    study_id=study.id,
+                                    step_id=step.id,
+                                    related_study_id=study.id,
+                                ),
+                                [step.id, own_eq.id],
+                            )
+            else:
+                eq_intervals: List[Tuple[datetime, datetime, StudyStep, Any]] = []
+                for ex in overlapping_other_eq:
+                    ex_key = ("OTHER", ex.study_id if ex.study_id is not None else ex.id)
+                    eq_intervals.append((ex.planned_start, ex.planned_end, ex, ex_key))
+                for own_eq in steps:
+                    if (
+                        own_eq.id != step.id
+                        and own_eq.status not in (StepStatus.COMPLETED, StepStatus.CANCELLED)
+                        and own_eq.equipment_id == step.equipment_id
+                        and _overlap_minutes(step.planned_start, step.planned_end, own_eq.planned_start, own_eq.planned_end) > 0
+                    ):
+                        eq_intervals.append((own_eq.planned_start, own_eq.planned_end, own_eq, ("SELF", own_eq.id)))
+
+                eq_peak_info = compute_peak_concurrent_details(step.planned_start, step.planned_end, eq_intervals)
+                if eq_peak_info["peak_total"] > eq_cap:
+                    peak_steps: List[StudyStep] = eq_peak_info["peak_items"] or eq_peak_info["overlapping_items"]
+                    other_labels = ", ".join(
+                        f"{ps.study.study_code if getattr(ps, 'study', None) else study.study_code} ('{ps.step_name}')"
+                        for ps in peak_steps
+                    )
+                    eq_label = f"{eq_obj.name} ({eq_obj.code})" if eq_obj else f"Ekipman #{step.equipment_id}"
+                    rel_sid = peak_steps[0].study_id if peak_steps else None
+                    record(
+                        Conflict(
+                            conflict_type=ConflictType.EQUIPMENT_OVERLAP,
+                            severity=ConflictSeverity.CRITICAL,
+                            title=f"Cihaz Kapasite Aşımı: Gün {step.study_day} — {eq_label} (Max: {eq_cap})",
+                            description=(
+                                f"'{eq_label}' cihazında {_fmt(step.planned_start)} – {_fmt(step.planned_end)} "
+                                f"penceresinde eşzamanlı çalışma kapasitesi (Max: {eq_cap}) aşıldı. "
+                                f"Bu çalışma ile birlikte eşzamanlı tepe kullanım {eq_peak_info['peak_total']} çalışma "
+                                f"({other_labels}) çakışıyor."
                             ),
-                            [step.id, own_eq.id],
-                        )
+                            study_id=study.id,
+                            step_id=step.id,
+                            related_study_id=rel_sid,
+                        ),
+                        [step.id],
+                    )
 
     # 6f) Biyolojik referans adımının gerçekleşen saati ve bağımlı (24/48/72s) gözlem adımlarının denetimi
     bio_info = compute_biological_dependency_info(study, steps, template)

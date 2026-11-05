@@ -138,24 +138,44 @@ def _span_days(tpl: StudyTemplate, offset_days: int = 0) -> int:
 
 
 def _collect_others(db: Session, study: Study) -> List[Dict[str, Any]]:
-    """Kıyas kümesi: onaylı + yürütülen + diğer taslak çalışmaların şablon, Gün 0, bitiş ve ekstraksiyon ofseti bilgisi."""
+    """Kıyas kümesi: onaylı + yürütülen + diğer taslak çalışmaların şablon, Gün 0, bitiş, ekstraksiyon ofseti ve adım bilgisi."""
+    from app.models.study_step import StepStatus, StudyStep
+
     out: List[Dict[str, Any]] = []
     others = db.query(Study).filter(Study.id != study.id, Study.status.in_(_ACTIVE_STATUSES)).all()
+    other_ids = [o.id for o in others if o.id is not None]
+    steps_by_study: Dict[int, List[StudyStep]] = {}
+    if other_ids:
+        for st_step in (
+            db.query(StudyStep)
+            .filter(StudyStep.study_id.in_(other_ids), StudyStep.status != StepStatus.CANCELLED)
+            .order_by(StudyStep.step_order.asc())
+            .all()
+        ):
+            steps_by_study.setdefault(st_step.study_id, []).append(st_step)
+
     for o in others:
         tpl = _tpl_for(o.template_code)
+        o_steps = steps_by_study.get(o.id, [])
         g0 = o.acclimatization_start_date or o.target_start_date
-        if tpl is None or g0 is None:
+        if g0 is None and o_steps and o_steps[0].planned_start:
+            g0 = o_steps[0].planned_start.date()
+        if tpl is None and not o_steps:
             continue
         offset = o.extraction_start_offset_days or 0
-        end = o.target_end_date or (g0 + timedelta(days=_span_days(tpl, offset)))
-        out.append({"study": o, "tpl": tpl, "g0": g0, "end": end, "offset": offset})
+        end = o.target_end_date or (
+            (g0 + timedelta(days=_span_days(tpl, offset))) if (tpl is not None and g0 is not None) else None
+        )
+        out.append({"study": o, "tpl": tpl, "g0": g0, "end": end, "offset": offset, "steps": o_steps})
     return out
 
 
 def _daily_cage_usage(others: List[Dict[str, Any]], room_code: str, start: date, end: date) -> Dict[date, int]:
     usage: Dict[date, int] = {}
     for o in others:
-        tpl: StudyTemplate = o["tpl"]
+        tpl: Optional[StudyTemplate] = o.get("tpl")
+        if tpl is None or o.get("g0") is None or o.get("end") is None:
+            continue
         if tpl.animal_room != room_code or tpl.cage_count <= 0:
             continue
         lo, hi = max(start, o["g0"]), min(end, o["end"])
@@ -205,8 +225,135 @@ def _cage_eval(
 
 
 # ---------------------------------------------------------------------------
-# 3) 24-72+ SAATLİK UZUN SÜRELİ CİHAZLAR
+# 3) 24-72+ SAATLİK UZUN SÜRELİ CİHAZLAR VE EŞZAMANLI TEPE KULLANIM (SWEEP-LINE)
 # ---------------------------------------------------------------------------
+def compute_peak_concurrent_details(
+    window_start: datetime,
+    window_end: datetime,
+    other_intervals: List[Tuple[Any, ...]],
+) -> Dict[str, Any]:
+    """
+    Yarı-açık aralık kuralına (`[start, end)`) göre `[window_start, window_end)` hedef penceresi
+    içinde herhangi bir `t` anında aynı anda aktif olan maksimum eşzamanlı kullanım sayısını
+    (sweep-line / tepe eşzamanlı yük — `peak_concurrent_usage`) hesaplar.
+
+    Bitiş ve başlangıç sınırlarında:
+      - Bir rezervasyon tam `09:00`'da bitiyor ve diğeri `09:00`'da başlıyorsa (`end_1 == start_2`),
+        yarı-açık `[start, end)` kuralı gereği aynı `t` anında aktif sayılmazlar.
+      - Hedef pencerenin farklı bölümleriyle kesişen ancak birbiriyle hiç çakışmayan iki çalışma
+        doğrudan toplanmaz; tepe noktadaki gerçek eşzamanlı sayı (`peak_other`) alınır.
+    """
+    if window_end is None or window_start is None or window_end <= window_start:
+        return {
+            "peak_other": 0,
+            "peak_total": 1,
+            "peak_concurrent_usage": 1,
+            "peak_items": [],
+            "overlapping_items": [],
+            "peak_time": window_start,
+        }
+
+    clamped: List[Tuple[datetime, datetime, Any, Any]] = []
+    overlapping_items: List[Any] = []
+    seen_overlap_keys: set = set()
+
+    for idx, entry in enumerate(other_intervals):
+        if isinstance(entry, dict):
+            o_start = entry.get("start") or entry.get("window_start") or entry.get("planned_start")
+            o_end = entry.get("end") or entry.get("window_end") or entry.get("planned_end")
+            item = entry.get("item", entry)
+            key = entry.get("key", idx)
+        else:
+            o_start = entry[0]
+            o_end = entry[1]
+            item = entry[2] if len(entry) > 2 else entry
+            key = entry[3] if len(entry) > 3 else (item if isinstance(item, (int, str)) else idx)
+
+        if o_start is None or o_end is None or o_end <= o_start:
+            continue
+
+        c_start = max(window_start, o_start)
+        c_end = min(window_end, o_end)
+        # Yarı-açık [start, end) kesişim koşulu: max(start) < min(end)
+        if c_start < c_end:
+            clamped.append((c_start, c_end, item, key))
+            if key not in seen_overlap_keys:
+                seen_overlap_keys.add(key)
+                overlapping_items.append(item)
+
+    if not clamped:
+        return {
+            "peak_other": 0,
+            "peak_total": 1,
+            "peak_concurrent_usage": 1,
+            "peak_items": [],
+            "overlapping_items": [],
+            "peak_time": window_start,
+        }
+
+    # Sweep-line aday noktaları: yarı-açık aralıklarda eşzamanlı maksimum küme her zaman
+    # aktif aralıklardan birinin sol uç noktasında (c_start) gerçekleşir.
+    # Aynı anda biten (-1) aralıklar `c_s <= t < c_e` koşulundaki `< c_e` sayesinde
+    # tam `t == c_e` anında otomatik olarak kapsam dışı kalır.
+    candidate_times = sorted({window_start} | {c_s for c_s, _, _, _ in clamped})
+    peak_other = 0
+    peak_items: List[Any] = []
+    peak_time: datetime = window_start
+
+    for t in candidate_times:
+        active_items: List[Any] = []
+        active_keys: set = set()
+        for c_s, c_e, item, key in clamped:
+            if c_s <= t < c_e and key not in active_keys:
+                active_keys.add(key)
+                active_items.append(item)
+        if len(active_keys) > peak_other:
+            peak_other = len(active_keys)
+            peak_items = active_items
+            peak_time = t
+
+    peak_total = 1 + peak_other
+    return {
+        "peak_other": peak_other,
+        "peak_total": peak_total,
+        "peak_concurrent_usage": peak_total,
+        "peak_items": peak_items,
+        "overlapping_items": overlapping_items,
+        "peak_time": peak_time,
+    }
+
+
+def peak_concurrent_usage(
+    window_start: Any,
+    window_end: Optional[datetime] = None,
+    other_intervals: Optional[List[Tuple[Any, ...]]] = None,
+    include_self: bool = True,
+) -> int:
+    """
+    Bir `[window_start, window_end)` hedef aralığındaki (veya doğrudan aralık listesi verildiğinde
+    tüm zaman eksenindeki) maksimum eşzamanlı kullanım sayısını (`peak_concurrent_usage`) döner.
+    """
+    if window_end is None and other_intervals is None and isinstance(window_start, (list, tuple)):
+        intervals = list(window_start)
+        events: List[Tuple[datetime, int]] = []
+        for entry in intervals:
+            s, e = (entry[0], entry[1]) if not isinstance(entry, dict) else (entry["start"], entry["end"])
+            if s is not None and e is not None and e > s:
+                events.append((s, 1))
+                events.append((e, -1))
+        events.sort(key=lambda ev: (ev[0], ev[1]))
+        cur = 0
+        best = 0
+        for _t, delta in events:
+            cur += delta
+            if cur > best:
+                best = cur
+        return best
+
+    details = compute_peak_concurrent_details(window_start, window_end, list(other_intervals or []))
+    return details["peak_total"] if include_self else details["peak_other"]
+
+
 def _equipment_window(tpl_win: Tuple[str, int, str, int], g0: date, offset: int) -> Tuple[datetime, datetime]:
     code, day, hhmm, hours = tpl_win
     hh, mm = (int(x) for x in hhmm.split(":"))
@@ -215,50 +362,168 @@ def _equipment_window(tpl_win: Tuple[str, int, str, int], g0: date, offset: int)
     return start, start + timedelta(hours=hours)
 
 
+def _extract_study_long_equipment_windows(
+    code: str,
+    eq_id: Optional[int],
+    tpl: Optional[StudyTemplate],
+    g0: Optional[date],
+    offset: int,
+    steps: Optional[List[Any]] = None,
+    shift_days: int = 0,
+) -> List[Tuple[datetime, datetime]]:
+    """
+    Bir çalışmanın belirli bir uzun süreli cihaz (`code`) için `[start, end)` rezervasyon
+    aralıklarını döner. Çalışmanın adımlarında (`steps`) bu cihaza atanmış veya ilgili şablon
+    gününde doğrudan >= 4 saatlik pencere olarak tanımlanmış adım varsa onu kullanır;
+    aksi halde şablonun `equipment_windows` tanımını kullanır.
+    """
+    delta = timedelta(days=shift_days)
+    active_steps = [
+        s for s in (steps or [])
+        if getattr(s, "planned_start", None) is not None
+        and getattr(s, "planned_end", None) is not None
+        and getattr(getattr(s, "status", None), "value", str(getattr(s, "status", "PENDING"))) != "CANCELLED"
+    ]
+
+    if eq_id is not None:
+        explicit_eq_steps = [
+            s for s in active_steps
+            if getattr(s, "equipment_id", None) == eq_id
+            and (s.planned_end - s.planned_start) >= timedelta(hours=4)
+        ]
+        if explicit_eq_steps:
+            return [(s.planned_start + delta, s.planned_end + delta) for s in explicit_eq_steps]
+
+    intervals: List[Tuple[datetime, datetime]] = []
+    if tpl is not None:
+        for win in tpl.equipment_windows:
+            if win[0] != code:
+                continue
+            eff_day = win[1] + (offset if win[1] >= 4 else 0)
+            matched_step = next(
+                (
+                    s for s in active_steps
+                    if getattr(s, "study_day", None) == eff_day
+                    and (s.planned_end - s.planned_start) >= timedelta(hours=4)
+                ),
+                None,
+            )
+            if matched_step is not None:
+                intervals.append((matched_step.planned_start + delta, matched_step.planned_end + delta))
+            elif g0 is not None:
+                intervals.append(_equipment_window(win, g0 + delta, offset))
+    return intervals
+
+
 def _equipment_eval(
-    db: Session, tpl: StudyTemplate, others: List[Dict[str, Any]], g0: date, offset: int
+    db: Session,
+    tpl: StudyTemplate,
+    others: List[Dict[str, Any]],
+    g0: date,
+    offset: int,
+    study_steps: Optional[List[Any]] = None,
+    shift_days: int = 0,
 ) -> List[Dict[str, Any]]:
     from app.seed import LONG_DURATION_EQUIPMENT
 
     default_eq_map = {c[0]: (c[1], c[3]) for c in LONG_DURATION_EQUIPMENT}
+    candidate_windows: List[Tuple[str, int, str, int, Optional[Tuple[datetime, datetime]]]] = [
+        (w[0], w[1], w[2], w[3], None) for w in (tpl.equipment_windows if tpl else ())
+    ]
+    seen_codes = {w[0] for w in candidate_windows}
+
+    if study_steps:
+        for s in study_steps:
+            eq_id_val = getattr(s, "equipment_id", None)
+            p_start = getattr(s, "planned_start", None)
+            p_end = getattr(s, "planned_end", None)
+            st_status = getattr(getattr(s, "status", None), "value", str(getattr(s, "status", "PENDING")))
+            if (
+                eq_id_val is not None
+                and p_start is not None
+                and p_end is not None
+                and st_status != "CANCELLED"
+                and (p_end - p_start) >= timedelta(hours=4)
+            ):
+                eq_row = db.query(Equipment).filter(Equipment.id == eq_id_val).first()
+                if eq_row and eq_row.code in default_eq_map and eq_row.code not in seen_codes:
+                    hrs = max(1, int(round((p_end - p_start).total_seconds() / 3600.0)))
+                    candidate_windows.append(
+                        (
+                            eq_row.code,
+                            int(getattr(s, "study_day", 0) or 0),
+                            p_start.strftime("%H:%M"),
+                            hrs,
+                            (p_start + timedelta(days=shift_days), p_end + timedelta(days=shift_days)),
+                        )
+                    )
+                    seen_codes.add(eq_row.code)
+
     results: List[Dict[str, Any]] = []
-    for win in tpl.equipment_windows:
-        code = win[0]
+    for code, win_day, win_hhmm, win_hours, explicit_win in candidate_windows:
         eq = db.query(Equipment).filter(Equipment.code == code).first()
         if eq is None:
             if code in default_eq_map:
                 eq_name, default_cap = default_eq_map[code]
                 cap = int(default_cap or 1)
+                eq_id = None
             else:
                 continue
         else:
             eq_name = eq.name
             default_cap = default_eq_map.get(code, (eq.name, 1))[1]
             cap = int(eq.max_concurrent_studies or default_cap or 1)
-        start, end = _equipment_window(win, g0, offset)
-        concurrent: List[str] = []
-        for o in others:
-            for ow in o["tpl"].equipment_windows:
-                if ow[0] != code:
-                    continue
-                os_, oe = _equipment_window(ow, o["g0"], o["offset"])
-                if min(end, oe) > max(start, os_):
-                    concurrent.append(o["study"].study_code)
-        used = 1 + len(concurrent)
-        results.append(
-            {
-                "kind": "EQUIPMENT",
-                "equipment_code": code,
-                "equipment_name": eq_name,
-                "window_start": start.isoformat(),
-                "window_end": end.isoformat(),
-                "hours": win[3],
-                "capacity": cap,
-                "used": used,
-                "concurrent_studies": concurrent,
-                "level": "EXCEEDED" if used > cap else "OK",
-            }
-        )
+            eq_id = eq.id
+
+        if explicit_win is not None:
+            target_windows = [explicit_win]
+        else:
+            target_windows = _extract_study_long_equipment_windows(
+                code=code,
+                eq_id=eq_id,
+                tpl=tpl,
+                g0=g0,
+                offset=offset,
+                steps=study_steps,
+                shift_days=shift_days,
+            ) or [_equipment_window((code, win_day, win_hhmm, win_hours), g0 + timedelta(days=shift_days), offset)]
+
+        for start, end in target_windows:
+            other_intervals: List[Tuple[datetime, datetime, str, str]] = []
+            for o in others:
+                o_code = o["study"].study_code
+                o_windows = _extract_study_long_equipment_windows(
+                    code=code,
+                    eq_id=eq_id,
+                    tpl=o.get("tpl"),
+                    g0=o.get("g0"),
+                    offset=o.get("offset", 0),
+                    steps=o.get("steps"),
+                    shift_days=0,
+                )
+                for os_, oe in o_windows:
+                    other_intervals.append((os_, oe, o_code, o_code))
+
+            peak_info = compute_peak_concurrent_details(start, end, other_intervals)
+            used = peak_info["peak_total"]
+            concurrent = list(peak_info["peak_items"])
+            eff_hours = max(1, int(round((end - start).total_seconds() / 3600.0))) if end > start else win_hours
+            results.append(
+                {
+                    "kind": "EQUIPMENT",
+                    "equipment_code": code,
+                    "equipment_name": eq_name,
+                    "window_start": start.isoformat(),
+                    "window_end": end.isoformat(),
+                    "hours": eff_hours,
+                    "capacity": cap,
+                    "used": used,
+                    "peak_concurrent_usage": used,
+                    "concurrent_studies": concurrent,
+                    "overlapping_studies": list(peak_info["overlapping_items"]),
+                    "level": "EXCEEDED" if used > cap else "OK",
+                }
+            )
     return results
 
 
@@ -283,10 +548,23 @@ def build_capacity_report(
     study: Study,
     template: Optional[StudyTemplate] = None,
     commit_defaults: bool = False,
+    steps: Optional[List[Any]] = None,
 ) -> Dict[str, Any]:
     """Planlama yanıtında gösterilecek kafes + uzun süreli cihaz kapasite raporu (engellemeyen bilgi etiketleri dahil)."""
+    from app.models.study_step import StepStatus, StudyStep
+
     tpl = template or _tpl_for(study.template_code)
+    study_steps = steps
+    if study_steps is None and getattr(study, "id", None) is not None:
+        study_steps = (
+            db.query(StudyStep)
+            .filter(StudyStep.study_id == study.id, StudyStep.status != StepStatus.CANCELLED)
+            .order_by(StudyStep.step_order.asc())
+            .all()
+        )
     g0 = study.acclimatization_start_date or study.target_start_date
+    if g0 is None and study_steps and getattr(study_steps[0], "planned_start", None) is not None:
+        g0 = study_steps[0].planned_start.date()
     report: Dict[str, Any] = {"cage": None, "equipment": [], "first_free_g0": None}
     if tpl is None or g0 is None:
         return report
@@ -299,13 +577,13 @@ def build_capacity_report(
             cage = _cage_eval(room, tpl, others, g0, offset, end_date=study.target_end_date)
             cage["message"] = _cage_message(cage)
             report["cage"] = cage
-    report["equipment"] = _equipment_eval(db, tpl, others, g0, offset)
+    report["equipment"] = _equipment_eval(db, tpl, others, g0, offset, study_steps=study_steps)
     needs_redirect = (report["cage"] and report["cage"]["level"] == "EXCEEDED") or any(
         e["level"] == "EXCEEDED" for e in report["equipment"]
     )
     if needs_redirect:
         report["first_free_g0"] = find_first_free_g0(
-            db, study, tpl, g0, offset, commit_defaults=commit_defaults
+            db, study, tpl, g0, offset, commit_defaults=commit_defaults, study_steps=study_steps
         )
         if report["cage"] and report["cage"]["level"] == "EXCEEDED":
             report["cage"]["first_free_date"] = report["first_free_g0"]
@@ -320,8 +598,18 @@ def find_first_free_g0(
     offset: int,
     max_days: int = 240,
     commit_defaults: bool = False,
+    study_steps: Optional[List[Any]] = None,
 ) -> Optional[str]:
     """Kafes (≤ Planlama Kapasitesi) ve uzun süreli cihaz kapasitesi uygun olan ilk Gün 0 (iş günü) tarihini bulur."""
+    from app.models.study_step import StepStatus, StudyStep
+
+    if study_steps is None and getattr(study, "id", None) is not None:
+        study_steps = (
+            db.query(StudyStep)
+            .filter(StudyStep.study_id == study.id, StudyStep.status != StepStatus.CANCELLED)
+            .order_by(StudyStep.step_order.asc())
+            .all()
+        )
     others = _collect_others(db, study)
     rooms = {r.room_code: r for r in ensure_default_room_capacities(db, commit=commit_defaults)}
     room = rooms.get(tpl.animal_room) if tpl.animal_room else None
@@ -333,7 +621,13 @@ def find_first_free_g0(
             continue
         if room is not None and tpl.cage_count > 0 and _cage_eval(room, tpl, others, cand, offset)["level"] == "EXCEEDED":
             continue
-        if any(e["level"] == "EXCEEDED" for e in _equipment_eval(db, tpl, others, cand, offset)):
+        shift_days = (cand - from_g0).days
+        if any(
+            e["level"] == "EXCEEDED"
+            for e in _equipment_eval(
+                db, tpl, others, from_g0, offset, study_steps=study_steps, shift_days=shift_days
+            )
+        ):
             continue
         return cand.isoformat()
     return None
@@ -349,7 +643,7 @@ def evaluate_capacity_conflicts(
     tpl = template or _tpl_for(study.template_code)
     if tpl is None or not steps:
         return []
-    report = build_capacity_report(db, study, tpl)
+    report = build_capacity_report(db, study, tpl, steps=steps)
     anchor = steps[0]
     findings: List[Tuple[Conflict, List[int]]] = []
 
@@ -373,18 +667,15 @@ def evaluate_capacity_conflicts(
             )
         )
 
-    ts_by_code = {w[0]: w for w in tpl.equipment_windows}
     for eq in report.get("equipment", []):
         if eq["level"] != "EXCEEDED":
             continue
-        win = ts_by_code.get(eq["equipment_code"])
         target = anchor
-        if win is not None:
-            win_day = datetime.fromisoformat(eq["window_start"]).date()
-            for s in steps:
-                if s.planned_start.date() == win_day:
-                    target = s
-                    break
+        win_day = datetime.fromisoformat(eq["window_start"]).date()
+        for s in steps:
+            if getattr(s, "planned_start", None) is not None and s.planned_start.date() == win_day:
+                target = s
+                break
         ff = report.get("first_free_g0")
         findings.append(
             (
@@ -409,6 +700,9 @@ def evaluate_capacity_conflicts(
             )
         )
     return findings
+
+
+evaluate_study_capacity_conflicts = evaluate_capacity_conflicts
 
 
 def is_capacity_conflict(conflict: Conflict) -> bool:

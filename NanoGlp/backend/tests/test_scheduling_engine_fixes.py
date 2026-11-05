@@ -4508,6 +4508,299 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
         finally:
             s_final.close()
 
+    def test_22_equipment_peak_concurrent_usage_and_half_open_boundary(self):
+        """
+        CİHAZ KAPASİTESİNDE GERÇEK EŞZAMANLI TEPE KULLANIM (PEAK CONCURRENT USAGE) VE YARI-AÇIK ARALIK [start, end) TESTİ:
+          - Kapasitesi 2 olan bir cihazda (hem EQ-WB-001 polar_capacity=2 hem de EQ-INC-001 max_concurrent_studies=2):
+              * Çalışma A: Gün 1 09:00 – Gün 4 09:00 (72 saat)
+              * Çalışma B: Gün 1 09:00 – Gün 2 09:00 (24 saat)
+              * Çalışma C: Gün 2 09:00 – Gün 3 09:00 (24 saat — B tam 09:00'da biterken C 09:00'da başlar, çakışmaz)
+          - A, B ve C hiçbir anda 2 kapasiteyi aşmaz (peak = 2); yanlış EQUIPMENT_OVERLAP /
+            Uzun Süreli Cihaz Kapasite Aşımı üretilmez ve her üç çalışma da onaylanabilir.
+          - Ardından Gün 1 12:00 – Gün 2 12:00 arasına gerçekten 3. eşzamanlı Çalışma D eklendiğinde
+            (peak = 3 > 2) kapasite aşımı doğru yakalanır ve onay engellenir.
+        """
+        from app.services.capacity_service import (
+            build_capacity_report,
+            compute_peak_concurrent_details,
+            evaluate_capacity_conflicts,
+            peak_concurrent_usage,
+        )
+        from app.services.scheduling_engine import (
+            _find_next_available_water_bath_offset,
+            revalidate_study_conflicts,
+            seed_default_equipment,
+        )
+
+        h_ezgi = _login_headers(self.client, "ezgi")
+        sd_ezgi = self.db.query(User).filter(User.username == "ezgi").first()
+        wb = seed_default_equipment(self.db, commit=True)
+
+        day1_0900 = datetime(2027, 4, 5, 9, 0)   # Gün 1 09:00 (Pazartesi)
+        day2_0900 = datetime(2027, 4, 6, 9, 0)   # Gün 2 09:00 (Salı)
+        day3_0900 = datetime(2027, 4, 7, 9, 0)   # Gün 3 09:00 (Çarşamba)
+        day4_0900 = datetime(2027, 4, 8, 9, 0)   # Gün 4 09:00 (Perşembe)
+        day1_1200 = datetime(2027, 4, 5, 12, 0)  # Gün 1 12:00
+        day2_1200 = datetime(2027, 4, 6, 12, 0)  # Gün 2 12:00
+
+        # 0) Doğrudan birim fonksiyon doğrulaması (sweep-line + yarı-açık [start, end) sınırı)
+        direct_details_abc = compute_peak_concurrent_details(
+            day1_0900,
+            day4_0900,
+            [
+                (day1_0900, day2_0900, "B", "B"),
+                (day2_0900, day3_0900, "C", "C"),
+            ],
+        )
+        self.assertEqual(direct_details_abc["peak_other"], 1, "B [09:00..G2 09:00) ve C [G2 09:00..G3 09:00) aynı anda aktif değildir")
+        self.assertEqual(direct_details_abc["peak_total"], 2, "A + max(B, C) tepe eşzamanlı kullanım 2 olmalı")
+        self.assertEqual(len(direct_details_abc["overlapping_items"]), 2)
+        self.assertEqual(
+            peak_concurrent_usage(
+                [
+                    (day1_0900, day4_0900),
+                    (day1_0900, day2_0900),
+                    (day2_0900, day3_0900),
+                ]
+            ),
+            2,
+        )
+        self.assertEqual(
+            peak_concurrent_usage(
+                [
+                    (day1_0900, day4_0900),
+                    (day1_0900, day2_0900),
+                    (day2_0900, day3_0900),
+                    (day1_1200, day2_1200),
+                ]
+            ),
+            3,
+        )
+
+        # ==================================================================
+        # BÖLÜM 1: EQ-WB-001 (Polar Kapasite = 2) üzerinde Çalışma A, B, C ve D
+        # ==================================================================
+        wb.polar_capacity = 2
+        wb.non_polar_capacity = 1
+        self.db.commit()
+
+        def _create_wb_study(code: str, start_dt: datetime, end_dt: datetime):
+            st_obj = Study(
+                study_code=code,
+                title=f"Peak WB Test {code}",
+                test_item_name="Peak Test Polymer",
+                study_director_id=sd_ezgi.id,
+                status=StudyStatus.DRAFT,
+                template_code="ISO_10993_23_IC",
+                acclimatization_start_date=start_dt.date() - timedelta(days=4),
+                target_start_date=start_dt.date() - timedelta(days=4),
+                target_end_date=end_dt.date(),
+                extraction_polar=True,
+                extraction_non_polar=False,
+            )
+            self.db.add(st_obj)
+            self.db.flush()
+            step_obj = StudyStep(
+                study_id=st_obj.id,
+                step_order=2,
+                study_day=4,
+                step_name="Ekstraksiyon Kurulumu",
+                step_type="Ekstraksiyon",
+                planned_start=start_dt,
+                planned_end=end_dt,
+                is_biological_fixed_time=True,
+                biological_tolerance_minutes=120,
+                equipment_id=wb.id,
+                status=StepStatus.PENDING,
+            )
+            self.db.add(step_obj)
+            self.db.commit()
+            return st_obj, step_obj
+
+        wb_a, _ = _create_wb_study("FIX22-WB-A", day1_0900, day4_0900)  # 72 saat
+        wb_b, _ = _create_wb_study("FIX22-WB-B", day1_0900, day2_0900)  # 24 saat
+        wb_c, _ = _create_wb_study("FIX22-WB-C", day2_0900, day3_0900)  # 24 saat (B bitince başlar)
+
+        for st_item in (wb_a, wb_b, wb_c):
+            findings_item = revalidate_study_conflicts(self.db, st_item)
+            eq_conflicts = [
+                c for c, _ in findings_item
+                if c.conflict_type == ConflictType.EQUIPMENT_OVERLAP
+            ]
+            self.assertEqual(
+                eq_conflicts,
+                [],
+                f"{st_item.study_code} için peak=2 <= 2 iken yanlış EQUIPMENT_OVERLAP üretilmemeli: {[c.title for c in eq_conflicts]}",
+            )
+
+        # Her üç çalışma (A, B, C) engellenmeden onaylanabilmeli
+        tech1 = self.db.query(User).filter(User.username == "invivo_1").first()
+        tech2 = self.db.query(User).filter(User.username == "invivo_2").first()
+        for st_item, assigned_tech in ((wb_a, tech1), (wb_b, tech2), (wb_c, tech1)):
+            for s_row in self.db.query(StudyStep).filter(StudyStep.study_id == st_item.id).all():
+                s_row.assignees = [assigned_tech]
+            self.db.commit()
+            revalidate_study_conflicts(self.db, st_item)
+            self.db.commit()
+
+            r_app = self.client.post(f"/api/v1/planning/studies/{st_item.id}/approve", headers=h_ezgi)
+            self.assertEqual(r_app.status_code, 200, f"{st_item.study_code} onaylanabilmeli: {r_app.text}")
+
+        # Şimdi Gün 1 12:00 – Gün 2 12:00 arasına 3. eşzamanlı Çalışma D eklendiğinde (peak = 3 > 2)
+        wb_d, _ = _create_wb_study("FIX22-WB-D", day1_1200, day2_1200)
+        for s_row in self.db.query(StudyStep).filter(StudyStep.study_id == wb_d.id).all():
+            s_row.assignees = [tech2]
+        self.db.commit()
+
+        findings_d = revalidate_study_conflicts(self.db, wb_d)
+        self.db.commit()
+        eq_conflicts_d = [
+            c for c, _ in findings_d
+            if c.conflict_type == ConflictType.EQUIPMENT_OVERLAP
+        ]
+        self.assertEqual(len(eq_conflicts_d), 1, "Peak=3 > 2 olduğunda Polar kapasite aşımı yakalanmalı")
+        self.assertIn("Polar Kapasite Aşımı (Max: 2)", eq_conflicts_d[0].title)
+        self.assertIn("eşzamanlı 3 Polar çalışma", eq_conflicts_d[0].description)
+
+        r_app_d = self.client.post(f"/api/v1/planning/studies/{wb_d.id}/approve", headers=h_ezgi)
+        self.assertIn(r_app_d.status_code, (400, 409), "Peak=3 > 2 iken Çalışma D onayı engellenmeli")
+
+        # En erken uygun tarih önerisi (_find_next_available_water_bath_offset) de peak hesabı kullanmalı:
+        # Çalışma D çıkarıldığında, Gün 3 09:00 – Gün 4 09:00 arasında yalnızca Çalışma A (1 çalışma) vardır;
+        # dolayısıyla Gün 3'te başlayan 24s bir çalışma için peak = 2 <= 2 olur!
+        self.db.query(Conflict).filter(Conflict.study_id == wb_d.id).delete()
+        self.db.query(StudyStep).filter(StudyStep.study_id == wb_d.id).delete()
+        self.db.delete(wb_d)
+        self.db.commit()
+
+        existing_wb_steps = (
+            self.db.query(StudyStep)
+            .filter(StudyStep.study_id.in_([wb_a.id, wb_b.id]))
+            .all()
+        )
+        next_off, next_dt = _find_next_available_water_bath_offset(
+            self.db,
+            wb_c,
+            wb_b.acclimatization_start_date,
+            0,
+            existing_wb_steps,
+            wb,
+        )
+        self.assertEqual(next_off, 1, "B çalışması Gün 2 09:00'da bittiği için +1 gün ofsette (Gün 2) peak=2 <= 2 ile cihaz müsait olmalı")
+        self.assertEqual(next_dt, day2_0900.date())
+
+        # Bölüm 1 çalışmalarını temizle ki Bölüm 2'de aynı tarihlerde teknisyen çakışması olmasın
+        for st_prev in (wb_a, wb_b, wb_c):
+            st_prev.status = StudyStatus.CANCELLED
+            for s_prev in self.db.query(StudyStep).filter(StudyStep.study_id == st_prev.id).all():
+                s_prev.status = StepStatus.CANCELLED
+        self.db.commit()
+
+        # ==================================================================
+        # BÖLÜM 2: Genel / Uzun Süreli Cihaz (EQ-INC-001, max_concurrent_studies = 2)
+        # üzerinde capacity_service (build_capacity_report, evaluate_capacity_conflicts,
+        # find_first_free_g0) ve scheduling_engine (step.equipment_id) doğrulaması
+        # ==================================================================
+        eq_inc = self.db.query(Equipment).filter(Equipment.code == "EQ-INC-001").first()
+        self.assertIsNotNone(eq_inc)
+        eq_inc.max_concurrent_studies = 2
+        self.db.commit()
+
+        def _create_inc_study(code: str, start_dt: datetime, end_dt: datetime):
+            g0_dt = start_dt.date()
+            st_obj = Study(
+                study_code=code,
+                title=f"Peak INC Test {code}",
+                test_item_name="Peak Cyto Item",
+                study_director_id=sd_ezgi.id,
+                status=StudyStatus.DRAFT,
+                template_code="ISO_10993_5_CYTO",
+                acclimatization_start_date=g0_dt,
+                target_start_date=g0_dt,
+                target_end_date=end_dt.date(),
+                extraction_polar=False,
+                extraction_non_polar=False,
+            )
+            self.db.add(st_obj)
+            self.db.flush()
+            step_obj = StudyStep(
+                study_id=st_obj.id,
+                step_order=1,
+                study_day=0,
+                step_name="L929 Hücre Kültürü Pasajlama ve CO2 İnkübatörüne Alma",
+                step_type="Hazırlık",
+                planned_start=start_dt,
+                planned_end=end_dt,
+                is_biological_fixed_time=True,
+                biological_tolerance_minutes=60,
+                equipment_id=eq_inc.id,
+                status=StepStatus.PENDING,
+            )
+            self.db.add(step_obj)
+            self.db.commit()
+            return st_obj, step_obj
+
+        inc_a, _ = _create_inc_study("FIX22-INC-A", day1_0900, day4_0900)  # 72 saat
+        inc_b, _ = _create_inc_study("FIX22-INC-B", day1_0900, day2_0900)  # 24 saat
+        inc_c, _ = _create_inc_study("FIX22-INC-C", day2_0900, day3_0900)  # 24 saat (B bitince başlar)
+
+        for st_inc, assigned_tech in ((inc_a, tech1), (inc_b, tech2), (inc_c, tech1)):
+            for s_row in self.db.query(StudyStep).filter(StudyStep.study_id == st_inc.id).all():
+                s_row.assignees = [assigned_tech]
+            self.db.commit()
+            cap_rep = build_capacity_report(self.db, st_inc)
+            inc_entry = next(e for e in cap_rep["equipment"] if e["equipment_code"] == "EQ-INC-001")
+            self.assertEqual(
+                inc_entry["used"],
+                2,
+                f"{st_inc.study_code} için EQ-INC-001 tepe eşzamanlı kullanım 2 olmalı: {inc_entry}",
+            )
+            self.assertEqual(inc_entry["level"], "OK", f"{st_inc.study_code} için kapasite (2) aşılmamalı: {inc_entry}")
+            st_steps = self.db.query(StudyStep).filter(StudyStep.study_id == st_inc.id).all()
+            cap_confs = [
+                c for c, _ in evaluate_capacity_conflicts(self.db, st_inc, st_steps)
+                if "EQ-INC-001" in (c.title or "")
+            ]
+            self.assertEqual(cap_confs, [], f"{st_inc.study_code} için yanlış Uzun Süreli Cihaz Kapasite Aşımı üretilmemeli")
+
+            findings_inc = revalidate_study_conflicts(self.db, st_inc)
+            self.db.commit()
+            eq_confs_inc = [
+                c for c, _ in findings_inc
+                if c.conflict_type == ConflictType.EQUIPMENT_OVERLAP and ("EQ-INC-001" in (c.title or "") or str(eq_inc.id) in (c.title or ""))
+            ]
+            self.assertEqual(eq_confs_inc, [], f"{st_inc.study_code} için yanlış EQUIPMENT_OVERLAP üretilmemeli")
+            r_app_inc = self.client.post(f"/api/v1/planning/studies/{st_inc.id}/approve", headers=h_ezgi)
+            self.assertEqual(r_app_inc.status_code, 200, f"{st_inc.study_code} onaylanabilmeli: {r_app_inc.text}")
+
+        # Şimdi Gün 1 12:00 – Gün 2 12:00 arasına 3. eşzamanlı Çalışma D eklendiğinde (peak = 3 > 2)
+        inc_d, _ = _create_inc_study("FIX22-INC-D", day1_1200, day2_1200)
+        for s_row in self.db.query(StudyStep).filter(StudyStep.study_id == inc_d.id).all():
+            s_row.assignees = [tech2]
+        self.db.commit()
+        cap_rep_d = build_capacity_report(self.db, inc_d)
+        inc_entry_d = next(e for e in cap_rep_d["equipment"] if e["equipment_code"] == "EQ-INC-001")
+        self.assertEqual(inc_entry_d["used"], 3, "Çalışma D eklendiğinde tepe eşzamanlı kullanım 3 olmalı")
+        self.assertEqual(inc_entry_d["level"], "EXCEEDED", "Peak=3 > 2 olduğunda EXCEEDED dönmeli")
+        self.assertIsNotNone(cap_rep_d["first_free_g0"], "Kapasite aşıldığında ilk uygun Gün 0 önerilmeli")
+
+        inc_d_steps = self.db.query(StudyStep).filter(StudyStep.study_id == inc_d.id).all()
+        cap_confs_d = [
+            c for c, _ in evaluate_capacity_conflicts(self.db, inc_d, inc_d_steps)
+            if "EQ-INC-001" in (c.title or "")
+        ]
+        self.assertEqual(len(cap_confs_d), 1, "Peak=3 > 2 olduğunda Uzun Süreli Cihaz Kapasite Aşımı üretilmeli")
+
+        findings_inc_d = revalidate_study_conflicts(self.db, inc_d)
+        self.db.commit()
+        eq_confs_inc_d = [
+            c for c, _ in findings_inc_d
+            if c.conflict_type == ConflictType.EQUIPMENT_OVERLAP
+        ]
+        self.assertGreaterEqual(len(eq_confs_inc_d), 1, "Peak=3 > 2 olduğunda EQUIPMENT_OVERLAP üretilmeli")
+        r_app_inc_d = self.client.post(f"/api/v1/planning/studies/{inc_d.id}/approve", headers=h_ezgi)
+        self.assertIn(r_app_inc_d.status_code, (400, 409), "Peak=3 > 2 iken Çalışma D onayı engellenmeli")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
