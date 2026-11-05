@@ -667,9 +667,10 @@ def main():
                 and "Cottonseed oil" in full_docx_text
                 and "Ezgi Nur AKIN" in full_docx_text
                 and "Emine ARMUTOĞLU" in full_docx_text
-                and "Selin BOLCAN" in full_docx_text
-                and "Dr. Shivadasan ANOOP" in full_docx_text,
-                "Üretilen .docx içinde Çalışma Kodu, Sponsor, Test Maddesi, Lot, Polar/Apolar Çözücüler, Aktif SD 'Ezgi Nur AKIN', TFM 'Emine ARMUTOĞLU', QA 'Selin BOLCAN', Management 'Dr. Shivadasan ANOOP' ve Takvim yer alıyor",
+                and "Selin BOLCAN" not in full_docx_text
+                and "Dr. Shivadasan ANOOP" not in full_docx_text
+                and "TBD" in full_docx_text,
+                "Üretilen .docx içinde Çalışma Kodu, Sponsor, Test Maddesi, Lot, Polar/Apolar Çözücüler, Aktif SD 'Ezgi Nur AKIN', TFM 'Emine ARMUTOĞLU', gerçek görev atamaları ve Takvim yer alıyor; atanmamış şablon kişileri yerine TBD kullanılıyor",
             )
             leftover_x = []
             with _zipfile.ZipFile(io.BytesIO(docx_resp.content)) as _z:
@@ -1072,8 +1073,11 @@ def main():
                 miss = [m for m in must if m.lower() not in low]
                 bad = [m for m in must_not if m.lower() in low]
                 check(not miss and not bad, f"{std} .docx: bölüm metinleri şablona göre dinamik (eksik={miss}, kalan={bad})")
-                check("intracutaneous" not in low and "ISO 10993-23" not in txt and std in txt,
-                      f"{std} .docx: İntrakütanöz / ISO 10993-23 metni kalmadı, standart adı güncellendi")
+                # Preserve the master-template figure and its truthful source caption.
+                # Only that reference illustration may retain the original ISO number.
+                protocol_txt = txt.replace("Figure-1: Arrangement of Injection Sites (Source: ISO 10993-23)", "")
+                check("intracutaneous" not in low and "ISO 10993-23" not in protocol_txt and std in txt,
+                      f"{std} .docx: protokol metni hedef standarda uyarlandı; referans şeklin özgün kaynak açıklaması korundu")
                 check(not _re.search(r"X{3,}", txt), f"{std} .docx: doldurulmamış 'XXX' yer tutucusu kalmadı")
 
             # --- Çekmeceden belge yükleme + otomatik doldurma (OpenAI çağrısı mock) ---
