@@ -64,6 +64,8 @@ def operational(snapshot_data):
 
 class SampleStudySync(unittest.TestCase):
     def setUp(self):
+        # Live indicators must not depend on the machine's calendar date.
+        self.enterContext(patch("app.utils.facility_time.facility_now", return_value=datetime(2026, 11, 5, 12)))
         reset_schema()
         self.db = SessionLocal()
         self.people = {u.username: u for u in seed_personnel(self.db)}

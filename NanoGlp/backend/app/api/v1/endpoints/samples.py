@@ -111,7 +111,8 @@ def _list_payload(db: Session, perms: Dict[str, Any]) -> Dict[str, Any]:
         .order_by(SampleRecord.serial_no.asc().nullslast(), SampleRecord.study_code.desc())
         .all()
     )
-    items = [ss.serialize_sample(db, s, perms, all_samples=samples, detailed=False) for s in samples]
+    today = ss.facility_today()
+    items = [ss.serialize_sample(db, s, perms, all_samples=samples, detailed=False, today=today) for s in samples]
     db.commit()  # sync_dates_from_study ile eşitlenen tarihleri kalıcılaştır
     sds = (
         db.query(User).filter(User.role == UserRole.STUDY_DIRECTOR, User.is_active == True)  # noqa: E712

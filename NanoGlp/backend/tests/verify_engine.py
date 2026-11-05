@@ -11,6 +11,7 @@ import os
 import shutil
 import sys
 import tempfile
+from unittest.mock import patch
 from datetime import date, datetime, time, timedelta
 
 _TMP_DIR = tempfile.mkdtemp(prefix="nanoglp_test_")
@@ -61,7 +62,8 @@ def auth_headers(client: TestClient, username: str, password: str = DEFAULT_PASS
     return {"Authorization": f"Bearer {token}"}
 
 
-def main():
+@patch("app.utils.facility_time.facility_now", return_value=datetime(2026, 11, 5, 12))
+def main(_facility_clock):
     reset_schema()
     db = SessionLocal()
     try:

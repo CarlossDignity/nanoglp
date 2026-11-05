@@ -50,6 +50,7 @@ from app.services.templates import (
     get_template,
 )
 from app.utils.security import get_current_user, require_management_read, require_management_write
+from app.utils.facility_time import FACILITY_TZ, facility_now, facility_today
 
 router = APIRouter(prefix="/planning", tags=["Operasyonel Planlama ve Çakışma Yönetimi"])
 
@@ -115,12 +116,9 @@ class ApplyResolutionRequest(BaseModel):
     target_user_id: Optional[int] = None
 
 
-FACILITY_TZ = timezone(timedelta(hours=3))
-
-
 def _facility_now() -> datetime:
     """Tesis yerel saatini (Europe/Istanbul, UTC+03:00 naive datetime) döner."""
-    return datetime.now(FACILITY_TZ).replace(tzinfo=None)
+    return facility_now()
 
 
 class UpdateStepStatusRequest(BaseModel):
@@ -1392,7 +1390,7 @@ def api_get_summary(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_management_read),
 ):
-    today = date.today()
+    today = facility_today()
     day_start = datetime.combine(today, time.min)
     day_end = datetime.combine(today, time.max)
 
@@ -1463,11 +1461,11 @@ def api_get_summary(
     ongoing_overdue_draft = 0
     for sr in ongoing_rows:
         end_ref = sr.experiment_end_date or sr.planned_end
-        if end_ref is not None and end_ref < REFERENCE_DATE:
+        if end_ref is not None and end_ref < today:
             ongoing_in_reporting += 1
         else:
             ongoing_in_experiment += 1
-        if (sr.glp_type or "GLP").upper() == "GLP" and sr.draft_report_date is not None and sr.draft_report_date < REFERENCE_DATE:
+        if (sr.glp_type or "GLP").upper() == "GLP" and sr.draft_report_date is not None and sr.draft_report_date < today:
             ongoing_overdue_draft += 1
 
     return {
