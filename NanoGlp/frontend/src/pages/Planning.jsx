@@ -34,6 +34,8 @@ import {
   getCalendar,
   getStudySchedule,
   approveStudyPlan,
+  getBiologicalRevisionPreview,
+  approveBiologicalRevision,
   applyConflictResolution,
   recomputeConflicts,
   downloadStudyPlanDocx,
@@ -204,6 +206,11 @@ export default function Planning({ onScheduled }) {
   const [approving, setApproving] = useState(false);
   const [downloadingDocx, setDownloadingDocx] = useState(false);
   const [recomputingConflicts, setRecomputingConflicts] = useState(false);
+  const [bioRevisionPreview, setBioRevisionPreview] = useState(null);
+  const [loadingBioPreview, setLoadingBioPreview] = useState(false);
+  const [approvingBioRevision, setApprovingBioRevision] = useState(false);
+  const [bioRevisionReason, setBioRevisionReason] = useState('');
+  const [bioRevisionError, setBioRevisionError] = useState(null);
   const [resolutionNotice, setResolutionNotice] = useState(null);
   const [error, setError] = useState(null);
   const [result, setResult] = useState(null);
@@ -231,8 +238,15 @@ export default function Planning({ onScheduled }) {
 
         const studiesList = data.studies || [];
         if (studiesList.length > 0) {
+          const searchParams = new URLSearchParams(location.search || window.location.search || '');
+          const queryStudyId = searchParams.get('study_id');
+          const queryStudyCode = (searchParams.get('study_code') || '').trim().toUpperCase();
           const targetId =
             preferredStudyId ||
+            (queryStudyId ? Number(queryStudyId) : null) ||
+            (queryStudyCode
+              ? studiesList.find((s) => (s.study_code || '').toUpperCase() === queryStudyCode)?.study_id
+              : null) ||
             location.state?.selectedStudyId ||
             result?.study_id ||
             (location.state?.focusDraft
@@ -505,6 +519,58 @@ export default function Planning({ onScheduled }) {
     }
   };
 
+  const handlePreviewBioRevision = async (targetStudyId = null) => {
+    const sid = targetStudyId || result?.study_id;
+    if (!sid) return;
+    setLoadingBioPreview(true);
+    setBioRevisionError(null);
+    try {
+      const res = await getBiologicalRevisionPreview(sid);
+      setBioRevisionPreview(res.data || null);
+    } catch (err) {
+      setBioRevisionError(extractError(err, 'Biyolojik plan revizyonu önizlemesi alınamadı.'));
+    } finally {
+      setLoadingBioPreview(false);
+    }
+  };
+
+  const handleApproveBioRevision = async () => {
+    if (!result?.study_id || isReadOnly) return;
+    const domVal =
+      typeof document !== 'undefined'
+        ? document.getElementById('bioRevisionReasonInput')?.value
+        : '';
+    const trimmedReason = (bioRevisionReason || domVal || '').trim();
+    if (!trimmedReason) {
+      setBioRevisionError('Biyolojik plan revizyonunu onaylamak için gerekçe girilmesi zorunludur.');
+      return;
+    }
+    setApprovingBioRevision(true);
+    setBioRevisionError(null);
+    setError(null);
+    setResolutionNotice(null);
+    try {
+      const res = await approveBiologicalRevision(result.study_id, {
+        reason: trimmedReason,
+        preview_token: bioRevisionPreview?.preview_token || undefined,
+      });
+      if (res.data) {
+        setResult(res.data);
+      }
+      setBioRevisionReason('');
+      await handlePreviewBioRevision(result.study_id);
+      await loadCalendar(result.study_id);
+      onScheduled?.();
+      setResolutionNotice(
+        `'${result.study_code}' için SD biyolojik plan revizyonu onaylandı ve uygun bekleyen adımların yeni saatleri resmî takvime işlendi.`
+      );
+    } catch (err) {
+      setBioRevisionError(extractError(err, 'Biyolojik plan revizyonu onaylanırken hata oluştu.'));
+    } finally {
+      setApprovingBioRevision(false);
+    }
+  };
+
   const syncFormWithStudy = (st) => {
     if (!st) return;
     if (st.study_code) setStudyCode(st.study_code);
@@ -521,6 +587,11 @@ export default function Planning({ onScheduled }) {
   };
 
   const handleSelectStudyCard = (st) => {
+    if (st?.study_id !== result?.study_id) {
+      setBioRevisionPreview(null);
+      setBioRevisionError(null);
+      setBioRevisionReason('');
+    }
     setResult(st);
     setError(null);
     setResolutionNotice(null);
@@ -686,6 +757,7 @@ export default function Planning({ onScheduled }) {
       <div className="bg-white border border-slate-200 rounded-lg shadow-xs overflow-hidden">
         <button
           type="button"
+          data-testid="toggle-studies-list-btn"
           onClick={() => setIsStudiesListOpen((v) => !v)}
           className="w-full px-4 py-3 flex flex-wrap items-center justify-between gap-2 text-left hover:bg-slate-50 transition"
         >
@@ -777,6 +849,7 @@ export default function Planning({ onScheduled }) {
                   return (
                     <div
                       key={st.study_id}
+                      data-testid={`study-card-${st.study_code}`}
                       onClick={() => handleSelectStudyCard(st)}
                       role="button"
                       tabIndex={0}
@@ -1290,6 +1363,337 @@ export default function Planning({ onScheduled }) {
             </div>
           )}
 
+          {/* Biyolojik Plan Revizyonu (SD Onayı) ve Kaynak Sapma İzleme Kartı */}
+          {((result.source_deviations && result.source_deviations.length > 0) ||
+            (result.revision_proposals && result.revision_proposals.length > 0) ||
+            (result.ineligible_revision_steps && result.ineligible_revision_steps.length > 0) ||
+            (result.biological_revisions && result.biological_revisions.length > 0) ||
+            (result.steps || []).some((s) => s.actual_reference_time)) && (
+            <div
+              data-testid="bio-revision-section"
+              className="bg-white border border-indigo-200 rounded-lg shadow-xs overflow-hidden"
+            >
+              <div className="px-5 py-3.5 bg-indigo-50/70 border-b border-indigo-200 flex flex-wrap items-center justify-between gap-3">
+                <div className="space-y-0.5">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Clock className="w-4 h-4 text-indigo-700" />
+                    <h3 className="text-sm font-bold text-indigo-950">
+                      Biyolojik Plan Revizyonu ve Referans Saat Sapma Yönetimi (SD Onayı)
+                    </h3>
+                    {result.revision_proposals?.length > 0 && (
+                      <span className="text-[11px] font-bold px-2 py-0.5 rounded bg-amber-100 text-amber-900 border border-amber-300">
+                        {result.revision_proposals.length} Uygun Adım Revizyon Bekliyor
+                      </span>
+                    )}
+                    {(result.source_deviations || []).some((sd) => sd.sd_revision_approved) && (
+                      <span
+                        data-testid="bio-sd-approved-badge"
+                        className="text-[11px] font-bold px-2 py-0.5 rounded bg-emerald-100 text-emerald-900 border border-emerald-300"
+                      >
+                        SD Onaylı Revizyon Uygulandı
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-xs text-slate-600">
+                    Gerçek biyolojik referans saatine göre bağımlı gözlem adımlarının önerilen yeni saatlerini
+                    önizleyin, engelleri denetleyin ve Çalışma Yöneticisi (SD) gerekçesiyle resmî takvime işleyin.
+                  </p>
+                </div>
+
+                <button
+                  type="button"
+                  data-testid="preview-bio-revision-btn"
+                  disabled={loadingBioPreview}
+                  onClick={() => handlePreviewBioRevision(result.study_id)}
+                  className="inline-flex items-center gap-1.5 bg-indigo-700 hover:bg-indigo-800 disabled:bg-slate-300 text-white text-xs font-semibold px-3.5 py-2 rounded-md shadow-xs transition"
+                >
+                  {loadingBioPreview ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <Eye className="w-3.5 h-3.5" />
+                  )}
+                  <span>Revizyon Önizlemesi</span>
+                </button>
+              </div>
+
+              <div className="p-5 space-y-4 text-xs">
+                {/* Kaynak Biyolojik Referans Adımı ve Korunan Geçmiş Sapma */}
+                {(result.source_deviations || []).map((src) => (
+                  <div
+                    key={src.step_id || src.step_order}
+                    data-testid="bio-source-summary"
+                    className="rounded-md border border-slate-200 bg-slate-50 p-3.5 flex flex-wrap items-center justify-between gap-3"
+                  >
+                    <div className="space-y-1">
+                      <div className="font-semibold text-slate-900">
+                        Kaynak Referans Adımı: #{src.step_order} — {src.step_name}
+                      </div>
+                      <div className="flex flex-wrap items-center gap-3 text-slate-700">
+                        <span>
+                          Planlanan Referans:{' '}
+                          <strong className="font-mono">{fmtDateTime(src.planned_reference_time)}</strong>
+                        </span>
+                        <span data-testid="bio-source-actual-ref">
+                          Gerçek Kaynak Referans:{' '}
+                          <strong className="font-mono text-indigo-900">
+                            {fmtDateTime(src.actual_reference_time)}
+                          </strong>
+                        </span>
+                        <span>
+                          Tolerans: <strong>±{src.biological_tolerance_minutes} dk</strong>
+                        </span>
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span
+                        data-testid="bio-source-deviation-badge"
+                        className={`font-mono font-bold px-2.5 py-1 rounded border ${
+                          src.exceeds_tolerance
+                            ? 'bg-amber-50 text-amber-900 border-amber-300'
+                            : 'bg-emerald-50 text-emerald-900 border-emerald-300'
+                        }`}
+                      >
+                        Kaynak Sapma: {src.deviation_minutes > 0 ? `+${src.deviation_minutes}` : src.deviation_minutes} dk
+                      </span>
+                      <span className="text-[11px] text-slate-500 italic">
+                        (Orijinal kaynak planı ve geçmiş sapma kaydı korunur)
+                      </span>
+                    </div>
+                  </div>
+                ))}
+
+                {/* Onaylanmış Biyolojik Revizyon Geçmişi */}
+                {result.biological_revisions?.length > 0 && (
+                  <div
+                    data-testid="bio-revision-history"
+                    className="rounded-md border border-emerald-300 bg-emerald-50/70 p-3.5 space-y-2"
+                  >
+                    <div className="font-bold text-emerald-950 flex items-center gap-1.5">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-700" />
+                      <span>Kaydedilmiş SD Biyolojik Plan Revizyonu Kararı</span>
+                    </div>
+                    {result.biological_revisions.map((rev, idx) => (
+                      <div
+                        key={rev.revision_id || idx}
+                        className="border-t border-emerald-200/80 pt-2 first:border-t-0 first:pt-0 text-emerald-950 space-y-1"
+                      >
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span>
+                            Onaylayan: <strong>{rev.approved_by_name}</strong> ({rev.approved_by_role})
+                          </span>
+                          <span>·</span>
+                          <span>
+                            Kaynak Referans:{' '}
+                            <strong className="font-mono">{fmtDateTime(rev.source_actual_reference_time)}</strong>
+                          </span>
+                          {rev.old_target_end_date !== rev.new_target_end_date && rev.new_target_end_date && (
+                            <>
+                              <span>·</span>
+                              <span>
+                                Çalışma Bitiş Tarihi:{' '}
+                                <strong className="font-mono">
+                                  {rev.old_target_end_date} → {rev.new_target_end_date}
+                                </strong>
+                              </span>
+                            </>
+                          )}
+                        </div>
+                        <div data-testid="bio-approved-reason" className="text-emerald-900">
+                          SD Onay Gerekçesi: <strong>{rev.reason}</strong>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {bioRevisionError && (
+                  <div
+                    data-testid="bio-revision-error"
+                    className="rounded-md border border-red-300 bg-red-50 px-3.5 py-2.5 text-red-900 font-medium"
+                  >
+                    {bioRevisionError}
+                  </div>
+                )}
+
+                {/* Revizyon Önizleme Paneli */}
+                {bioRevisionPreview && (
+                  <div
+                    data-testid="bio-revision-preview-panel"
+                    className="rounded-md border border-indigo-200 bg-white p-4 space-y-4"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 pb-2.5">
+                      <div>
+                        <h4 className="font-bold text-slate-900 text-xs">
+                          Revizyon Önizlemesi — {bioRevisionPreview.study_code}
+                        </h4>
+                        <p className="text-[11px] text-slate-500">
+                          Bu önizleme salt-okunurdur; onaylanana kadar resmî çalışma takvimini veya durumunu değiştirmez.
+                        </p>
+                      </div>
+                      {bioRevisionPreview.target_end_date_changed && (
+                        <span
+                          data-testid="bio-preview-end-date"
+                          className="font-mono text-[11px] font-bold px-2.5 py-1 rounded bg-indigo-50 text-indigo-900 border border-indigo-200"
+                        >
+                          Hedef Bitiş Tarihi: {bioRevisionPreview.current_target_end_date} →{' '}
+                          {bioRevisionPreview.proposed_target_end_date}
+                        </span>
+                      )}
+                    </div>
+
+                    {/* Etkilenen ve Uygun Olmayan Bağımlı Adımlar Tablosu */}
+                    {bioRevisionPreview.all_dependent_steps?.length > 0 ? (
+                      <div className="overflow-x-auto border border-slate-200 rounded-md">
+                        <table className="w-full text-xs">
+                          <thead className="bg-slate-50 text-slate-600 uppercase tracking-wider text-[11px]">
+                            <tr>
+                              <th className="text-left px-3 py-2 font-semibold">Adım</th>
+                              <th className="text-left px-3 py-2 font-semibold">Durum</th>
+                              <th className="text-left px-3 py-2 font-semibold">Çalışma Günü</th>
+                              <th className="text-left px-3 py-2 font-semibold">Mevcut Plan (Başlangıç–Bitiş)</th>
+                              <th className="text-left px-3 py-2 font-semibold">Önerilen Plan (Başlangıç–Bitiş)</th>
+                              <th className="text-left px-3 py-2 font-semibold">Uygunluk / Neden</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-100">
+                            {bioRevisionPreview.all_dependent_steps.map((st) => (
+                              <tr
+                                key={st.step_id || st.step_order}
+                                data-testid={`bio-preview-step-row-${st.step_order}`}
+                                className={st.eligible ? 'bg-indigo-50/30' : 'bg-slate-50 text-slate-500'}
+                              >
+                                <td className="px-3 py-2 font-medium text-slate-900">
+                                  #{st.step_order} — {st.step_name}
+                                </td>
+                                <td className="px-3 py-2 font-mono">{st.status}</td>
+                                <td
+                                  data-testid={`bio-preview-day-${st.step_order}`}
+                                  className="px-3 py-2 font-mono font-semibold"
+                                >
+                                  G{st.current_study_day}
+                                  {st.day_changed && (
+                                    <span className="ml-1 text-indigo-700 font-bold">
+                                      → G{st.proposed_study_day} (Yeni Gün)
+                                    </span>
+                                  )}
+                                </td>
+                                <td className="px-3 py-2 font-mono whitespace-nowrap">
+                                  {fmtDateTime(st.current_planned_start)} – {fmtTime(st.current_planned_end)}
+                                </td>
+                                <td
+                                  data-testid={`bio-preview-proposed-${st.step_order}`}
+                                  className="px-3 py-2 font-mono font-semibold text-indigo-900 whitespace-nowrap"
+                                >
+                                  {fmtDateTime(st.expected_start)} – {fmtTime(st.expected_end)}
+                                </td>
+                                <td className="px-3 py-2">
+                                  {st.eligible ? (
+                                    <span className="inline-flex items-center px-2 py-0.5 rounded bg-emerald-100 text-emerald-900 font-semibold">
+                                      Güncellenmeye Uygun
+                                    </span>
+                                  ) : (
+                                    <span
+                                      data-testid={`bio-preview-ineligible-${st.step_order}`}
+                                      className="inline-flex items-center px-2 py-0.5 rounded bg-amber-100 text-amber-900 font-medium"
+                                    >
+                                      Değiştirilemez: {st.ineligible_reason}
+                                    </span>
+                                  )}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : (
+                      <p className="text-slate-600 italic">Bu çalışmada bağımlı biyolojik gözlem adımı bulunamadı.</p>
+                    )}
+
+                    {/* Yeni Saatlerde Oluşan / Devam Eden Engeller */}
+                    {bioRevisionPreview.blocking_conflicts?.length > 0 ? (
+                      <div
+                        data-testid="bio-preview-blockers"
+                        className="rounded-md border border-red-300 bg-red-50 p-3.5 space-y-2 text-red-950"
+                      >
+                        <div className="font-bold flex items-center gap-1.5 text-red-900">
+                          <AlertTriangle className="w-4 h-4 shrink-0" />
+                          <span>
+                            Önerilen Yeni Saatlerde Kritik Planlama / Kapasite Engelleri (
+                            {bioRevisionPreview.blocking_conflicts.length})
+                          </span>
+                        </div>
+                        <ul className="list-disc list-inside space-y-1 text-red-900">
+                          {bioRevisionPreview.blocking_conflicts.map((bc, idx) => (
+                            <li key={idx}>
+                              <strong>{bc.title}:</strong> {bc.description}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    ) : (
+                      <div
+                        data-testid="bio-preview-no-blockers"
+                        className="rounded-md border border-emerald-200 bg-emerald-50 px-3.5 py-2 text-emerald-900 flex items-center gap-2"
+                      >
+                        <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0" />
+                        <span>
+                          Önerilen saatlerde kritik personel çakışması, 9 saat iş yükü aşımı, cihaz veya oda/kafes
+                          kapasitesi engeli bulunmamaktadır.
+                        </span>
+                      </div>
+                    )}
+
+                    {/* SD Revizyon Onay Formu */}
+                    {!isReadOnly && (
+                      <div className="border-t border-slate-200 pt-3.5 space-y-3">
+                        <div>
+                          <label
+                            htmlFor="bioRevisionReasonInput"
+                            className="block text-xs font-semibold text-slate-800 mb-1"
+                          >
+                            Çalışma Yöneticisi (SD) Revizyon Onay Gerekçesi (Zorunlu)
+                          </label>
+                          <input
+                            id="bioRevisionReasonInput"
+                            type="text"
+                            data-testid="bio-revision-reason-input"
+                            value={bioRevisionReason}
+                            onChange={(e) => setBioRevisionReason(e.target.value)}
+                            placeholder="Örn: Dozlama +180 dk geciktiği için 24/48/72. saat gözlemleri gerçek referansa göre revize edildi."
+                            className="w-full border border-slate-300 rounded-md px-3 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-indigo-600"
+                          />
+                        </div>
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <span className="text-[11px] text-slate-500">
+                            {bioRevisionPreview.status_reason ||
+                              `${bioRevisionPreview.affected_steps?.length || 0} uygun PENDING adım resmî takvimde güncellenecektir.`}
+                          </span>
+                          <button
+                            type="button"
+                            data-testid="approve-bio-revision-btn"
+                            disabled={
+                              approvingBioRevision ||
+                              !bioRevisionPreview.can_approve_revision
+                            }
+                            onClick={handleApproveBioRevision}
+                            className="inline-flex items-center gap-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-300 disabled:text-slate-500 text-white text-xs font-bold px-4 py-2 rounded-md shadow-xs transition"
+                          >
+                            {approvingBioRevision ? (
+                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            ) : (
+                              <CheckCheck className="w-3.5 h-3.5" />
+                            )}
+                            <span>Revizyonu Onayla ve Takvime İşle</span>
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
           <div className="grid gap-2 text-xs text-slate-600 bg-white border border-slate-200 rounded-lg px-4 py-3">
             <div className="flex flex-wrap items-center gap-2">
               <ShieldCheck className="w-4 h-4 text-slate-500" />
@@ -1368,18 +1772,44 @@ export default function Planning({ onScheduled }) {
                 {result.steps.map((s) => {
                   const flagged = conflictStepIds.has(s.id);
                   return (
-                    <tr key={s.id} className={flagged ? 'bg-red-50' : ''}>
-                      <td className="px-5 py-2.5 font-mono text-xs text-slate-600">G{s.study_day}</td>
+                    <tr
+                      key={s.id}
+                      data-testid={`schedule-step-row-${s.step_order}`}
+                      className={flagged ? 'bg-red-50' : ''}
+                    >
+                      <td
+                        data-testid={`schedule-step-day-${s.step_order}`}
+                        className="px-5 py-2.5 font-mono text-xs text-slate-600"
+                      >
+                        G{s.study_day}
+                      </td>
                       <td className="px-5 py-2.5 text-slate-800">
-                        {s.step_name}
-                        {flagged && (
-                          <span className="ml-2 text-[10px] font-bold text-white bg-red-600 px-1.5 py-0.5 rounded">
-                            ÇAKIŞMA
-                          </span>
+                        <div>
+                          {s.step_name}
+                          {flagged && (
+                            <span className="ml-2 text-[10px] font-bold text-white bg-red-600 px-1.5 py-0.5 rounded">
+                              ÇAKIŞMA
+                            </span>
+                          )}
+                        </div>
+                        {s.actual_reference_time && (
+                          <div
+                            data-testid={`schedule-step-ref-${s.step_order}`}
+                            className="mt-0.5 text-[11px] font-mono text-indigo-800"
+                          >
+                            Gerçek Ref: {fmtDateTime(s.actual_reference_time)} (
+                            {s.reference_deviation_minutes > 0
+                              ? `+${s.reference_deviation_minutes}`
+                              : s.reference_deviation_minutes}{' '}
+                            dk)
+                          </div>
                         )}
                       </td>
-                      <td className="px-5 py-2.5 text-xs text-slate-600 whitespace-nowrap">
-                        {fmtDateTime(s.planned_start)}
+                      <td
+                        data-testid={`schedule-step-planned-${s.step_order}`}
+                        className="px-5 py-2.5 text-xs text-slate-600 whitespace-nowrap font-mono"
+                      >
+                        {fmtDateTime(s.planned_start)} – {fmtTime(s.planned_end)}
                       </td>
                       <td className="px-5 py-2.5 text-xs text-slate-600">{fmtMinutes(s.duration_minutes)}</td>
                       <td className="px-5 py-2.5 text-xs text-slate-700">

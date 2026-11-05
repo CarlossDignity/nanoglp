@@ -69,6 +69,10 @@ export const getSteps = (params) => api.get('/planning/steps', { params });
 export const getCalendar = () => api.get('/planning/calendar');
 export const getStudySchedule = (studyId) => api.get(`/planning/studies/${studyId}/schedule`);
 export const approveStudyPlan = (studyId) => api.post(`/planning/studies/${studyId}/approve`);
+export const getBiologicalRevisionPreview = (studyId) =>
+  api.get(`/planning/studies/${studyId}/revision-preview`);
+export const approveBiologicalRevision = (studyId, data) =>
+  api.post(`/planning/studies/${studyId}/approve-revision`, data);
 export const getMyTasks = (targetDate) =>
   api.get('/planning/my-tasks', { params: targetDate ? { target_date: targetDate } : {} });
 export const updateStepStatus = (stepId, data) =>

@@ -167,9 +167,15 @@ def _daily_cage_usage(others: List[Dict[str, Any]], room_code: str, start: date,
 
 
 def _cage_eval(
-    room: AnimalRoomCapacity, tpl: StudyTemplate, others: List[Dict[str, Any]], g0: date, offset: int
+    room: AnimalRoomCapacity,
+    tpl: StudyTemplate,
+    others: List[Dict[str, Any]],
+    g0: date,
+    offset: int,
+    end_date: Optional[date] = None,
 ) -> Dict[str, Any]:
-    start, end = g0, g0 + timedelta(days=_span_days(tpl, offset))
+    default_end = g0 + timedelta(days=_span_days(tpl, offset))
+    start, end = g0, (max(default_end, end_date) if end_date is not None else default_end)
     usage = _daily_cage_usage(others, tpl.animal_room, start, end)
     peak_other = max(usage.values(), default=0)
     peak_total = peak_other + tpl.cage_count
@@ -277,7 +283,7 @@ def build_capacity_report(
         rooms = {r.room_code: r for r in ensure_default_room_capacities(db)}
         room = rooms.get(tpl.animal_room)
         if room is not None:
-            cage = _cage_eval(room, tpl, others, g0, offset)
+            cage = _cage_eval(room, tpl, others, g0, offset, end_date=study.target_end_date)
             cage["message"] = _cage_message(cage)
             report["cage"] = cage
     report["equipment"] = _equipment_eval(db, tpl, others, g0, offset)

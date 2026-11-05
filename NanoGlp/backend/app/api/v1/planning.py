@@ -22,8 +22,10 @@ from app.services.scheduling_engine import (
     REFERENCE_DATE,
     _safe_capacity_report,
     apply_conflict_resolution,
+    approve_biological_revision,
     build_conflict_resolutions,
     check_personnel_workload,
+    check_step_revision_eligibility,
     calculate_personnel_workload,
     compute_biological_dependency_info,
     enrich_conflicts_with_category,
@@ -32,6 +34,7 @@ from app.services.scheduling_engine import (
     get_study_schedule_detail,
     is_eligible_lab_personnel,
     is_historical_unverified_step,
+    preview_biological_revision,
     recompute_all_conflicts,
     revalidate_study_conflicts,
     schedule_new_study,
@@ -187,12 +190,18 @@ def _serialize_step(s: StudyStep, study_steps: Optional[List[StudyStep]] = None)
     bio_item: dict = {}
     dep_steps: list = []
     rev_proposals: list = []
+    inelig_steps: list = []
+    source_devs: list = []
+    bio_revs: list = []
     if s.study is not None:
         steps_list = study_steps if study_steps is not None else list(getattr(s.study, "steps", None) or [s])
         bio_info = compute_biological_dependency_info(s.study, steps_list)
         bio_item = bio_info["by_step_id"].get(s.id) or {}
         dep_steps = bio_info["dependent_by_ref_order"].get(s.step_order, [])
         rev_proposals = bio_info["revision_proposals"]
+        inelig_steps = bio_info["ineligible_revision_steps"]
+        source_devs = bio_info["source_deviations"]
+        bio_revs = bio_info["biological_revisions"]
 
     dev_min = bio_item.get("deviation_minutes", 0)
     return {
@@ -227,9 +236,20 @@ def _serialize_step(s: StudyStep, study_steps: Optional[List[StudyStep]] = None)
         "exceeds_biological_tolerance": bio_item.get("exceeds_tolerance", False),
         "requires_plan_revision": bio_item.get("requires_revision", False),
         "revision_suggestion": bio_item.get("revision_suggestion"),
+        "eligible_for_revision": bio_item.get("eligible_for_revision", False),
+        "ineligible_reason": bio_item.get("ineligible_reason"),
+        "proposed_study_day": bio_item.get("proposed_study_day", s.study_day),
+        "expected_study_day": bio_item.get("expected_study_day", s.study_day),
+        "day_changed": bio_item.get("day_changed", False),
+        "expected_day_changed": bio_item.get("expected_day_changed", False),
+        "sd_revision_approved": bio_item.get("sd_revision_approved", False),
+        "sd_revision_decision": bio_item.get("sd_revision_decision"),
         "deviation_notes": s.deviation_notes,
         "dependent_steps": dep_steps,
         "revision_proposals": rev_proposals,
+        "ineligible_revision_steps": inelig_steps,
+        "source_deviations": source_devs,
+        "biological_revisions": bio_revs,
         "duration_minutes": s.duration_minutes,
         "is_biological_fixed_time": s.is_biological_fixed_time,
         "biological_tolerance_minutes": s.biological_tolerance_minutes,
@@ -644,6 +664,76 @@ def api_get_study_schedule(
     if not study:
         raise HTTPException(status_code=404, detail="GLP çalışması bulunamadı.")
     return get_study_schedule_detail(db, study)
+
+
+class ApproveBiologicalRevisionRequest(BaseModel):
+    reason: Optional[str] = None
+    justification: Optional[str] = None
+    preview_token: Optional[str] = None
+    expected_source_reference_time: Optional[str] = None
+    expected_steps: Optional[List[dict]] = None
+
+
+@router.get(
+    "/studies/{study_id}/revision-preview",
+    summary="SD Onaylı Biyolojik Plan Revizyonu Önizlemesi (Salt-Okunur)",
+)
+@router.get(
+    "/studies/{study_id}/biological-revision-preview",
+    summary="SD Onaylı Biyolojik Plan Revizyonu Önizlemesi (Alias)",
+    include_in_schema=False,
+)
+def api_preview_biological_revision(
+    study_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_management_read),
+):
+    try:
+        return preview_biological_revision(db=db, study_id=study_id)
+    except LookupError as le:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(le))
+
+
+@router.post(
+    "/studies/{study_id}/approve-revision",
+    summary="SD Onaylı Biyolojik Plan Revizyonunu Onayla ve Resmî Takvime İşle",
+)
+@router.post(
+    "/studies/{study_id}/biological-revision/approve",
+    summary="SD Onaylı Biyolojik Plan Revizyonunu Onayla (Alias)",
+    include_in_schema=False,
+)
+@router.post(
+    "/studies/{study_id}/approve-biological-revision",
+    summary="SD Onaylı Biyolojik Plan Revizyonunu Onayla (Alias 2)",
+    include_in_schema=False,
+)
+def api_approve_biological_revision(
+    study_id: int,
+    payload: ApproveBiologicalRevisionRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    effective_reason = payload.reason if payload.reason is not None else payload.justification
+    try:
+        return approve_biological_revision(
+            db=db,
+            study_id=study_id,
+            user=current_user,
+            reason=effective_reason,
+            preview_token=payload.preview_token,
+            expected_source_reference_time=payload.expected_source_reference_time,
+            expected_steps=payload.expected_steps,
+        )
+    except LookupError as le:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(le))
+    except PermissionError as pe:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(pe))
+    except ValueError as ve:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(ve))
+    except RuntimeError as re:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(re))
+
 
 
 @router.post("/studies/{study_id}/approve", summary="Taslak Çalışma Planını Onayla ve Aktif Çalışmalara Al (FAZ 6.3)")

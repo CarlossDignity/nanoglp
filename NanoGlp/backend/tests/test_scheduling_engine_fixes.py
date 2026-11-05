@@ -2666,6 +2666,978 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
             self.assertEqual(r_norm_end.json()["actual_start"], "2026-12-07T09:00:00")
             self.assertEqual(r_norm_end.json()["actual_end"], "2026-12-07T12:00:00")
 
+    # ------------------------------------------------------------------
+    # 19. SD Onaylı Biyolojik Plan Revizyonu (Kabul Testleri 1–8)
+    # ------------------------------------------------------------------
+    def test_19_biological_plan_revision_workflow_and_atomicity(self):
+        from app.models.audit_log import AuditLog
+        from app.utils.security import get_password_hash
+
+        sd_ezgi = self.people["ezgi"]
+        sd_onur = User(
+            username="onur_sd",
+            full_name="Onur Diğer SD",
+            email="onur_sd@nanolab.com.tr",
+            role=UserRole.STUDY_DIRECTOR,
+            department="Biyouyumluluk",
+            hashed_password=get_password_hash(DEFAULT_PASSWORD),
+            is_active=True,
+        )
+        self.db.add(sd_onur)
+        self.db.commit()
+
+        tech1 = self.people["invivo_1"]
+        tech2 = self.people["invivo_2"]
+        qa_user = self.people["qa_user"]
+
+        h_ezgi = _login_headers(self.client, "ezgi")
+        h_onur = _login_headers(self.client, "onur_sd")
+        h_tech1 = _login_headers(self.client, "invivo_1")
+        h_qa = _login_headers(self.client, "qa_user")
+
+        # Çalışma oluştur (Gün 0 = 2027-01-04 Pazartesi, Gün 7 Dozlama = 2027-01-11, Gün 8/9/10 = 12/13/14 Ocak)
+        st = Study(
+            study_code="FIX19-REV-001",
+            title="SD Biyolojik Plan Revizyonu Çalışması",
+            test_item_name="Revizyon Test Jel",
+            study_director_id=sd_ezgi.id,
+            status=StudyStatus.DRAFT,
+            animal_species_strain="Tavşan (New Zealand White)",
+            animal_count=3,
+            extraction_polar=True,
+            extraction_non_polar=False,
+        )
+        self.db.add(st)
+        self.db.commit()
+        schedule_new_study(self.db, st.id, date(2027, 1, 4))
+        st.status = StudyStatus.IN_PROGRESS
+        self.db.commit()
+
+        steps = (
+            self.db.query(StudyStep)
+            .filter(StudyStep.study_id == st.id)
+            .order_by(StudyStep.step_order.asc())
+            .all()
+        )
+        day7 = next(s for s in steps if s.study_day == 7)   # order=3, 2027-01-11 09:00-12:00, Plan Ref: 10:00
+        day8 = next(s for s in steps if s.study_day == 8)   # order=4, 2027-01-12 10:00-10:45 (24s)
+        day9 = next(s for s in steps if s.study_day == 9)   # order=5, 2027-01-13 10:00-10:45 (48s)
+        day10 = next(s for s in steps if s.study_day == 10)  # order=6, 2027-01-14 10:00-10:45 (72s)
+
+        # Ek bir CANCELLED bağımlı adım (uygunluk testi için)
+        cancelled_dep = StudyStep(
+            study_id=st.id,
+            step_order=6,
+            study_day=10,
+            step_name="İptal Edilmiş 72. Saat Gözlem Kopyası",
+            step_type="Gözlem",
+            planned_start=datetime(2027, 1, 14, 10, 0),
+            planned_end=datetime(2027, 1, 14, 10, 45),
+            is_biological_fixed_time=True,
+            biological_tolerance_minutes=120,
+            status=StepStatus.CANCELLED,
+        )
+        self.db.add(cancelled_dep)
+        self.db.commit()
+
+        # Kaynak adım (day7) gerçek referans saatini +180 dk gecikmeyle (13:00) kaydet ve tamamla
+        r_ref = self.client.patch(
+            f"/api/v1/planning/steps/{day7.id}/status",
+            headers=h_tech1,
+            json={
+                "status": "COMPLETED",
+                "actual_start": "2027-01-11T12:00:00",
+                "actual_reference_time": "2027-01-11T13:00:00",
+                "actual_end": "2027-01-11T14:00:00",
+            },
+        )
+        self.assertEqual(r_ref.status_code, 200, r_ref.text)
+
+        # ------------------------------------------------------------------
+        # (1) Önizleme salt-okunur olmalı: planned_start / planned_end ve study.status değişmemeli
+        # ------------------------------------------------------------------
+        self.db.expire_all()
+        before_times = {
+            s.id: (s.planned_start, s.planned_end, s.study_day, s.status)
+            for s in self.db.query(StudyStep).filter(StudyStep.study_id == st.id, StudyStep.status != StepStatus.CANCELLED).all()
+        }
+        r_prev = self.client.get(
+            f"/api/v1/planning/studies/{st.id}/revision-preview",
+            headers=h_ezgi,
+        )
+        self.assertEqual(r_prev.status_code, 200, r_prev.text)
+        prev_data = r_prev.json()
+        self.assertEqual(prev_data["source_reference"]["actual_reference_time"], "2027-01-11T13:00:00")
+        self.assertEqual(prev_data["source_reference"]["deviation_minutes"], 180)
+        self.assertEqual(len(prev_data["affected_steps"]), 3)
+
+        self.db.expire_all()
+        after_times = {
+            s.id: (s.planned_start, s.planned_end, s.study_day, s.status)
+            for s in self.db.query(StudyStep).filter(StudyStep.study_id == st.id, StudyStep.status != StepStatus.CANCELLED).all()
+        }
+        self.assertEqual(before_times, after_times, "Önizleme çağrısı hiçbir adımın planlanan saatini değiştirmemeli")
+
+        # ------------------------------------------------------------------
+        # (2) Adım uygunluğu: COMPLETED, CANCELLED, IN_PROGRESS veya actual_* verisi olan PENDING
+        #     adımlar kaydırılmamalı; yalnızca uygun PENDING adımlar güncellenmeli
+        # ------------------------------------------------------------------
+        # day8'i COMPLETED yap ve gerçekleşen gözlem ihlali oluştur (beklenen 13:00 yerine 10:00'da gözlemlenmiş olsun)
+        self.db.expire_all()
+        d8_orm = self.db.query(StudyStep).filter(StudyStep.id == day8.id).first()
+        d8_orm.status = StepStatus.COMPLETED
+        d8_orm.actual_start = datetime(2027, 1, 12, 9, 50)
+        d8_orm.actual_reference_time = datetime(2027, 1, 12, 10, 0)  # beklenen 13:00'a göre -180 dk (>120 dk ihlal!)
+        d8_orm.actual_end = datetime(2027, 1, 12, 10, 30)
+        self.db.commit()
+        revalidate_study_conflicts(self.db, st)
+        self.db.commit()
+
+        # day9'u önce IN_PROGRESS olarak test et -> uygun olmamalı
+        d9_orm = self.db.query(StudyStep).filter(StudyStep.id == day9.id).first()
+        d9_orm.status = StepStatus.IN_PROGRESS
+        d9_orm.actual_start = datetime(2027, 1, 13, 10, 0)
+        self.db.commit()
+
+        r_prev_elig1 = self.client.get(
+            f"/api/v1/planning/studies/{st.id}/revision-preview",
+            headers=h_ezgi,
+        ).json()
+        aff_orders_1 = [x["step_order"] for x in r_prev_elig1["affected_steps"]]
+        inelig_by_order_1 = {x["step_order"]: x for x in r_prev_elig1["ineligible_steps"]}
+        self.assertEqual(aff_orders_1, [day10.step_order], "Yalnızca PENDING ve actual verisi olmayan day10 uygun olmalı")
+        self.assertIn(day8.step_order, inelig_by_order_1)
+        self.assertIn("COMPLETED", inelig_by_order_1[day8.step_order]["ineligible_reason"])
+        self.assertIn(day9.step_order, inelig_by_order_1)
+        self.assertIn("IN_PROGRESS", inelig_by_order_1[day9.step_order]["ineligible_reason"])
+        self.assertTrue(
+            any(x["status"] == "CANCELLED" for x in r_prev_elig1["ineligible_steps"]),
+            "CANCELLED adımlar da uygun olmayan adımlar arasında nedeni ile gösterilmeli",
+        )
+
+        # Şimdi day9'u status=PENDING ama actual_start dolu olarak test et -> yine uygun olmamalı!
+        d9_orm = self.db.query(StudyStep).filter(StudyStep.id == day9.id).first()
+        d9_orm.status = StepStatus.PENDING
+        d9_orm.actual_start = datetime(2027, 1, 13, 10, 5)
+        self.db.commit()
+
+        r_prev_elig2 = self.client.get(
+            f"/api/v1/planning/studies/{st.id}/revision-preview",
+            headers=h_ezgi,
+        ).json()
+        aff_orders_2 = [x["step_order"] for x in r_prev_elig2["affected_steps"]]
+        inelig_by_order_2 = {x["step_order"]: x for x in r_prev_elig2["ineligible_steps"]}
+        self.assertEqual(aff_orders_2, [day10.step_order])
+        self.assertIn(day9.step_order, inelig_by_order_2)
+        self.assertIn("actual_start", inelig_by_order_2[day9.step_order]["ineligible_reason"])
+
+        # Şimdi day9'un actual_start'ını temizle ki day9 ve day10 uygun PENDING olsun, day8 COMPLETED kalsın
+        d9_orm = self.db.query(StudyStep).filter(StudyStep.id == day9.id).first()
+        d9_orm.actual_start = None
+        d9_orm.actual_end = None
+        d9_orm.actual_reference_time = None
+        self.db.commit()
+
+        # ------------------------------------------------------------------
+        # (4) Yetki ve gerekçe kontrolleri (403 ve 422)
+        # ------------------------------------------------------------------
+        # Farklı SD (onur) -> 403
+        r_unauth_sd = self.client.post(
+            f"/api/v1/planning/studies/{st.id}/approve-revision",
+            headers=h_onur,
+            json={"reason": "Farklı SD onay denemesi"},
+        )
+        self.assertEqual(r_unauth_sd.status_code, 403, r_unauth_sd.text)
+
+        # Teknisyen -> 403
+        r_unauth_tech = self.client.post(
+            f"/api/v1/planning/studies/{st.id}/approve-revision",
+            headers=h_tech1,
+            json={"reason": "Teknisyen onay denemesi"},
+        )
+        self.assertEqual(r_unauth_tech.status_code, 403, r_unauth_tech.text)
+
+        # QA (salt-okunur) -> 403
+        r_unauth_qa = self.client.post(
+            f"/api/v1/planning/studies/{st.id}/approve-revision",
+            headers=h_qa,
+            json={"reason": "QA onay denemesi"},
+        )
+        self.assertEqual(r_unauth_qa.status_code, 403, r_unauth_qa.text)
+
+        # Boş gerekçe -> 422
+        r_empty_reason = self.client.post(
+            f"/api/v1/planning/studies/{st.id}/approve-revision",
+            headers=h_ezgi,
+            json={"reason": "   "},
+        )
+        self.assertEqual(r_empty_reason.status_code, 422, r_empty_reason.text)
+
+        # ------------------------------------------------------------------
+        # (5a) Bayat önizleme (Stale Preview): Önizleme alındıktan sonra kaynak referans değişirse eski onay 409 ile reddedilmeli
+        # ------------------------------------------------------------------
+        stale_prev = self.client.get(
+            f"/api/v1/planning/studies/{st.id}/revision-preview",
+            headers=h_ezgi,
+        ).json()
+        stale_token = stale_prev["preview_token"]
+
+        # Kaynak referans saatini 13:00 -> 13:30 olarak değiştir
+        self.client.patch(
+            f"/api/v1/planning/steps/{day7.id}/status",
+            headers=h_tech1,
+            json={"actual_reference_time": "2027-01-11T13:30:00"},
+        )
+
+        # Eski preview_token ile (veya önbellekteki eski önizleme sonrasında) onay 409 dönmeli
+        r_stale = self.client.post(
+            f"/api/v1/planning/studies/{st.id}/approve-revision",
+            headers=h_ezgi,
+            json={"reason": "Bayat önizleme ile onay", "preview_token": stale_token},
+        )
+        self.assertEqual(r_stale.status_code, 409, r_stale.text)
+
+        # Kaynak referansı tekrar 13:00 yap
+        self.client.patch(
+            f"/api/v1/planning/steps/{day7.id}/status",
+            headers=h_tech1,
+            json={"actual_reference_time": "2027-01-11T13:00:00"},
+        )
+
+        # ------------------------------------------------------------------
+        # (6) Engel kontrolleri: Yeni saatlerde çakışma / kapasite / eksik rol / kapasite doğrulama hatası varsa 409 ve 0 değişiklik
+        # ------------------------------------------------------------------
+        # 6A) Başka bir çalışmada (other_st) 2027-01-13 13:00-13:45 saatinde aynı teknisyenin görevi varsa -> PERSONNEL_OVERLAP engeli
+        other_st = Study(
+            study_code="FIX19-BLOCKER",
+            title="Blocker Study",
+            test_item_name="Blocker Item",
+            study_director_id=sd_ezgi.id,
+            status=StudyStatus.APPROVED,
+            acclimatization_start_date=date(2027, 1, 4),
+            target_start_date=date(2027, 1, 4),
+            target_end_date=date(2027, 1, 15),
+        )
+        self.db.add(other_st)
+        self.db.flush()
+        blocker_step = StudyStep(
+            study_id=other_st.id,
+            step_order=1,
+            study_day=9,
+            step_name="Çakışan Görev",
+            step_type="Gözlem",
+            planned_start=datetime(2027, 1, 13, 13, 0),
+            planned_end=datetime(2027, 1, 13, 13, 45),
+            is_biological_fixed_time=True,
+            biological_tolerance_minutes=60,
+            status=StepStatus.PENDING,
+        )
+        blocker_step.assignees = list(day9.assignees)
+        self.db.add(blocker_step)
+        self.db.commit()
+
+        prev_with_blocker = self.client.get(
+            f"/api/v1/planning/studies/{st.id}/revision-preview",
+            headers=h_ezgi,
+        ).json()
+        self.assertTrue(prev_with_blocker["has_blocking_obstacles"])
+        self.assertFalse(prev_with_blocker["can_approve_revision"])
+        self.assertTrue(any(c["type"] == "PERSONNEL_OVERLAP" for c in prev_with_blocker["blocking_conflicts"]))
+
+        r_blocked_overlap = self.client.post(
+            f"/api/v1/planning/studies/{st.id}/approve-revision",
+            headers=h_ezgi,
+            json={"reason": "Çakışma varken onay denemesi", "preview_token": prev_with_blocker["preview_token"]},
+        )
+        self.assertEqual(r_blocked_overlap.status_code, 409, r_blocked_overlap.text)
+        self.db.expire_all()
+        self.assertEqual(
+            self.db.query(StudyStep).filter(StudyStep.id == day9.id).first().planned_start,
+            datetime(2027, 1, 13, 10, 0),
+            "Engellenen revizyon adım saatini değiştirmemeli",
+        )
+
+        # 6B) 9 saat (540 dk) günlük iş yükü aşımı engeli (çakışmayan saatte 500 dk görev + 45 dk revize adım = 545 dk > 540 dk)
+        blocker_step.planned_start = datetime(2027, 1, 13, 1, 0)
+        blocker_step.planned_end = datetime(2027, 1, 13, 9, 20)  # 500 dk
+        self.db.commit()
+
+        prev_workload = self.client.get(
+            f"/api/v1/planning/studies/{st.id}/revision-preview",
+            headers=h_ezgi,
+        ).json()
+        self.assertTrue(prev_workload["has_blocking_obstacles"])
+        self.assertTrue(any("9 Saat İş Yükü Aşımı" in c["title"] for c in prev_workload["blocking_conflicts"]))
+        r_blocked_wl = self.client.post(
+            f"/api/v1/planning/studies/{st.id}/approve-revision",
+            headers=h_ezgi,
+            json={"reason": "9 saat aşımı varken onay", "preview_token": prev_workload["preview_token"]},
+        )
+        self.assertEqual(r_blocked_wl.status_code, 409, r_blocked_wl.text)
+
+        # Blocker step'i kaldır
+        self.db.delete(blocker_step)
+        self.db.delete(other_st)
+        self.db.commit()
+
+        # 6C) Eksik zorunlu rol ataması (QUALIFICATION_MISMATCH) engeli
+        self.db.expire_all()
+        d10_orm = self.db.query(StudyStep).filter(StudyStep.id == day10.id).first()
+        saved_d10_assignees = list(d10_orm.assignees)
+        d10_orm.assignees = []
+        self.db.commit()
+
+        prev_missing_role = self.client.get(
+            f"/api/v1/planning/studies/{st.id}/revision-preview",
+            headers=h_ezgi,
+        ).json()
+        self.assertTrue(prev_missing_role["has_blocking_obstacles"])
+        self.assertTrue(any(c["type"] == "QUALIFICATION_MISMATCH" for c in prev_missing_role["blocking_conflicts"]))
+        r_blocked_role = self.client.post(
+            f"/api/v1/planning/studies/{st.id}/approve-revision",
+            headers=h_ezgi,
+            json={"reason": "Eksik rol varken onay", "preview_token": prev_missing_role["preview_token"]},
+        )
+        self.assertEqual(r_blocked_role.status_code, 409, r_blocked_role.text)
+
+        d10_orm = self.db.query(StudyStep).filter(StudyStep.id == day10.id).first()
+        d10_orm.assignees = saved_d10_assignees
+        self.db.commit()
+
+        # 6D) Kapasite doğrulama hatası (build_capacity_report exception) engeli
+        with patch("app.services.scheduling_engine.build_capacity_report", side_effect=RuntimeError("Simüle Kapasite Servis Hatası")):
+            prev_cap_err = self.client.get(
+                f"/api/v1/planning/studies/{st.id}/revision-preview",
+                headers=h_ezgi,
+            ).json()
+            self.assertFalse(prev_cap_err["capacity_verified"])
+            self.assertTrue(prev_cap_err["has_blocking_obstacles"])
+            r_blocked_cap_err = self.client.post(
+                f"/api/v1/planning/studies/{st.id}/approve-revision",
+                headers=h_ezgi,
+                json={"reason": "Kapasite hatası varken onay", "preview_token": prev_cap_err["preview_token"]},
+            )
+            self.assertEqual(r_blocked_cap_err.status_code, 409, r_blocked_cap_err.text)
+
+        # 6E) Oda/kafes kapasitesi aşımı (ROOM_CAPACITY_EXCEEDED) engeli
+        from app.models.room_capacity import AnimalRoomCapacity, ensure_default_room_capacities
+
+        ensure_default_room_capacities(self.db)
+        self.db.expire_all()
+        rabbit_room = self.db.query(AnimalRoomCapacity).filter(AnimalRoomCapacity.room_code == "RABBIT_ROOM").first()
+        orig_phys_cages = rabbit_room.physical_cages
+        orig_flex_pct = rabbit_room.flexibility_pct
+        rabbit_room.physical_cages = 1
+        rabbit_room.flexibility_pct = 0
+        self.db.commit()
+
+        prev_cage_exceed = self.client.get(
+            f"/api/v1/planning/studies/{st.id}/revision-preview",
+            headers=h_ezgi,
+        ).json()
+        self.assertTrue(prev_cage_exceed["has_blocking_obstacles"])
+        self.assertTrue(any(c["type"] == "ROOM_CAPACITY_EXCEEDED" for c in prev_cage_exceed["blocking_conflicts"]))
+        r_blocked_cage = self.client.post(
+            f"/api/v1/planning/studies/{st.id}/approve-revision",
+            headers=h_ezgi,
+            json={"reason": "Kafes aşımı varken onay", "preview_token": prev_cage_exceed["preview_token"]},
+        )
+        self.assertEqual(r_blocked_cage.status_code, 409, r_blocked_cage.text)
+
+        rabbit_room = self.db.query(AnimalRoomCapacity).filter(AnimalRoomCapacity.room_code == "RABBIT_ROOM").first()
+        rabbit_room.physical_cages = orig_phys_cages
+        rabbit_room.flexibility_pct = orig_flex_pct
+        self.db.commit()
+
+        # 6F) Cihaz kapasitesi / ekipman çakışması (EQUIPMENT_OVERLAP) engeli
+        from app.services.scheduling_engine import seed_default_equipment
+
+        wb_eq = seed_default_equipment(self.db)
+        eq_other_st = Study(
+            study_code="FIX19-EQ-BLOCKER",
+            title="Equipment Blocker Study",
+            test_item_name="Blocker Eq Item",
+            study_director_id=sd_ezgi.id,
+            status=StudyStatus.APPROVED,
+            animal_species_strain="Tavşan",
+            animal_count=3,
+        )
+        self.db.add(eq_other_st)
+        self.db.flush()
+        eq_other_step = StudyStep(
+            study_id=eq_other_st.id,
+            step_order=1,
+            study_day=1,
+            step_name="Cihaz Kullanan Adım",
+            step_type="Gözlem",
+            planned_start=datetime(2027, 1, 13, 13, 0),
+            planned_end=datetime(2027, 1, 13, 14, 0),
+            is_biological_fixed_time=True,
+            biological_tolerance_minutes=60,
+            equipment_id=wb_eq.id,
+            status=StepStatus.PENDING,
+        )
+        self.db.add(eq_other_step)
+        d9_orm_eq = self.db.query(StudyStep).filter(StudyStep.id == day9.id).first()
+        d9_orm_eq.equipment_id = wb_eq.id
+        self.db.commit()
+
+        prev_eq_exceed = self.client.get(
+            f"/api/v1/planning/studies/{st.id}/revision-preview",
+            headers=h_ezgi,
+        ).json()
+        self.assertTrue(prev_eq_exceed["has_blocking_obstacles"])
+        self.assertTrue(any(c["type"] == "EQUIPMENT_OVERLAP" for c in prev_eq_exceed["blocking_conflicts"]))
+        r_blocked_eq = self.client.post(
+            f"/api/v1/planning/studies/{st.id}/approve-revision",
+            headers=h_ezgi,
+            json={"reason": "Cihaz çakışması varken onay", "preview_token": prev_eq_exceed["preview_token"]},
+        )
+        self.assertEqual(r_blocked_eq.status_code, 409, r_blocked_eq.text)
+
+        self.db.expire_all()
+        d9_orm_eq = self.db.query(StudyStep).filter(StudyStep.id == day9.id).first()
+        d9_orm_eq.equipment_id = None
+        self.db.delete(self.db.query(StudyStep).filter(StudyStep.id == eq_other_step.id).first())
+        self.db.delete(self.db.query(Study).filter(Study.id == eq_other_st.id).first())
+        self.db.commit()
+
+        # ------------------------------------------------------------------
+        # (8) Atomiklik: İşlem ortasında kontrollü hata oluştuğunda adım planları,
+        #     çalışma meta verisi ve çakışma kayıtları birlikte geri alınmalı
+        # ------------------------------------------------------------------
+        from app.services.scheduling_engine import approve_biological_revision
+
+        clean_prev = self.client.get(
+            f"/api/v1/planning/studies/{st.id}/revision-preview",
+            headers=h_ezgi,
+        ).json()
+        self.assertTrue(clean_prev["can_approve_revision"])
+
+        with self.assertRaises(RuntimeError):
+            approve_biological_revision(
+                db=self.db,
+                study_id=st.id,
+                user=sd_ezgi,
+                reason="Atomik rollback testi",
+                preview_token=clean_prev["preview_token"],
+                _fail_mid_transaction_for_test=True,
+            )
+
+        self.db.expire_all()
+        st_after_fail = self.db.query(Study).filter(Study.id == st.id).first()
+        d9_after_fail = self.db.query(StudyStep).filter(StudyStep.id == day9.id).first()
+        d10_after_fail = self.db.query(StudyStep).filter(StudyStep.id == day10.id).first()
+        open_src_conf = (
+            self.db.query(Conflict)
+            .filter(
+                Conflict.study_id == st.id,
+                Conflict.is_resolved == False,  # noqa: E712
+                Conflict.title.like("%Biyolojik Referans Saat Sapması%"),
+            )
+            .first()
+        )
+        self.assertEqual(d9_after_fail.planned_start, datetime(2027, 1, 13, 10, 0), "Rollback sonrası day9 saati değişmemeli")
+        self.assertEqual(d10_after_fail.planned_start, datetime(2027, 1, 14, 10, 0), "Rollback sonrası day10 saati değişmemeli")
+        self.assertFalse(
+            bool((st_after_fail.dossier_metadata or {}).get("biological_revisions")),
+            "Rollback sonrası dossier_metadata içinde biological_revisions kalmamalı",
+        )
+        self.assertIsNotNone(open_src_conf, "Rollback sonrası kaynak sapma çakışması açık kalmalı")
+
+        # ------------------------------------------------------------------
+        # (3) Gün/gece yarısı geçişi ve (7) Başarılı onay, sapma/karar koruma ve yeniden hesaplama
+        #     Kaynak referansı 22:00 yapalım (10:00 -> 22:00 = +720 dk):
+        #     48. saat gözlem: 2027-01-13 22:00 - 22:45 (G9)
+        #     72. saat gözlem: 2027-01-14 22:00 + 150 dk süre verirsek 2027-01-15 00:30'a taşar veya
+        #     kaynak referansı 2027-01-12 01:00 (+15 saat = +900 dk) yaparsak:
+        #       - 48s gözlem: 2027-01-13 10:00 (G9) -> 2027-01-14 01:00 (G10) [Gün değişimi G9 -> G10!]
+        #       - 72s gözlem: 2027-01-14 10:00 (G10) -> 2027-01-15 01:00 (G11) [Gün değişimi G10 -> G11, target_end_date 14 Ocak -> 15 Ocak!]
+        # ------------------------------------------------------------------
+        self.client.patch(
+            f"/api/v1/planning/steps/{day7.id}/status",
+            headers=h_tech1,
+            json={
+                "status": "COMPLETED",
+                "actual_start": "2027-01-11T22:00:00",
+                "actual_reference_time": "2027-01-12T01:00:00",
+                "actual_end": "2027-01-12T01:30:00",
+            },
+        )
+        # Gece 01:00 mesai dışı uyarısı (WARNING) engellemez, önizlemede G9->G10 ve G10->G11 gün değişimini doğrula
+        prev_midnight = self.client.get(
+            f"/api/v1/planning/studies/{st.id}/revision-preview",
+            headers=h_ezgi,
+        ).json()
+        self.assertTrue(prev_midnight["can_approve_revision"], prev_midnight)
+        self.assertTrue(prev_midnight["any_day_changed"])
+        self.assertTrue(prev_midnight["target_end_date_changed"])
+        self.assertEqual(prev_midnight["current_target_end_date"], "2027-01-14")
+        self.assertEqual(prev_midnight["proposed_target_end_date"], "2027-01-15")
+
+        aff_by_order = {x["step_order"]: x for x in prev_midnight["affected_steps"]}
+        self.assertEqual(aff_by_order[day9.step_order]["current_study_day"], 9)
+        self.assertEqual(aff_by_order[day9.step_order]["proposed_study_day"], 10)
+        self.assertTrue(aff_by_order[day9.step_order]["day_changed"])
+        self.assertEqual(aff_by_order[day10.step_order]["current_study_day"], 10)
+        self.assertEqual(aff_by_order[day10.step_order]["proposed_study_day"], 11)
+        self.assertTrue(aff_by_order[day10.step_order]["day_changed"])
+
+        # SD gerekçesiyle revizyonu onayla
+        sd_reason = "Dozlama gece 01:00'de tamamlandığı için 48 ve 72. saat gözlemleri yeni güne revize edildi."
+        r_approve = self.client.post(
+            f"/api/v1/planning/studies/{st.id}/approve-revision",
+            headers=h_ezgi,
+            json={
+                "reason": sd_reason,
+                "preview_token": prev_midnight["preview_token"],
+            },
+        )
+        self.assertEqual(r_approve.status_code, 200, r_approve.text)
+        app_data = r_approve.json()
+        self.assertEqual(app_data["target_end_date"], "2027-01-15")
+
+        # (5b) Aynı onayın ikinci kez gönderilmesi (mükerrer gönderim) 409 ile reddedilmeli ve ikinci kez kaydırma yapmamalı
+        r_dup = self.client.post(
+            f"/api/v1/planning/studies/{st.id}/approve-revision",
+            headers=h_ezgi,
+            json={"reason": sd_reason},
+        )
+        self.assertEqual(r_dup.status_code, 409, r_dup.text)
+
+        self.db.expire_all()
+        st_db = self.db.query(Study).filter(Study.id == st.id).first()
+        d7_db = self.db.query(StudyStep).filter(StudyStep.id == day7.id).first()
+        d8_db = self.db.query(StudyStep).filter(StudyStep.id == day8.id).first()
+        d9_db = self.db.query(StudyStep).filter(StudyStep.id == day9.id).first()
+        d10_db = self.db.query(StudyStep).filter(StudyStep.id == day10.id).first()
+
+        # Kaynak adımın orijinal planı ve gerçek referansı korunmalı
+        self.assertEqual(d7_db.planned_start, datetime(2027, 1, 11, 9, 0))
+        self.assertEqual(d7_db.planned_end, datetime(2027, 1, 11, 12, 0))
+        self.assertEqual(d7_db.actual_reference_time, datetime(2027, 1, 12, 1, 0))
+
+        # Uygun olmayan COMPLETED adım (day8) kaydırılmamalı
+        self.assertEqual(d8_db.planned_start, datetime(2027, 1, 12, 10, 0))
+        self.assertEqual(d8_db.study_day, 8)
+
+        # Uygun PENDING adımlar (day9, day10) yeni saatlere ve yeni study_day değerlerine güncellenmeli
+        self.assertEqual(d9_db.planned_start, datetime(2027, 1, 14, 1, 0))
+        self.assertEqual(d9_db.planned_end, datetime(2027, 1, 14, 2, 0))
+        self.assertEqual(d9_db.study_day, 10)
+        self.assertEqual(d10_db.planned_start, datetime(2027, 1, 15, 1, 0))
+        self.assertEqual(d10_db.planned_end, datetime(2027, 1, 15, 3, 0))
+        self.assertEqual(d10_db.study_day, 11)
+        self.assertEqual(st_db.target_end_date, date(2027, 1, 15))
+
+        # Tek bir biological_revisions kaydı ve AuditLog kaydı oluşmalı
+        revs_meta = (st_db.dossier_metadata or {}).get("biological_revisions") or []
+        self.assertEqual(len(revs_meta), 1, "Mükerrer revizyon kaydı oluşmamalı")
+        self.assertEqual(revs_meta[0]["reason"], sd_reason)
+        self.assertEqual(revs_meta[0]["approved_by_id"], sd_ezgi.id)
+
+        audit_row = (
+            self.db.query(AuditLog)
+            .filter(AuditLog.entity_name == "Study", AuditLog.entity_id == st.id, AuditLog.action == "APPROVE_BIOLOGICAL_REVISION")
+            .first()
+        )
+        self.assertIsNotNone(audit_row)
+        self.assertEqual(audit_row.reason, sd_reason)
+        self.assertEqual(audit_row.old_values["target_end_date"], "2027-01-14")
+        self.assertEqual(audit_row.new_values["target_end_date"], "2027-01-15")
+
+        # (7) Çakışma durumu: ileriye dönük Bağımlı Biyolojik Adım Sapması (day9, day10) kalkmalı,
+        #     kaynak sapması ve SD kararı korunmalı, daha önce gerçekleşmiş day8 gözlem ihlali ise AÇIK kalmalı!
+        open_confs = (
+            self.db.query(Conflict)
+            .filter(Conflict.study_id == st.id, Conflict.is_resolved == False)  # noqa: E712
+            .all()
+        )
+        open_titles = [c.title for c in open_confs]
+        self.assertFalse(
+            any("Biyolojik Referans Saat Sapması" in t for t in open_titles),
+            f"SD onayından sonra kaynak referans sapma çakışması açık kalmamalı: {open_titles}",
+        )
+        self.assertFalse(
+            any("Bağımlı Biyolojik Adım Sapması" in t and ("48. Saat" in t or "72. Saat" in t) for t in open_titles),
+            f"Revize edilen 48 ve 72. saat adımlarında Bağımlı Biyolojik Adım Sapması kalkmalı: {open_titles}",
+        )
+        self.assertTrue(
+            any("Gerçekleşen Gözlem Biyolojik Pencere İhlali" in t for t in open_titles),
+            f"Daha önce gerçekleşmiş ve ihlal oluşturmuş 24. saat gözlem bulgusu korunmalı: {open_titles}",
+        )
+
+        # revalidate_study_conflicts ve recompute_all_conflicts sonrasında da bu durum bozulmamalı
+        revalidate_study_conflicts(self.db, st_db)
+        self.db.commit()
+        recompute_all_conflicts(self.db, user=sd_ezgi)
+        self.db.expire_all()
+
+        open_after_recompute = (
+            self.db.query(Conflict)
+            .filter(Conflict.study_id == st.id, Conflict.is_resolved == False)  # noqa: E712
+            .all()
+        )
+        titles_after_recompute = [c.title for c in open_after_recompute]
+        self.assertFalse(
+            any("Biyolojik Referans Saat Sapması" in t for t in titles_after_recompute),
+            "recompute_all_conflicts sonrasında SD onaylı kaynak referans sapması tekrar açılmamalı",
+        )
+        self.assertTrue(
+            any("Gerçekleşen Gözlem Biyolojik Pencere İhlali" in t for t in titles_after_recompute),
+            "recompute_all_conflicts sonrasında gerçekleşmiş gözlem ihlali korunmalı",
+        )
+
+        # Kaynak referans saati tekrar değişirse (01:00 -> 04:00 = +180 dk > ±120 dk tolerans), yeni sapma yeniden değerlendirilmeli!
+        r_new_ref = self.client.patch(
+            f"/api/v1/planning/steps/{day7.id}/status",
+            headers=h_tech1,
+            json={
+                "actual_reference_time": "2027-01-12T04:00:00",
+                "actual_end": "2027-01-12T04:30:00",
+            },
+        )
+        self.assertEqual(r_new_ref.status_code, 200, r_new_ref.text)
+        self.assertEqual(len(r_new_ref.json()["revision_proposals"]), 2)
+        self.db.expire_all()
+        open_after_new_ref = (
+            self.db.query(Conflict)
+            .filter(Conflict.study_id == st.id, Conflict.is_resolved == False)  # noqa: E712
+            .all()
+        )
+        titles_after_new_ref = [c.title for c in open_after_new_ref]
+        self.assertTrue(
+            any("Biyolojik Referans Saat Sapması" in t for t in titles_after_new_ref),
+            "Kaynak referans saati tekrar değiştiğinde yeni sapma yeniden değerlendirilmeli",
+        )
+        self.assertTrue(
+            any("Bağımlı Biyolojik Adım Sapması" in t for t in titles_after_new_ref),
+            "Kaynak referans saati tekrar değiştiğinde bağımlı adımlar için yeni revizyon önerisi ve bulgu üretilmeli",
+        )
+
+    # ------------------------------------------------------------------
+    # 20. Planlama ekranında SD Biyolojik Plan Revizyonu gerçek tarayıcı (Headless Chrome) testi
+    # ------------------------------------------------------------------
+    def test_20_biological_revision_headless_browser_e2e(self):
+        import json as _json
+        import socket
+        import subprocess
+        import threading
+        import time as _time
+        import uvicorn
+
+        chrome_candidates = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        ]
+        chrome_bin = next((p for p in chrome_candidates if os.path.exists(p)), None)
+        if not chrome_bin:
+            self.skipTest("Headless Chrome/Edge bulunamadı")
+
+        sd = self.people["ezgi"]
+        tech = self.people["invivo_1"]
+        h_tech = _login_headers(self.client, "invivo_1")
+
+        s_rev = Study(
+            study_code="FIX20-BROWSER-REV",
+            title="Browser E2E Biological Revision Study",
+            test_item_name="Browser Rev Gel",
+            study_director_id=sd.id,
+            status=StudyStatus.DRAFT,
+            animal_species_strain="Tavşan (New Zealand White)",
+            animal_count=3,
+            extraction_polar=True,
+            extraction_non_polar=False,
+        )
+        self.db.add(s_rev)
+        self.db.commit()
+        schedule_new_study(self.db, s_rev.id, date(2027, 2, 1))
+        s_rev.status = StudyStatus.IN_PROGRESS
+        self.db.commit()
+
+        steps = (
+            self.db.query(StudyStep)
+            .filter(StudyStep.study_id == s_rev.id)
+            .order_by(StudyStep.step_order.asc())
+            .all()
+        )
+        day7 = next(s for s in steps if s.study_day == 7)  # 2027-02-08 09:00-12:00, Plan Ref: 10:00
+        day8 = next(s for s in steps if s.study_day == 8)  # 2027-02-09 10:00-10:45
+
+        # Kaynak adım (day7) gerçek referansını 13:00 (+180 dk) olarak kaydet
+        r_ref = self.client.patch(
+            f"/api/v1/planning/steps/{day7.id}/status",
+            headers=h_tech,
+            json={
+                "status": "COMPLETED",
+                "actual_start": "2027-02-08T12:00:00",
+                "actual_reference_time": "2027-02-08T13:00:00",
+                "actual_end": "2027-02-08T14:00:00",
+            },
+        )
+        self.assertEqual(r_ref.status_code, 200, r_ref.text)
+
+        sd_token = self.client.post(
+            "/api/v1/auth/login",
+            json={"username": "ezgi", "password": DEFAULT_PASSWORD},
+        ).json()["access_token"]
+        sd_user_info = self.client.get(
+            "/api/v1/auth/me",
+            headers={"Authorization": f"Bearer {sd_token}"},
+        ).json()
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+
+        config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error")
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        try:
+            for _ in range(50):
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                        break
+                except OSError:
+                    _time.sleep(0.1)
+
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s2:
+                s2.bind(("127.0.0.1", 0))
+                cdp_port = s2.getsockname()[1]
+
+            user_data_dir = os.path.join(_TMP_DIR, "chrome_profile_rev")
+            proc = subprocess.Popen(
+                [
+                    chrome_bin,
+                    "--headless=new",
+                    "--disable-gpu",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    f"--user-data-dir={user_data_dir}",
+                    f"--remote-debugging-port={cdp_port}",
+                    f"http://127.0.0.1:{port}/login",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                import base64
+                import urllib.request
+                from urllib.parse import urlparse
+
+                ws_url = None
+                for _ in range(50):
+                    try:
+                        with urllib.request.urlopen(f"http://127.0.0.1:{cdp_port}/json/list", timeout=0.5) as resp:
+                            tabs = _json.loads(resp.read().decode("utf-8"))
+                            page_tab = next((t for t in tabs if t.get("type") == "page"), None)
+                            if page_tab and page_tab.get("webSocketDebuggerUrl"):
+                                ws_url = page_tab["webSocketDebuggerUrl"]
+                                break
+                    except Exception:
+                        _time.sleep(0.1)
+                self.assertIsNotNone(ws_url, "Chrome CDP bağlantısı kurulamadı")
+
+                parsed_ws = urlparse(ws_url)
+                sock = socket.create_connection((parsed_ws.hostname, parsed_ws.port), timeout=10)
+                key = base64.b64encode(os.urandom(16)).decode("ascii")
+                handshake = (
+                    f"GET {parsed_ws.path} HTTP/1.1\r\n"
+                    f"Host: {parsed_ws.hostname}:{parsed_ws.port}\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    f"Sec-WebSocket-Key: {key}\r\n"
+                    "Sec-WebSocket-Version: 13\r\n\r\n"
+                )
+                sock.sendall(handshake.encode("ascii"))
+                resp_buf = b""
+                while b"\r\n\r\n" not in resp_buf:
+                    resp_buf += sock.recv(1024)
+
+                msg_id = 0
+
+                def cdp_eval(js_expr: str):
+                    nonlocal msg_id
+                    msg_id += 1
+                    payload_bytes = _json.dumps(
+                        {
+                            "id": msg_id,
+                            "method": "Runtime.evaluate",
+                            "params": {"expression": js_expr, "awaitPromise": True, "returnByValue": True},
+                        }
+                    ).encode("utf-8")
+                    mask_key = os.urandom(4)
+                    header = bytearray([0x81])
+                    length = len(payload_bytes)
+                    if length < 126:
+                        header.append(0x80 | length)
+                    elif length < 65536:
+                        header.append(0x80 | 126)
+                        header.extend(length.to_bytes(2, "big"))
+                    else:
+                        header.append(0x80 | 127)
+                        header.extend(length.to_bytes(8, "big"))
+                    header.extend(mask_key)
+                    masked = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload_bytes))
+                    sock.sendall(bytes(header) + masked)
+
+                    while True:
+                        first2 = sock.recv(2)
+                        plen = first2[1] & 0x7F
+                        if plen == 126:
+                            plen = int.from_bytes(sock.recv(2), "big")
+                        elif plen == 127:
+                            plen = int.from_bytes(sock.recv(8), "big")
+                        data = bytearray()
+                        while len(data) < plen:
+                            chunk = sock.recv(plen - len(data))
+                            if not chunk:
+                                break
+                            data.extend(chunk)
+                        msg = _json.loads(data.decode("utf-8"))
+                        if msg.get("id") == msg_id:
+                            return msg.get("result", {}).get("result", {}).get("value")
+
+                # SD (ezgi) olarak oturum aç ve /planning?study_id=... ekranına git
+                cdp_eval(
+                    f"""
+                    localStorage.setItem('nanolab_glp_jwt', {_json.dumps(sd_token)});
+                    localStorage.setItem('nanolab_glp_user', {_json.dumps(_json.dumps(sd_user_info))});
+                    window.location.href = 'http://127.0.0.1:{port}/planning?study_id={s_rev.id}';
+                    true;
+                    """
+                )
+
+                # FIX20-BROWSER-REV çalışmasının biyolojik revizyon kartının yüklenmesini bekle
+                section_ready = False
+                for _ in range(60):
+                    has_sec = cdp_eval(
+                        """
+                        (() => {
+                          return Boolean(document.querySelector('[data-testid="bio-revision-section"]'));
+                        })()
+                        """
+                    )
+                    if has_sec:
+                        section_ready = True
+                        break
+                    _time.sleep(0.2)
+                self.assertTrue(section_ready, "Planlama ekranında biyolojik revizyon bölümü yüklenmedi")
+
+                # 1) "Revizyon Önizlemesi" butonuna tıkla ve önizleme panelinin açılmasını bekle
+                cdp_eval(
+                    """
+                    document.querySelector('[data-testid="preview-bio-revision-btn"]').click();
+                    true;
+                    """
+                )
+                preview_ready = False
+                for _ in range(40):
+                    if cdp_eval("Boolean(document.querySelector('[data-testid=\"bio-revision-preview-panel\"]'))"):
+                        preview_ready = True
+                        break
+                    _time.sleep(0.15)
+                self.assertTrue(preview_ready, "Revizyon önizleme paneli açılmadı")
+
+                preview_ui = cdp_eval(
+                    f"""
+                    (() => {{
+                      const devBadge = document.querySelector('[data-testid="bio-source-deviation-badge"]')?.textContent || '';
+                      const propRow = document.querySelector('[data-testid="bio-preview-proposed-{day8.step_order}"]')?.textContent || '';
+                      const stepRowBefore = document.querySelector('[data-testid="schedule-step-planned-{day8.step_order}"]')?.textContent || '';
+                      return {{ devBadge, propRow, stepRowBefore }};
+                    }})()
+                    """
+                )
+                self.assertIn("+180 dk", preview_ui["devBadge"])
+                self.assertIn("13:00", preview_ui["propRow"])
+                self.assertIn("10:00", preview_ui["stepRowBefore"], "Önizleme sırasında tablo saati henüz 10:00 olmalı")
+
+                # 2) Gerekçe gir ve "Revizyonu Onayla ve Takvime İşle" butonuna tıkla
+                e2e_reason = "Tarayıcı E2E SD Onayı: Dozlama 13:00'te gerçekleştiği için gözlem saatleri 13:00'e çekildi."
+                cdp_eval(
+                    f"""
+                    (() => {{
+                      const input = document.querySelector('[data-testid="bio-revision-reason-input"]');
+                      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                      setter.call(input, {_json.dumps(e2e_reason)});
+                      input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                      input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                      return true;
+                    }})()
+                    """
+                )
+                for _ in range(25):
+                    btn_enabled = cdp_eval(
+                        "Boolean(document.querySelector('[data-testid=\"approve-bio-revision-btn\"]') && !document.querySelector('[data-testid=\"approve-bio-revision-btn\"]').disabled)"
+                    )
+                    if btn_enabled:
+                        break
+                    _time.sleep(0.1)
+
+                cdp_eval("document.querySelector('[data-testid=\"approve-bio-revision-btn\"]').click(); true;")
+
+                approved_in_ui = False
+                for _ in range(40):
+                    if cdp_eval("Boolean(document.querySelector('[data-testid=\"bio-revision-history\"]'))"):
+                        approved_in_ui = True
+                        break
+                    _time.sleep(0.15)
+                self.assertTrue(approved_in_ui, "Onay sonrası revizyon geçmişi kartı görünmedi")
+
+                # 3) Sayfayı yenile (reload) ve yeni saatler ile korunan kaynak sapmasını doğrula
+                cdp_eval("window.location.reload(); true;")
+                reloaded_ready = False
+                for _ in range(60):
+                    ok = cdp_eval(
+                        """
+                        (() => {
+                          const cards = Array.from(document.querySelectorAll('button, div'));
+                          const studyBtn = cards.find(el => (el.textContent || '').includes('FIX20-BROWSER-REV'));
+                          if (studyBtn && !document.querySelector('[data-testid="bio-revision-history"]')) {
+                            studyBtn.click();
+                          }
+                          return Boolean(document.querySelector('[data-testid="bio-revision-history"]'));
+                        })()
+                        """
+                    )
+                    if ok:
+                        reloaded_ready = True
+                        break
+                    _time.sleep(0.2)
+                self.assertTrue(reloaded_ready, "Sayfa yenilendikten sonra onaylı revizyon geçmişi yüklenmedi")
+
+                after_reload = cdp_eval(
+                    f"""
+                    (() => {{
+                      return {{
+                        devBadge: document.querySelector('[data-testid="bio-source-deviation-badge"]')?.textContent || '',
+                        approvedReason: document.querySelector('[data-testid="bio-approved-reason"]')?.textContent || '',
+                        step8Planned: document.querySelector('[data-testid="schedule-step-planned-{day8.step_order}"]')?.textContent || '',
+                        step7Planned: document.querySelector('[data-testid="schedule-step-planned-{day7.step_order}"]')?.textContent || '',
+                      }};
+                    }})()
+                    """
+                )
+                self.assertIn("+180 dk", after_reload["devBadge"], "Kaynak sapması (+180 dk) sayfa yenileme sonrasında da korunmalı")
+                self.assertIn(e2e_reason, after_reload["approvedReason"])
+                self.assertIn("13:00", after_reload["step8Planned"], "24. saat gözlem adımı takvimde 13:00 olarak görünmeli")
+                self.assertIn("09:00", after_reload["step7Planned"], "Kaynak adımın orijinal plan saati (09:00) korunmalı")
+
+                sock.close()
+            finally:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    proc.kill()
+        finally:
+            server.should_exit = True
+            thread.join(timeout=5)
+
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
