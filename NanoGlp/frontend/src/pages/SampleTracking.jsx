@@ -242,6 +242,7 @@ export default function SampleTracking() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [notice, setNotice] = useState(null);
+  const [importResult, setImportResult] = useState(null);
   const [bulkResult, setBulkResult] = useState(null);
   const [busy, setBusy] = useState({});
   const [filter, setFilter] = useState({ status: 'ALL', glp: 'ALL', q: '', sd: 'ALL', overdue: false, subPhase: 'ALL' });
@@ -635,13 +636,15 @@ export default function SampleTracking() {
     if (!file) return;
     setError(null);
     setNotice(null);
+    setImportResult(null);
     setBusyKey('import', true);
     try {
       const res = await importSamplesExcel(file);
       setData(res.data.data);
       const r = res.data;
+      setImportResult(r);
       setNotice(
-        `${file.name}: ${r.created} yeni, ${r.updated} güncellenen, ${r.skipped} atlanan kayıt.` +
+        `${file.name}: ${r.created} yeni, ${r.updated} değişen, ${r.unchanged ?? 0} değişmeyen, ${r.failed ?? r.errors?.length ?? 0} hatalı, ${r.review_required ?? 0} inceleme gerektiren kayıt.` +
           (r.errors?.length ? ` Uyarılar: ${r.errors.slice(0, 3).join(' • ')}${r.errors.length > 3 ? ' …' : ''}` : '')
       );
     } catch (err) {
@@ -716,6 +719,26 @@ export default function SampleTracking() {
             <X className="w-3.5 h-3.5" />
           </button>
         </div>
+      )}
+      {importResult && (
+        <details className="border rounded p-3 text-xs bg-white">
+          <summary>Excel aktarım farkları ve inceleme notları</summary>
+          <div className="overflow-auto max-h-96">
+            <table className="w-full text-left mt-2">
+              <thead><tr><th>Çalışma</th><th>Alan / kayıt</th><th>Eski değer</th><th>Excel değeri</th><th>Sonuç</th></tr></thead>
+              <tbody>{[...(importResult.changes || []), ...(importResult.reviews || [])].map((row, i) => (
+                <tr key={i} className="border-t">
+                  <td>{row.study_code}</td><td>{row.field} ({row.target})</td>
+                  <td className="break-all">{JSON.stringify(row.old_value)}</td>
+                  <td className="break-all">{JSON.stringify(row.excel_value)}</td>
+                  <td>{row.reason || 'Güncellendi'}</td>
+                </tr>
+              ))}</tbody>
+            </table>
+            {(importResult.scheduling || []).map(row => <p key={row.study_code}>{row.study_code}: {row.reason}</p>)}
+            {(importResult.errors || []).map((error, i) => <p key={i} className="text-red-700">{error}</p>)}
+          </div>
+        </details>
       )}
       {bulkResult?.results?.length > 0 && (
         <div className="border border-slate-200 bg-white rounded text-xs divide-y divide-slate-100">
