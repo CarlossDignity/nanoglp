@@ -667,20 +667,19 @@ def main():
                 and "Cottonseed oil" in full_docx_text
                 and "Ezgi Nur AKIN" in full_docx_text
                 and "Emine ARMUTOĞLU" in full_docx_text
-                and "Selin BOLCAN" in full_docx_text
-                and "Dr. Shivadasan ANOOP" in full_docx_text,
-                "Üretilen .docx içinde Çalışma Kodu, Sponsor, Test Maddesi, Lot, Polar/Apolar Çözücüler, Aktif SD 'Ezgi Nur AKIN', TFM 'Emine ARMUTOĞLU', QA 'Selin BOLCAN', Management 'Dr. Shivadasan ANOOP' ve Takvim yer alıyor",
+                and "Selin BOLCAN" not in full_docx_text
+                and "Dr. Shivadasan ANOOP" not in full_docx_text
+                and "TBD" in full_docx_text,
+                "Üretilen .docx içinde Çalışma Kodu, Sponsor, Test Maddesi, Lot, Polar/Apolar Çözücüler, Aktif SD 'Ezgi Nur AKIN', TFM 'Emine ARMUTOĞLU', gerçek görev atamaları ve Takvim yer alıyor; atanmamış şablon kişileri yerine TBD kullanılıyor",
             )
-            leftover_x = []
-            with _zipfile.ZipFile(io.BytesIO(docx_resp.content)) as _z:
-                for _name in _z.namelist():
-                    if _name.endswith(".xml"):
-                        _txt = _re.sub(r"<[^>]+>", "", _z.read(_name).decode("utf-8", errors="ignore"))
-                        if _re.search(r"X{2,}|GLP20XX|Original\s+X", _txt):
-                            leftover_x.append(_name)
+            # Assert field outcomes, not absence of XX (valid in lots/names).
+            docx_fields = {row.cells[0].text.strip(): row.cells[2].text.strip()
+                           for table in parsed_docx.tables for row in table.rows if len(row.cells) == 3}
             check(
-                len(leftover_x) == 0,
-                "FAZ 6.5: Orijinal Nanolab Study Plan (.docx) şablonunda tek bir 'XXX' veya 'GLP20XX' yer tutucusu bile kalmadı",
+                docx_fields["LOT Number"] == "EDC-NO-230586"
+                and docx_fields["Name of the test item"] == "Hyaluronik Asit HA 30 mg/ml"
+                and docx_fields["Study Completion Date"] == "TBD",
+                "FAZ 6.5: DOCX alanları kayıt değerlerini koruyor; eksik tamamlanma tarihi TBD",
             )
 
             print("\n[10] FAZ 6.3: Kalıcı Master Takvim (/calendar), Haftalık İş Yükü (/workload-weekly) ve Taslak Onayı (/approve)")
@@ -1040,7 +1039,7 @@ def main():
             print("\n[14] FAZ 8.2: Şablona Özgü Study Plan (.docx) Bölüm 6–10 Metinleri ve Çekmeceden TIIS / CoA / FM.083 PDF Yükleme + Otomatik Doldurma")
             import re as _re
 
-            def docx_text(study_id):
+            def docx_text(study_id, include_document=False):
                 r = client.get(f"/api/v1/studies/{study_id}/export-study-plan", headers=h_tfm)
                 assert r.status_code == 200, f"docx {study_id}: {r.status_code}"
                 rd = _DocxReader(_io.BytesIO(r.content))
@@ -1053,7 +1052,7 @@ def main():
                                 continue
                             seen.add(id(c._tc))
                             parts.append(c.text)
-                return "\n".join(parts)
+                return ("\n".join(parts), rd) if include_document else "\n".join(parts)
 
             doc_cases = [
                 ("T-DOC-IMP", "2029-02-05", "ISO_10993_6_IMP", "ISO 10993-6",
@@ -1067,14 +1066,20 @@ def main():
             ]
             for code, start, tpl_code, std, must, must_not in doc_cases:
                 rsp = sched(code, start, tpl=tpl_code)
-                txt = docx_text(rsp["study_id"])
+                txt, rendered = docx_text(rsp["study_id"], include_document=True)
                 low = txt.lower()
                 miss = [m for m in must if m.lower() not in low]
                 bad = [m for m in must_not if m.lower() in low]
                 check(not miss and not bad, f"{std} .docx: bölüm metinleri şablona göre dinamik (eksik={miss}, kalan={bad})")
-                check("intracutaneous" not in low and "ISO 10993-23" not in txt and std in txt,
-                      f"{std} .docx: İntrakütanöz / ISO 10993-23 metni kalmadı, standart adı güncellendi")
-                check(not _re.search(r"X{3,}", txt), f"{std} .docx: doldurulmamış 'XXX' yer tutucusu kalmadı")
+                # Preserve the master-template figure and its truthful source caption.
+                # Only that reference illustration may retain the original ISO number.
+                protocol_txt = txt.replace("Figure-1: Arrangement of Injection Sites (Source: ISO 10993-23)", "")
+                check("intracutaneous" not in low and "ISO 10993-23" not in protocol_txt and std in txt,
+                      f"{std} .docx: protokol metni hedef standarda uyarlandı; referans şeklin özgün kaynak açıklaması korundu")
+                fields = {r.cells[0].text.strip(): r.cells[2].text.strip()
+                          for t in rendered.tables for r in t.rows if len(r.cells) == 3}
+                check(fields["LOT Number"] == "TBD" and fields["Study Completion Date"] == "TBD",
+                      f"{std} .docx: eksik lot ve tamamlanma tarihi alanları TBD")
 
             # --- Çekmeceden belge yükleme + otomatik doldurma (OpenAI çağrısı mock) ---
             import fitz as _fitz

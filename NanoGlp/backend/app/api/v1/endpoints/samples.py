@@ -534,11 +534,9 @@ def download_study_plan(
     sample = _get_or_404(db, sample_id)
     perms = ss.sample_permissions(current_user)
     study = ss.find_study(db, sample.study_code)
-    has_ready_study = study is not None and (
-        ss._study_has_steps(db, study)
-        or sample.planned_start is not None
-        or (sample.stored_status or "").upper() in ("ONGOING", "COMPLETED")
-    )
+    # An existing study can be exported with TBD dates. Downloading its DOCX
+    # must not create/rebuild a schedule merely because planned dates are absent.
+    has_ready_study = study is not None
     if not has_ready_study:
         if not perms["can_plan"]:
             raise HTTPException(
