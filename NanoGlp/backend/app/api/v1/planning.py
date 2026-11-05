@@ -128,6 +128,9 @@ class UpdateStepStatusRequest(BaseModel):
     biological_reference_time: Optional[str] = None
     reference_time: Optional[str] = None
     deviation_notes: Optional[str] = None
+    preserve_missing_actuals: bool = False
+    actual_start_unknown: bool = False
+    actual_end_unknown: bool = False
 
 
 def _parse_step_dt(
@@ -1156,10 +1159,35 @@ def api_update_step_status(
             detail="IN_PROGRESS (Devam Ediyor) durumundaki bir görev için gerçekleşen bitiş saati (actual_end) girilemez.",
         )
 
-    check_start = parsed_start if parsed_start is not None else step.actual_start
-    check_end = parsed_end if parsed_end is not None else step.actual_end
-    check_ref = parsed_ref if parsed_ref is not None else getattr(step, "actual_reference_time", None)
+    skip_auto_start = bool(payload.preserve_missing_actuals or payload.actual_start_unknown)
+    skip_auto_end = bool(payload.preserve_missing_actuals or payload.actual_end_unknown)
 
+    if payload.status == StepStatus.PENDING:
+        check_start = None
+        check_end = None
+        check_ref = None
+    else:
+        check_start = parsed_start if parsed_start is not None else step.actual_start
+        check_end = parsed_end if parsed_end is not None else step.actual_end
+        check_ref = parsed_ref if parsed_ref is not None else getattr(step, "actual_reference_time", None)
+
+        if payload.status == StepStatus.IN_PROGRESS:
+            if check_start is None and not skip_auto_start:
+                check_start = local_now
+        elif payload.status == StepStatus.COMPLETED:
+            if step.status == StepStatus.PENDING and check_start is None and not skip_auto_start:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=(
+                        "Henüz başlatılmamış (PENDING) bir görevi doğrudan tamamlamak için "
+                        "gerçekleşen başlangıç saatini (actual_start) girin veya başlangıç saati "
+                        "bilinmiyorsa eksik bilgi olarak koruma seçeneğini (preserve_missing_actuals=true) kullanın."
+                    ),
+                )
+            if check_end is None and not skip_auto_end:
+                check_end = local_now
+
+    # Otomatik değerler dahil kaydedilecek nihai durumun zaman tutarlılığını veritabanına yazmadan önce doğrula
     if check_start is not None and check_end is not None and check_end < check_start:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -1184,7 +1212,9 @@ def api_update_step_status(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=(
                     f"Gerçekleşen biyolojik referans/gözlem saati ({check_ref.isoformat()}), "
-                    f"gerçekleşen başlangıç saatinden ({check_start.isoformat()}) önce olamaz."
+                    f"gerçekleşen başlangıç saatinden ({check_start.isoformat()}) önce olamaz. "
+                    f"Geç gerçekleşme kaydı için lütfen gerçek başlangıç saatini (actual_start) girin "
+                    f"veya saat bilinmiyorsa eksik bilgi olarak koruyun (preserve_missing_actuals=true)."
                 ),
             )
         if check_end is not None and check_ref > check_end:
@@ -1198,28 +1228,13 @@ def api_update_step_status(
 
     if payload.status is not None:
         step.status = payload.status
-        if payload.status == StepStatus.PENDING:
-            step.actual_start = None
-            step.actual_end = None
-            step.actual_reference_time = None
-    if parsed_start is not None:
-        step.actual_start = parsed_start
-    if parsed_end is not None:
-        step.actual_end = parsed_end
-    if parsed_ref is not None:
-        step.actual_reference_time = parsed_ref
+    step.actual_start = check_start
+    step.actual_end = check_end
+    step.actual_reference_time = check_ref
     if payload.deviation_notes is not None:
         step.deviation_notes = payload.deviation_notes
     elif payload.notes and not step.deviation_notes:
         step.deviation_notes = payload.notes
-
-    if payload.status == StepStatus.IN_PROGRESS and not step.actual_start:
-        step.actual_start = local_now
-    elif payload.status == StepStatus.COMPLETED:
-        if not step.actual_start:
-            step.actual_start = step.actual_end or local_now
-        if not step.actual_end:
-            step.actual_end = max(step.actual_start, local_now)
 
     db.flush()
     if step.study is not None:

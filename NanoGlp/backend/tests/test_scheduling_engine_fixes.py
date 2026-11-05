@@ -1950,8 +1950,10 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
         )
         day7 = next(s for s in steps if s.study_day == 7)  # 2026-12-14 09:00-12:00, Plan Ref: 10:00
         day8 = next(s for s in steps if s.study_day == 8)  # 2026-12-15 10:00-10:45, Plan Ref: 10:00
+        day9 = next(s for s in steps if s.study_day == 9)  # 2026-12-16 10:00-10:45, Plan Ref: 10:00
         day7.assignees = [tech]
         day8.assignees = [tech]
+        day9.assignees = [tech]
         self.db.commit()
 
         token = self.client.post(
@@ -2179,7 +2181,133 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
                 self.assertIsNone(d7_persisted.actual_start)
                 self.assertIsNone(d7_persisted.actual_end)
 
-                # 3) 2026-12-15 (Gün 8) görevine geç ve 'Başlat' butonuna tıkla:
+                # 3) AYNI GÖREVDE (day7) tesis saati 12:00 iken doğrudan 'Başlat' tıklandığında:
+                #    Otomatik 12:00 başlangıç saati (12:00 > 10:45) reddedilmeli, kayıt değişmemeli,
+                #    ve kullanıcı çıkmazda kalmayıp geç kayıt alanlarına yönlendirilmeli!
+                with patch("app.api.v1.planning._facility_now", return_value=datetime(2026, 12, 14, 12, 0, 0)):
+                    cdp_eval(
+                        f"""
+                        document.querySelector('[data-testid="start-task-btn-{day7.id}"]').click();
+                        true;
+                        """
+                    )
+                    for _ in range(30):
+                        guidance_txt = cdp_eval(
+                            f"""
+                            (() => {{
+                              const g = document.querySelector('[data-testid="task-guidance-{day7.id}"]');
+                              return g ? g.textContent.trim() : null;
+                            }})()
+                            """
+                        )
+                        if guidance_txt:
+                            break
+                        _time.sleep(0.2)
+
+                    self.assertTrue(
+                        bool(guidance_txt),
+                        "Bilgi eksikse kullanıcı anlaşılır şekilde gerekli alanlara yönlendirilmeli",
+                    )
+                    self.db.expire_all()
+                    d7_after_rejected_start = self.db.query(StudyStep).filter(StudyStep.id == day7.id).first()
+                    self.assertEqual(d7_after_rejected_start.status, StepStatus.PENDING)
+                    self.assertIsNone(
+                        d7_after_rejected_start.actual_start,
+                        "Reddedilen Başlat işlemi mevcut kayda 12:00 actual_start yazmamalı",
+                    )
+
+                    # 4) AYNI GÖREVDE (day7) gerçek başlangıç 09:30 girilip 'Başlat' ve ardından gerçek bitiş 11:30 girilip 'Tamamla'
+                    cdp_eval(
+                        f"""
+                        (() => {{
+                          const sInp = document.querySelector('[data-testid="actual-start-input-{day7.id}"]');
+                          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                          setter.call(sInp, '2026-12-14T09:30');
+                          sInp.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                          sInp.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                          document.querySelector('[data-testid="start-task-btn-{day7.id}"]').click();
+                          return true;
+                        }})()
+                        """
+                    )
+                    for _ in range(30):
+                        st7_badge = cdp_eval(
+                            f"""
+                            (() => {{
+                              const b = document.querySelector('[data-testid="task-status-badge-{day7.id}"]');
+                              return b ? b.textContent.trim() : null;
+                            }})()
+                            """
+                        )
+                        if st7_badge == "Devam Ediyor":
+                            break
+                        _time.sleep(0.2)
+
+                    self.assertEqual(st7_badge, "Devam Ediyor")
+                    self.db.expire_all()
+                    d7_in_prog = self.db.query(StudyStep).filter(StudyStep.id == day7.id).first()
+                    self.assertEqual(d7_in_prog.status, StepStatus.IN_PROGRESS)
+                    self.assertEqual(d7_in_prog.actual_start, datetime(2026, 12, 14, 9, 30))
+                    self.assertEqual(d7_in_prog.actual_reference_time, datetime(2026, 12, 14, 10, 45))
+                    self.assertIsNone(d7_in_prog.actual_end)
+
+                    # Şimdi aynı görevde (day7) gerçek bitiş 11:30 girilip 'Tamamla'
+                    cdp_eval(
+                        f"""
+                        (() => {{
+                          const toggleBtn = document.querySelector('[data-testid="toggle-actual-times-btn-{day7.id}"]');
+                          if (!document.querySelector('[data-testid="actual-end-input-{day7.id}"]') && toggleBtn) {{
+                            toggleBtn.click();
+                          }}
+                          return true;
+                        }})()
+                        """
+                    )
+                    for _ in range(20):
+                        has_end_inp = cdp_eval(
+                            f"Boolean(document.querySelector('[data-testid=\"actual-end-input-{day7.id}\"]'))"
+                        )
+                        if has_end_inp:
+                            break
+                        _time.sleep(0.1)
+
+                    cdp_eval(
+                        f"""
+                        (() => {{
+                          const eInp = document.querySelector('[data-testid="actual-end-input-{day7.id}"]');
+                          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                          setter.call(eInp, '2026-12-14T11:30');
+                          eInp.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                          eInp.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                          document.querySelector('[data-testid="complete-task-btn-{day7.id}"]').click();
+                          return true;
+                        }})()
+                        """
+                    )
+                    for _ in range(30):
+                        st7_done = cdp_eval(
+                            f"""
+                            (() => {{
+                              const b = document.querySelector('[data-testid="task-status-badge-{day7.id}"]');
+                              return b ? b.textContent.trim() : null;
+                            }})()
+                            """
+                        )
+                        if st7_done == "Tamamlandı":
+                            break
+                        _time.sleep(0.2)
+
+                    self.assertEqual(st7_done, "Tamamlandı")
+                    self.db.expire_all()
+                    d7_completed = self.db.query(StudyStep).filter(StudyStep.id == day7.id).first()
+                    self.assertEqual(d7_completed.status, StepStatus.COMPLETED)
+                    self.assertEqual(d7_completed.actual_start, datetime(2026, 12, 14, 9, 30))
+                    self.assertEqual(d7_completed.actual_reference_time, datetime(2026, 12, 14, 10, 45))
+                    self.assertEqual(d7_completed.actual_end, datetime(2026, 12, 14, 11, 30))
+                    self.assertEqual(d7_completed.planned_start, datetime(2026, 12, 14, 9, 0))
+                    self.assertEqual(d7_completed.planned_end, datetime(2026, 12, 14, 12, 0))
+
+                # 5) 2026-12-15 (Gün 8) görevine geç ve normal zamanında 'Başlat' butonuna tıkla:
                 #    Planlanan/beklenen referans saati actual_reference_time olarak kaydedilmemeli!
                 for _ in range(30):
                     d8_ready = cdp_eval(
@@ -2226,6 +2354,81 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
                     "Tarayıcıda 'Başlat' tıklandığında planlanan/beklenen referans saati actual_reference_time olarak kaydedilmemeli",
                 )
 
+                # 6) 2026-12-16 (Gün 9) görevinde: Referans kaydet (10:45) -> saat bilinmiyor seçeneğiyle doğrudan Tamamla
+                with patch("app.api.v1.planning._facility_now", return_value=datetime(2026, 12, 16, 12, 0, 0)):
+                    for _ in range(30):
+                        d9_ready = cdp_eval(
+                            f"""
+                            (() => {{
+                              const btns = Array.from(document.querySelectorAll('button'));
+                              const dBtn = btns.find(b => b.textContent.trim() === '2026-12-16');
+                              if (dBtn) dBtn.click();
+                              const inp = document.querySelector('[data-testid="ref-time-input-{day9.id}"]');
+                              return inp ? true : false;
+                            }})()
+                            """
+                        )
+                        if d9_ready:
+                            break
+                        _time.sleep(0.2)
+
+                    cdp_eval(
+                        f"""
+                        (() => {{
+                          const inp = document.querySelector('[data-testid="ref-time-input-{day9.id}"]');
+                          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                          setter.call(inp, '2026-12-16T10:45');
+                          inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                          inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                          document.querySelector('[data-testid="save-ref-time-btn-{day9.id}"]').click();
+                          return true;
+                        }})()
+                        """
+                    )
+                    for _ in range(30):
+                        rec9 = cdp_eval(
+                            f"""
+                            (() => {{
+                              const el = document.querySelector('[data-testid="recorded-ref-time-{day9.id}"]');
+                              return el ? el.textContent : null;
+                            }})()
+                            """
+                        )
+                        if rec9 and "10:45" in rec9:
+                            break
+                        _time.sleep(0.2)
+
+                    cdp_eval(
+                        f"""
+                        (() => {{
+                          const chk = document.querySelector('[data-testid="preserve-missing-actuals-{day9.id}"]');
+                          if (chk && !chk.checked) chk.click();
+                          document.querySelector('[data-testid="complete-task-btn-{day9.id}"]').click();
+                          return true;
+                        }})()
+                        """
+                    )
+                    for _ in range(30):
+                        st9_badge = cdp_eval(
+                            f"""
+                            (() => {{
+                              const b = document.querySelector('[data-testid="task-status-badge-{day9.id}"]');
+                              return b ? b.textContent.trim() : null;
+                            }})()
+                            """
+                        )
+                        if st9_badge == "Tamamlandı":
+                            break
+                        _time.sleep(0.2)
+
+                    self.assertEqual(st9_badge, "Tamamlandı")
+                    self.db.expire_all()
+                    d9_persisted = self.db.query(StudyStep).filter(StudyStep.id == day9.id).first()
+                    self.assertEqual(d9_persisted.status, StepStatus.COMPLETED)
+                    self.assertEqual(d9_persisted.actual_reference_time, datetime(2026, 12, 16, 10, 45))
+                    self.assertIsNone(d9_persisted.actual_start, "Bilinmeyen actual_start uydurulmamalı")
+                    self.assertIsNone(d9_persisted.actual_end, "Bilinmeyen actual_end uydurulmamalı")
+
                 sock.close()
             finally:
                 proc.terminate()
@@ -2236,6 +2439,232 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
         finally:
             server.should_exit = True
             thread.join(timeout=5)
+
+    # ------------------------------------------------------------------
+    # 18. MyTasks durum geçişi, geç gerçekleşme kaydı ve zaman tutarlılığı kabul testleri
+    # ------------------------------------------------------------------
+    def test_18_mytasks_same_task_late_transition_and_consistency(self):
+        sd = self.people["ezgi"]
+        tech = self.people["invivo_1"]
+        s_late = Study(
+            study_code="FIX18-LATE",
+            title="Same Task Late Transition Study",
+            test_item_name="Late Gel",
+            study_director_id=sd.id,
+            status=StudyStatus.DRAFT,
+            extraction_polar=True,
+            extraction_non_polar=False,
+        )
+        self.db.add(s_late)
+        self.db.commit()
+        schedule_new_study(self.db, s_late.id, date(2026, 12, 7))
+        s_late.status = StudyStatus.IN_PROGRESS
+        self.db.commit()
+
+        steps = (
+            self.db.query(StudyStep)
+            .filter(StudyStep.study_id == s_late.id)
+            .order_by(StudyStep.step_order.asc())
+            .all()
+        )
+        day0 = next(s for s in steps if s.study_day == 0)   # 2026-12-07 09:00-17:00 (normal adım)
+        day7 = next(s for s in steps if s.study_day == 7)   # 2026-12-14 09:00-12:00, Plan Ref: 10:00
+        day8 = next(s for s in steps if s.study_day == 8)   # 2026-12-15 10:00-10:45, Plan Ref: 10:00
+        day9 = next(s for s in steps if s.study_day == 9)   # 2026-12-16 10:00-10:45, Plan Ref: 10:00
+        day10 = next(s for s in steps if s.study_day == 10) # 2026-12-17 10:00-10:45, Plan Ref: 10:00
+        for st in (day0, day7, day8, day9, day10):
+            st.assignees = [tech]
+        self.db.commit()
+
+        h_tech = self.h_tech1
+        frozen_noon = datetime(2026, 12, 14, 12, 0, 0)
+
+        with patch("app.api.v1.planning._facility_now", return_value=frozen_noon):
+            # ------------------------------------------------------------------
+            # A) Doğrulanacak hata senaryosu 1 & 2 ve kabul testi 1:
+            #    Aynı görevde (day7): Referans kaydet (10:45) -> Başlat -> Tamamla
+            # ------------------------------------------------------------------
+            r_ref = self.client.patch(
+                f"/api/v1/planning/steps/{day7.id}/status",
+                headers=h_tech,
+                json={"actual_reference_time": "2026-12-14T10:45:00"},
+            )
+            self.assertEqual(r_ref.status_code, 200, r_ref.text)
+            self.assertEqual(r_ref.json()["status"], "PENDING")
+            self.assertIsNone(r_ref.json()["actual_start"])
+            self.assertIsNone(r_ref.json()["actual_end"])
+
+            # Saat 12:00'de eksik bilgiyle 'Şimdi Başlat' ({"status": "IN_PROGRESS"}) denendiğinde:
+            # Otomatik 12:00 > 10:45 olduğu için veritabanına yazılmadan önce 422 dönmeli ve kayıt değişmemeli!
+            r_bad_start = self.client.patch(
+                f"/api/v1/planning/steps/{day7.id}/status",
+                headers=h_tech,
+                json={"status": "IN_PROGRESS"},
+            )
+            self.assertEqual(
+                r_bad_start.status_code,
+                422,
+                "10:45 referansı kayıtlıyken saat 12:00'de otomatik Başlat 12:00 atamayıp 422 ile reddedilmeli",
+            )
+            self.db.expire_all()
+            d7_check = self.db.query(StudyStep).filter(StudyStep.id == day7.id).first()
+            self.assertEqual(d7_check.status, StepStatus.PENDING, "Reddedilen işlem mevcut durumu değiştirmemeli")
+            self.assertIsNone(d7_check.actual_start, "Reddedilen işlem actual_start=12:00 yazmamalı")
+            self.assertEqual(d7_check.actual_reference_time, datetime(2026, 12, 14, 10, 45))
+
+            # Doğrudan 'Tamamla' ({"status": "COMPLETED"}) da eksik başlangıç uydurmadan 422 ile reddedilmeli ve kayıt değişmemeli!
+            r_bad_complete = self.client.patch(
+                f"/api/v1/planning/steps/{day7.id}/status",
+                headers=h_tech,
+                json={"status": "COMPLETED"},
+            )
+            self.assertEqual(
+                r_bad_complete.status_code,
+                422,
+                "Doğrudan Tamamla yolunda da otomatik saat uydurulmamalı ve tutarsız işlem 422 ile reddedilmeli",
+            )
+            self.db.expire_all()
+            d7_check2 = self.db.query(StudyStep).filter(StudyStep.id == day7.id).first()
+            self.assertEqual(d7_check2.status, StepStatus.PENDING)
+            self.assertIsNone(d7_check2.actual_start)
+            self.assertIsNone(d7_check2.actual_end)
+
+            # Aynı görevde (day7) gerçek başlangıç 09:30 girilerek Başlat -> gerçek bitiş 11:30 girilerek Tamamla
+            r_valid_start = self.client.patch(
+                f"/api/v1/planning/steps/{day7.id}/status",
+                headers=h_tech,
+                json={"status": "IN_PROGRESS", "actual_start": "2026-12-14T09:30:00"},
+            )
+            self.assertEqual(r_valid_start.status_code, 200, r_valid_start.text)
+            self.assertEqual(r_valid_start.json()["status"], "IN_PROGRESS")
+            self.assertEqual(r_valid_start.json()["actual_start"], "2026-12-14T09:30:00")
+            self.assertEqual(r_valid_start.json()["actual_reference_time"], "2026-12-14T10:45:00")
+            self.assertIsNone(r_valid_start.json()["actual_end"])
+
+            r_valid_complete = self.client.patch(
+                f"/api/v1/planning/steps/{day7.id}/status",
+                headers=h_tech,
+                json={"status": "COMPLETED", "actual_end": "2026-12-14T11:30:00"},
+            )
+            self.assertEqual(r_valid_complete.status_code, 200, r_valid_complete.text)
+            d7_done = r_valid_complete.json()
+            self.assertEqual(d7_done["status"], "COMPLETED")
+            self.assertEqual(d7_done["actual_start"], "2026-12-14T09:30:00")
+            self.assertEqual(d7_done["actual_reference_time"], "2026-12-14T10:45:00")
+            self.assertEqual(d7_done["actual_end"], "2026-12-14T11:30:00")
+            self.assertEqual(d7_done["planned_start"], "2026-12-14T09:00:00", "Onaylı plan saatleri değişmemeli")
+            self.assertEqual(d7_done["planned_end"], "2026-12-14T12:00:00", "Onaylı plan saatleri değişmemeli")
+
+            # Gerçekleşen sınırların (09:30 - 11:30) dışındaki referans reddedilmeli ve kayıt değişmemeli
+            for invalid_ref in ("2026-12-14T09:15:00", "2026-12-14T11:45:00"):
+                r_out = self.client.patch(
+                    f"/api/v1/planning/steps/{day7.id}/status",
+                    headers=h_tech,
+                    json={"actual_reference_time": invalid_ref},
+                )
+                self.assertEqual(r_out.status_code, 422)
+                self.db.expire_all()
+                d7_unchanged = self.db.query(StudyStep).filter(StudyStep.id == day7.id).first()
+                self.assertEqual(d7_unchanged.actual_start, datetime(2026, 12, 14, 9, 30))
+                self.assertEqual(d7_unchanged.actual_reference_time, datetime(2026, 12, 14, 10, 45))
+                self.assertEqual(d7_unchanged.actual_end, datetime(2026, 12, 14, 11, 30))
+
+        # ------------------------------------------------------------------
+        # B) Saat gerçekten bilinmediğinde: Referans kaydet -> Başlat -> Tamamla (day8)
+        #    Eksik saatler sessizce doldurulmamalı (actual_start=None, actual_end=None korunmalı)
+        # ------------------------------------------------------------------
+        with patch("app.api.v1.planning._facility_now", return_value=datetime(2026, 12, 15, 12, 0, 0)):
+            self.client.patch(
+                f"/api/v1/planning/steps/{day8.id}/status",
+                headers=h_tech,
+                json={"actual_reference_time": "2026-12-15T10:45:00"},
+            )
+            r_s8 = self.client.patch(
+                f"/api/v1/planning/steps/{day8.id}/status",
+                headers=h_tech,
+                json={"status": "IN_PROGRESS", "preserve_missing_actuals": True},
+            )
+            self.assertEqual(r_s8.status_code, 200, r_s8.text)
+            self.assertEqual(r_s8.json()["status"], "IN_PROGRESS")
+            self.assertIsNone(r_s8.json()["actual_start"], "Eksik başlangıç saati sessizce doldurulmamalı")
+            self.assertEqual(r_s8.json()["actual_reference_time"], "2026-12-15T10:45:00")
+
+            r_c8 = self.client.patch(
+                f"/api/v1/planning/steps/{day8.id}/status",
+                headers=h_tech,
+                json={"status": "COMPLETED", "preserve_missing_actuals": True},
+            )
+            self.assertEqual(r_c8.status_code, 200, r_c8.text)
+            self.assertEqual(r_c8.json()["status"], "COMPLETED")
+            self.assertIsNone(r_c8.json()["actual_start"], "Eksik başlangıç saati sessizce doldurulmamalı")
+            self.assertIsNone(r_c8.json()["actual_end"], "Eksik bitiş saati sessizce doldurulmamalı")
+            self.assertEqual(r_c8.json()["actual_reference_time"], "2026-12-15T10:45:00")
+
+        # ------------------------------------------------------------------
+        # C) Referans kaydet -> doğrudan Tamamla sırası (day9: bilinen saatlerle, day10: bilinmeyen saatlerle)
+        # ------------------------------------------------------------------
+        with patch("app.api.v1.planning._facility_now", return_value=datetime(2026, 12, 16, 12, 0, 0)):
+            self.client.patch(
+                f"/api/v1/planning/steps/{day9.id}/status",
+                headers=h_tech,
+                json={"actual_reference_time": "2026-12-16T10:45:00"},
+            )
+            r_direct_known = self.client.patch(
+                f"/api/v1/planning/steps/{day9.id}/status",
+                headers=h_tech,
+                json={
+                    "status": "COMPLETED",
+                    "actual_start": "2026-12-16T09:30:00",
+                    "actual_end": "2026-12-16T11:30:00",
+                },
+            )
+            self.assertEqual(r_direct_known.status_code, 200, r_direct_known.text)
+            self.assertEqual(r_direct_known.json()["status"], "COMPLETED")
+            self.assertEqual(r_direct_known.json()["actual_start"], "2026-12-16T09:30:00")
+            self.assertEqual(r_direct_known.json()["actual_reference_time"], "2026-12-16T10:45:00")
+            self.assertEqual(r_direct_known.json()["actual_end"], "2026-12-16T11:30:00")
+
+        with patch("app.api.v1.planning._facility_now", return_value=datetime(2026, 12, 17, 12, 0, 0)):
+            self.client.patch(
+                f"/api/v1/planning/steps/{day10.id}/status",
+                headers=h_tech,
+                json={"actual_reference_time": "2026-12-17T10:45:00"},
+            )
+            r_direct_unknown = self.client.patch(
+                f"/api/v1/planning/steps/{day10.id}/status",
+                headers=h_tech,
+                json={"status": "COMPLETED", "preserve_missing_actuals": True},
+            )
+            self.assertEqual(r_direct_unknown.status_code, 200, r_direct_unknown.text)
+            self.assertEqual(r_direct_unknown.json()["status"], "COMPLETED")
+            self.assertIsNone(r_direct_unknown.json()["actual_start"])
+            self.assertIsNone(r_direct_unknown.json()["actual_end"])
+            self.assertEqual(r_direct_unknown.json()["actual_reference_time"], "2026-12-17T10:45:00")
+
+        # ------------------------------------------------------------------
+        # D) Normal, zamanında 'Başlat / Tamamla' akışı çalışmaya devam etmeli (day0)
+        # ------------------------------------------------------------------
+        with patch("app.api.v1.planning._facility_now", return_value=datetime(2026, 12, 7, 9, 0, 0)):
+            r_norm_start = self.client.patch(
+                f"/api/v1/planning/steps/{day0.id}/status",
+                headers=h_tech,
+                json={"status": "IN_PROGRESS"},
+            )
+            self.assertEqual(r_norm_start.status_code, 200, r_norm_start.text)
+            self.assertEqual(r_norm_start.json()["status"], "IN_PROGRESS")
+            self.assertEqual(r_norm_start.json()["actual_start"], "2026-12-07T09:00:00")
+            self.assertIsNone(r_norm_start.json()["actual_end"])
+
+        with patch("app.api.v1.planning._facility_now", return_value=datetime(2026, 12, 7, 12, 0, 0)):
+            r_norm_end = self.client.patch(
+                f"/api/v1/planning/steps/{day0.id}/status",
+                headers=h_tech,
+                json={"status": "COMPLETED"},
+            )
+            self.assertEqual(r_norm_end.status_code, 200, r_norm_end.text)
+            self.assertEqual(r_norm_end.json()["status"], "COMPLETED")
+            self.assertEqual(r_norm_end.json()["actual_start"], "2026-12-07T09:00:00")
+            self.assertEqual(r_norm_end.json()["actual_end"], "2026-12-07T12:00:00")
 
 
 if __name__ == "__main__":

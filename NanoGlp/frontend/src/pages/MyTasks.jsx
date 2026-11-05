@@ -37,6 +37,11 @@ export default function MyTasks() {
   const [updatingId, setUpdatingId] = useState(null);
   const [error, setError] = useState(null);
   const [refInputs, setRefInputs] = useState({});
+  const [startInputs, setStartInputs] = useState({});
+  const [endInputs, setEndInputs] = useState({});
+  const [preserveMissingInputs, setPreserveMissingInputs] = useState({});
+  const [latePanelOpen, setLatePanelOpen] = useState({});
+  const [taskGuidance, setTaskGuidance] = useState({});
   const [noteInputs, setNoteInputs] = useState({});
   const [savedNoticeId, setSavedNoticeId] = useState(null);
 
@@ -53,6 +58,24 @@ export default function MyTasks() {
         for (const step of all) {
           next[step.id] = step.actual_reference_time
             ? toLocalInputValue(step.actual_reference_time)
+            : '';
+        }
+        return next;
+      });
+      setStartInputs((prev) => {
+        const next = { ...prev };
+        for (const step of all) {
+          next[step.id] = step.actual_start
+            ? toLocalInputValue(step.actual_start)
+            : '';
+        }
+        return next;
+      });
+      setEndInputs((prev) => {
+        const next = { ...prev };
+        for (const step of all) {
+          next[step.id] = step.actual_end
+            ? toLocalInputValue(step.actual_end)
             : '';
         }
         return next;
@@ -84,10 +107,34 @@ export default function MyTasks() {
         ? taskOrId
         : (data?.all_assigned_tasks || []).find((x) => x.id === taskOrId) || { id: taskOrId };
     const stepId = taskObj.id;
+    const startVal = (startInputs[stepId] || '').trim();
+    const endVal = (endInputs[stepId] || '').trim();
+    const refVal = (refInputs[stepId] || '').trim();
+    const preserveMissing = Boolean(preserveMissingInputs[stepId]);
+
     setUpdatingId(stepId);
     setError(null);
+    setTaskGuidance((prev) => ({ ...prev, [stepId]: null }));
     try {
       const body = { status: nextStatus };
+      if (startVal) {
+        body.actual_start = startVal.length === 16 ? `${startVal}:00` : startVal;
+      }
+      if (nextStatus === 'COMPLETED' && endVal) {
+        body.actual_end = endVal.length === 16 ? `${endVal}:00` : endVal;
+      }
+      if (preserveMissing) {
+        body.preserve_missing_actuals = true;
+        if (!startVal) body.actual_start_unknown = true;
+        if (nextStatus === 'COMPLETED' && !endVal) body.actual_end_unknown = true;
+      }
+      if (
+        nextStatus === 'COMPLETED' &&
+        refVal &&
+        refVal !== toLocalInputValue(taskObj.actual_reference_time)
+      ) {
+        body.actual_reference_time = refVal.length === 16 ? `${refVal}:00` : refVal;
+      }
       const noteVal = (noteInputs[stepId] || '').trim();
       if (noteVal) {
         body.deviation_notes = noteVal;
@@ -96,7 +143,19 @@ export default function MyTasks() {
       setSavedNoticeId(stepId);
       await load();
     } catch (err) {
-      setError(extractError(err, 'Görev durumu güncellenemedi.'));
+      const msg = extractError(err, 'Görev durumu güncellenemedi.');
+      if (err?.response?.status === 422 && !startVal && !preserveMissing) {
+        setLatePanelOpen((prev) => ({ ...prev, [stepId]: true }));
+        setTaskGuidance((prev) => ({
+          ...prev,
+          [stepId]:
+            nextStatus === 'IN_PROGRESS'
+              ? 'Kaydedilen referans saati mevcut saatten önce olduğu için görev geçmişte başlamıştır. Lütfen Gerçekleşen Başlangıç saatini girin veya saat bilinmiyorsa "Gerçek başlangıç/bitiş saati bilinmiyor (eksik bilgi olarak koru)" seçeneğini işaretleyip tekrar Başlat butonuna tıklayın.'
+              : 'Geçmişte gerçekleşen veya henüz başlatılmamış görevi tamamlamak için lütfen Gerçekleşen Başlangıç / Bitiş saatlerini girin veya saatler bilinmiyorsa "Gerçek başlangıç/bitiş saati bilinmiyor (eksik bilgi olarak koru)" seçeneğini işaretleyip tekrar Tamamla butonuna tıklayın.',
+        }));
+      } else {
+        setError(msg);
+      }
     } finally {
       setUpdatingId(null);
     }
@@ -144,6 +203,90 @@ export default function MyTasks() {
   }, [allAssignedTasks]);
 
   const lockedCount = allAssignedTasks.filter((t) => t.is_biological_fixed_time).length;
+
+  const renderActualTimesPanel = (task) => {
+    if (isReadOnly) return null;
+    const isVisible =
+      Boolean(latePanelOpen[task.id]) ||
+      Boolean(taskGuidance[task.id]) ||
+      Boolean(task.actual_reference_time && !task.actual_start && task.status !== 'COMPLETED');
+    if (!isVisible) return null;
+
+    return (
+      <div
+        data-testid={`actual-times-panel-${task.id}`}
+        className="mt-2.5 p-3 rounded-md bg-amber-50/60 border border-amber-200 space-y-2 text-xs"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <span className="font-semibold text-slate-800">
+            Geç Gerçekleşme / Gerçekleşen Başlangıç & Bitiş Saatleri
+          </span>
+          <span className="text-[11px] text-slate-500">
+            Planlanan: <strong className="font-mono text-slate-700">{fmtDateTime(task.planned_start)} – {fmtTime(task.planned_end)}</strong>
+          </span>
+        </div>
+
+        {taskGuidance[task.id] && (
+          <p
+            data-testid={`task-guidance-${task.id}`}
+            className="text-xs font-medium text-amber-900 bg-amber-100/80 px-2.5 py-1.5 rounded border border-amber-300"
+          >
+            {taskGuidance[task.id]}
+          </p>
+        )}
+
+        <div className="flex flex-wrap items-center gap-3 pt-1">
+          <label className="text-[11px] font-medium text-slate-700">
+            Gerçekleşen Başlangıç:
+            <input
+              type="datetime-local"
+              data-testid={`actual-start-input-${task.id}`}
+              value={startInputs[task.id] || ''}
+              onChange={(e) =>
+                setStartInputs((prev) => ({
+                  ...prev,
+                  [task.id]: e.target.value,
+                }))
+              }
+              className="ml-1.5 border border-slate-300 rounded px-2 py-1 text-xs font-mono bg-white"
+            />
+          </label>
+
+          <label className="text-[11px] font-medium text-slate-700">
+            Gerçekleşen Bitiş:
+            <input
+              type="datetime-local"
+              data-testid={`actual-end-input-${task.id}`}
+              value={endInputs[task.id] || ''}
+              onChange={(e) =>
+                setEndInputs((prev) => ({
+                  ...prev,
+                  [task.id]: e.target.value,
+                }))
+              }
+              className="ml-1.5 border border-slate-300 rounded px-2 py-1 text-xs font-mono bg-white"
+            />
+          </label>
+
+          <label className="inline-flex items-center gap-1.5 text-[11px] font-medium text-slate-700 cursor-pointer">
+            <input
+              type="checkbox"
+              data-testid={`preserve-missing-actuals-${task.id}`}
+              checked={Boolean(preserveMissingInputs[task.id])}
+              onChange={(e) =>
+                setPreserveMissingInputs((prev) => ({
+                  ...prev,
+                  [task.id]: e.target.checked,
+                }))
+              }
+              className="rounded border-slate-300 text-blue-600 focus:ring-blue-500"
+            />
+            Gerçek başlangıç/bitiş saati bilinmiyor (eksik bilgi olarak koru)
+          </label>
+        </div>
+      </div>
+    );
+  };
 
   const renderReferenceTimePanel = (task) => {
     if (!task.requires_reference_time) return null;
@@ -463,7 +606,21 @@ export default function MyTasks() {
                     </div>
 
                     {!isReadOnly && (
-                      <div className="flex items-center gap-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          disabled={busy}
+                          data-testid={`toggle-actual-times-btn-${task.id}`}
+                          onClick={() =>
+                            setLatePanelOpen((prev) => ({
+                              ...prev,
+                              [task.id]: !prev[task.id],
+                            }))
+                          }
+                          className="inline-flex items-center gap-1 text-xs font-medium px-2.5 py-1.5 rounded-md border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 disabled:opacity-50"
+                        >
+                          <Clock className="w-3.5 h-3.5" /> Geç Kayıt / Saat Gir
+                        </button>
                         {task.status === 'PENDING' && (
                           <button
                             type="button"
@@ -489,6 +646,7 @@ export default function MyTasks() {
                       </div>
                     )}
                   </div>
+                  {renderActualTimesPanel(task)}
                   {renderReferenceTimePanel(task)}
                 </li>
               );
