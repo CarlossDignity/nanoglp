@@ -2411,6 +2411,34 @@ def _format_schedule_response(
     }
 
 
+def serialize_water_bath_reservations(study: Study, steps: List[StudyStep]) -> List[Dict[str, Any]]:
+    """Expose the existing EQ-WB-001 equipment windows, not personnel task duration.
+
+    Mirrors evaluate_study_conflicts' active_equipment_steps and 6c scope.
+    COMPLETED setup tasks keep their reservation while the study remains active.
+    No scheduling, conflict calculation or database writes are performed here.
+    """
+    if study.status not in COMPARED_STUDY_STATUSES:
+        return []
+    usage = get_study_extraction_usage(study)
+    if not usage["uses_water_bath"]:
+        return []
+    return [
+        {
+            "equipment_code": "EQ-WB-001",
+            "step_id": step.id,
+            "window_start": step.planned_start.isoformat(),
+            "window_end": (step.planned_start + timedelta(hours=72)).isoformat(),
+            "uses_polar": usage["uses_polar"],
+            "uses_apolar": usage["uses_apolar"],
+        }
+        for step in steps
+        if step.status != StepStatus.CANCELLED
+        and not is_historical_unverified_step(step, study)
+        and (step.step_type == "Ekstraksiyon" or "Ekstraksiyon" in (step.step_name or ""))
+    ]
+
+
 def get_all_studies_calendar_details(
     db: Session,
     studies: List[Study],
@@ -2481,6 +2509,7 @@ def get_all_studies_calendar_details(
                 "sponsor_name": study.sponsor_name,
                 "test_item_name": study.test_item_name,
                 "test_item_batch": study.test_item_batch,
+                "water_bath_reservations": serialize_water_bath_reservations(study, st_steps),
                 "extraction_polar": study.extraction_polar,
                 "extraction_polar_solvent": study.extraction_polar_solvent,
                 "extraction_non_polar": study.extraction_non_polar,
