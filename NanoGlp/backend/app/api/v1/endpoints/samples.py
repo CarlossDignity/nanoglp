@@ -280,36 +280,47 @@ def update_sample(
     data = _payload_dict(payload)
     data.pop("study_code", None)
     _check_edit_perms(data, perms)
-    changed = ss.apply_field_updates(sample, data, ss.SALES_FIELDS + ss.TRM_FIELDS + ss.PLANNING_FIELDS)
-    propagated: List[str] = []
-    trm_changes = {k: v for k, v in data.items() if k in ss.TRM_FIELDS}
-    if payload.apply_to_related and trm_changes and sample.test_item_code:
-        related = (
-            db.query(SampleRecord)
-            .filter(SampleRecord.test_item_code == sample.test_item_code, SampleRecord.id != sample.id)
-            .all()
-        )
-        for o in related:
-            if ss.apply_field_updates(o, trm_changes, ss.TRM_FIELDS):
-                propagated.append(o.study_code)
-    if sample.lab_arrival_date and (sample.stored_status or "").upper() in ("", "EXPECTED"):
-        sample.stored_status = "PLANNED"
-    if changed:
-        db.add(
-            AuditLog(
-                user_id=current_user.id, entity_name="SampleRecord", entity_id=sample.id, action="UPDATE_SAMPLE",
-                new_values={"changed": changed, "propagated_to": propagated},
-                reason=(
-                    f"{current_user.username}: '{sample.study_code}' numune kaydı güncellendi"
-                    + (f" (ortak güncelleme: {', '.join(propagated)})." if propagated else ".")
-                ),
+    try:
+        changed = ss.apply_field_updates(sample, data, ss.SALES_FIELDS + ss.TRM_FIELDS + ss.PLANNING_FIELDS)
+        study_changed = ss.sync_sample_shared_fields(db, sample, data)
+        propagated: List[str] = []
+        trm_changes = {k: v for k, v in data.items() if k in ss.TRM_FIELDS}
+        if payload.apply_to_related and trm_changes and sample.test_item_code:
+            related = (
+                db.query(SampleRecord)
+                .filter(SampleRecord.test_item_code == sample.test_item_code, SampleRecord.id != sample.id)
+                .all()
             )
-        )
-    db.commit()
-    out = ss.serialize_sample(db, sample, perms)
-    out["propagated_to"] = propagated
-    db.commit()
-    return out
+            for other in related:
+                related_changed = ss.apply_field_updates(other, trm_changes, ss.TRM_FIELDS)
+                related_study_changed = ss.sync_sample_shared_fields(db, other, trm_changes)
+                if related_changed or related_study_changed:
+                    propagated.append(other.study_code)
+        if "lab_arrival_date" in changed and sample.lab_arrival_date and (sample.stored_status or "").upper() in ("", "EXPECTED"):
+            sample.stored_status = "PLANNED"
+        if changed or study_changed or propagated:
+            db.add(
+                AuditLog(
+                    user_id=current_user.id, entity_name="SampleRecord", entity_id=sample.id, action="UPDATE_SAMPLE",
+                    new_values={"changed": changed, "study_changed": study_changed, "propagated_to": propagated},
+                    reason=(
+                        f"{current_user.username}: '{sample.study_code}' numune kaydı güncellendi"
+                        + (f" (ortak güncelleme: {', '.join(propagated)})." if propagated else ".")
+                    ),
+                )
+            )
+        db.flush()
+        # A factual edit must not silently rewrite dates omitted from the PUT.
+        out = ss.serialize_sample(db, sample, perms, sync_schedule_dates=False)
+        out["propagated_to"] = propagated
+        db.commit()
+        return out
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception:
+        db.rollback()
+        raise
 
 
 @router.delete("/{sample_id}", summary="Numune / Çalışma Kaydını Sil")
