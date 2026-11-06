@@ -38,6 +38,32 @@ const STATUS_META = {
 };
 const STATUS_ORDER = ['ONGOING', 'PLANNED', 'EXPECTED', 'COMPLETED', 'CANCELLED'];
 
+// Operational Study status is independent of sample status and document signatures.
+const OPERATIONAL_STATUS_LABELS = new Map([
+  ['DRAFT', 'Taslak — plan onayı bekleniyor'],
+  ['APPROVED', 'Onaylı'],
+  ['IN_PROGRESS', 'Devam ediyor'],
+  ['REPORTING', 'Raporlama'],
+  ['COMPLETED', 'Tamamlandı'],
+  ['CANCELLED', 'İptal edildi'],
+]);
+
+function OperationalStudyStatus({ study }) {
+  const label = !study?.id
+    ? 'Bağlı çalışma bulunmuyor'
+    : OPERATIONAL_STATUS_LABELS.get(study.status) || `Bilinmeyen durum${study.status ? ` (${study.status})` : ''}`;
+  return (
+    <div data-testid="operational-study-status" className="mt-2 text-xs text-slate-700">
+      <p>Operasyonel plan / çalışma durumu: <strong>{label}</strong></p>
+      {study?.id && (
+        <p className="mt-0.5 text-[11px] text-slate-500">
+          {study.has_schedule === true ? 'Takvim oluşturulmuş' : study.has_schedule === false ? 'Takvim oluşturulmamış' : 'Takvim bilgisi bulunmuyor'}
+        </p>
+      )}
+    </div>
+  );
+}
+
 const Dot = ({ cls }) => <span className={`inline-block w-1.5 h-1.5 rounded-full shrink-0 ${cls}`} />;
 
 const inputCls =
@@ -1161,6 +1187,7 @@ export default function SampleTracking() {
                     <p className="text-xs text-slate-500 mt-0.5 truncate">
                       {detail?.requested_analysis || '—'} · {detail?.test_item_name || '—'}
                     </p>
+                    {!drawerLoading && detail && <OperationalStudyStatus study={detail.study} />}
                     {detail?.overdue_reasons?.length > 0 && (
                       <p className="text-[11px] text-red-700 mt-1">{detail.overdue_reasons.join(' · ')}</p>
                     )}
@@ -1673,7 +1700,7 @@ export default function SampleTracking() {
                                 ? 'bg-white border-blue-600 ring-2 ring-blue-100'
                                 : 'bg-white border-slate-300';
                             return (
-                              <li key={s.no} className="flex gap-3">
+                              <li key={s.no} data-testid={`workflow-step-${s.no}`} className="flex gap-3">
                                 <div className="flex flex-col items-center">
                                   <span className={`w-4 h-4 rounded-full border flex items-center justify-center shrink-0 mt-0.5 ${stateCls}`}>
                                     {s.state === 'done' && <Check className="w-2.5 h-2.5" />}
@@ -1726,6 +1753,18 @@ export default function SampleTracking() {
                                       ? `${s.overdue ? 'Gecikti · ' : 'Hedef '}${fmtD(s.due_date)}`
                                       : ''}
                                   </p>
+
+                                  {s.no === 6 && (
+                                    <p className="mt-1.5 text-[11px] text-slate-600">
+                                      ÇY/KG/TBY belge imzaları operasyonel plan onayından ayrı kaydedilir.
+                                      {detail.study?.status === 'DRAFT' && ' Görevleri yürütmek için planlama ekranında plan onayı gerekir.'}
+                                    </p>
+                                  )}
+                                  {s.no === 11 && (
+                                    <p className="mt-1.5 text-[11px] text-slate-600">
+                                      Final rapor onayı belge iş akışına aittir; operasyonel çalışmayı otomatik olarak tamamlamaz.
+                                    </p>
+                                  )}
 
                                   {s.kind === 'approval' ? (
                                     <div className="mt-1.5 flex flex-wrap gap-1.5">
