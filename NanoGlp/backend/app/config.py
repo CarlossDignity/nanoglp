@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     APP_ENV: str = "development"
     API_V1_STR: str = "/api/v1"
     DATABASE_URL: str = DEFAULT_SQLITE_PATH
+    TRUSTED_PROXY_CIDRS: str = ""
     SECRET_KEY: str = "glp_nanolab_secret_key_2026_edirne"
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 720  # 12 saat (1 vardiya)

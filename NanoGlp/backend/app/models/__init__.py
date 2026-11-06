@@ -1,3 +1,4 @@
+from app.models.user_access_log import UserAccessLog
 from app.models.user import User, UserRole
 from app.models.room import Room
 from app.models.equipment import Equipment, EquipmentStatus
@@ -32,4 +33,5 @@ __all__ = [
     "ConflictType",
     "ConflictSeverity",
     "AuditLog",
+    "UserAccessLog",
 ]

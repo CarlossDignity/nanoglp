@@ -34,6 +34,8 @@ api.interceptors.response.use(
 // Kimlik Doğrulama (FAZ 5, 5.1 & FAZ 10 Auth & RBAC)
 export const loginApi = (username, password) =>
   api.post('/auth/login', { username, password });
+export const logoutApi = () => api.post('/auth/logout', {}, { timeout: 5000 });
+export const getAccessLogs = (params) => api.get('/access-logs', { params });
 export const getMe = () => api.get('/auth/me');
 export const changePasswordApi = (currentPassword, newPassword) =>
   api.post('/auth/change-password', {
@@ -55,6 +57,7 @@ export const deleteRole = (roleCode) => api.delete(`/users/roles/${roleCode}`);
 export const getHealth = () => api.get('/health');
 export const getStudies = () => api.get('/studies/');
 export const createStudy = (data) => api.post('/studies/', data);
+export const updatePersonnelContact = (id, data) => api.patch(`/personnel/${id}/contact`, data);
 export const getPersonnel = () => api.get('/personnel/');
 export const createPersonnel = (data) => api.post('/personnel/', data);
 export const getEquipment = () => api.get('/equipment');

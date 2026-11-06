@@ -1,3 +1,4 @@
+import PersonnelContact from '../components/PersonnelContact';
 import React, { useCallback, useEffect, useState } from 'react';
 import {
   UserPlus,
@@ -322,6 +323,7 @@ export default function Personnel({ onChanged }) {
                   </div>
                 </button>
 
+                <PersonnelContact person={p} canEdit={!isReadOnly} onSaved={load} />
                 {open && (
                   <div className="px-12 pb-4">
                     {p.tasks.length === 0 ? (
@@ -446,6 +448,7 @@ export default function Personnel({ onChanged }) {
                   <tr key={p.personnel_id} className="hover:bg-slate-50/70">
                     <td className="px-4 py-3">
                       <p className="font-semibold text-slate-900">{p.full_name}</p>
+                      <PersonnelContact person={p} canEdit={!isReadOnly} onSaved={load} />
                       <p className="text-[11px] text-slate-500">{ROLE_LABEL[p.role] || p.role}</p>
                     </td>
                     {p.daily.map((cell, idx) => {

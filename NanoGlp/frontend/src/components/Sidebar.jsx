@@ -33,6 +33,7 @@ export const ALL_NAV_SECTIONS = [
   {
     title: 'Yönetim',
     items: [
+      { to: '/access-logs', sysadminOnly: true, label: 'Giriş / Çıkış Kayıtları', icon: UserCog },
       { to: '/users', menuKey: 'users', label: 'Kullanıcı Yönetimi', icon: UserCog },
       { to: '/settings', menuKey: 'settings', label: 'Sistem Ayarları', icon: SettingsIcon },
     ],
@@ -45,7 +46,7 @@ export default function Sidebar({ badges = {} }) {
 
   const sections = ALL_NAV_SECTIONS.map((sec) => ({
     ...sec,
-    items: sec.items.filter((item) => allowedMenus.includes(item.menuKey)),
+    items: sec.items.filter((item) => item.sysadminOnly ? ['SYSADMIN', 'ADMIN'].includes(role) : allowedMenus.includes(item.menuKey)),
   })).filter((sec) => sec.items.length > 0);
 
   return (

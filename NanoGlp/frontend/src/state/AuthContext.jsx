@@ -1,7 +1,8 @@
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import {
   getMe,
   loginApi,
+  logoutApi,
   TOKEN_STORAGE_KEY,
   USER_STORAGE_KEY,
 } from '../services/api';
@@ -60,7 +61,7 @@ export function AuthProvider({ children }) {
   const [user, setUser] = useState(() => readStoredUser());
   const [authChecking, setAuthChecking] = useState(() => Boolean(localStorage.getItem(TOKEN_STORAGE_KEY)));
 
-  const logout = useCallback(() => {
+  const clearSession = useCallback(() => {
     localStorage.removeItem(TOKEN_STORAGE_KEY);
     localStorage.removeItem(USER_STORAGE_KEY);
     setToken(null);
@@ -69,10 +70,26 @@ export function AuthProvider({ children }) {
   }, []);
 
   useEffect(() => {
-    const onUnauthorized = () => logout();
+    const onUnauthorized = () => clearSession();
     window.addEventListener('nanolab:unauthorized', onUnauthorized);
     return () => window.removeEventListener('nanolab:unauthorized', onUnauthorized);
-  }, [logout]);
+  }, [clearSession]);
+
+  const logoutRequest = useRef(null);
+  const logout = useCallback(async () => {
+    if (logoutRequest.current) return logoutRequest.current;
+    const request = (async () => {
+      try {
+        if (localStorage.getItem(TOKEN_STORAGE_KEY)) await logoutApi();
+      } catch {
+        // Explicit local logout always completes, even offline or after expiry.
+      } finally {
+        clearSession();
+      }
+    })();
+    logoutRequest.current = request;
+    try { await request; } finally { logoutRequest.current = null; }
+  }, [clearSession]);
 
   const refreshUser = useCallback(async () => {
     if (!token) return null;
@@ -100,7 +117,7 @@ export function AuthProvider({ children }) {
       })
       .catch(() => {
         if (!active) return;
-        logout();
+        clearSession();
       })
       .finally(() => {
         if (active) setAuthChecking(false);
@@ -108,7 +125,7 @@ export function AuthProvider({ children }) {
     return () => {
       active = false;
     };
-  }, [token, logout]);
+  }, [token, clearSession]);
 
   const login = useCallback(async (username, password) => {
     const res = await loginApi(username, password);

@@ -544,6 +544,7 @@ def api_get_daily_workload(
         wl.update({
             "full_name": u.full_name,
             "email": u.email,
+            "phone": u.phone,
             "role": u.role.value if hasattr(u.role, "value") else str(u.role),
             "qualifications": u.qualifications or [],
         })
@@ -587,6 +588,8 @@ def api_get_weekly_workload(
             "full_name": u.full_name,
             "role": u.role.value if hasattr(u.role, "value") else str(u.role),
             "qualifications": u.qualifications or [],
+            "email": u.email,
+            "phone": u.phone,
             "weekly_total_minutes": sum(item["total_minutes"] for item in daily),
             "weekly_task_count": sum(item["task_count"] for item in daily),
             "any_day_exceeds": any(item["exceeds_limit"] for item in daily),

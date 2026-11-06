@@ -450,7 +450,14 @@ def build_stepper(
             extra["marker"] = marker
         if abroad:
             extra["abroad"] = True
-        if no == 4:
+        if no == 3:
+            done = bool(st.get("done") or marker == "+")
+            extra["order_defaults"] = {"order_date": today.isoformat(), "estimated_delivery_days": 15}
+            extra["animal_order"] = st if st.get("animal_tracking") is True else None
+            if st.get("animal_tracking"):
+                done = bool(st.get("received_date"))
+                extra["animal_status"] = ("Kabul Edildi" if done else "Sipariş Verildi — Teslim Bekleniyor" if st.get("order_date") else "Sipariş Bekleniyor")
+        elif no == 4:
             if sample.lab_arrival_date:
                 done, done_at, done_by = True, sample.lab_arrival_date.isoformat(), "TRM Kabul"
                 due = sample.lab_arrival_date

@@ -16,7 +16,7 @@ const MENU_KEY_TO_PATH = {
   settings: '/settings',
 };
 
-export default function ProtectedRoute({ allowedRoles, menuKey, children }) {
+export default function ProtectedRoute({ allowedRoles, menuKey, sysadminOnly = false, children }) {
   const { isAuthenticated, authChecking, role, allowedMenus, defaultHomeRoute } = useAuth();
   const location = useLocation();
 
@@ -34,6 +34,10 @@ export default function ProtectedRoute({ allowedRoles, menuKey, children }) {
   }
 
   const firstAllowedPath = defaultHomeRoute || MENU_KEY_TO_PATH[allowedMenus?.[0]] || (role === 'TECHNICIAN' ? '/my-tasks' : '/samples');
+
+  if (sysadminOnly && !['SYSADMIN', 'ADMIN'].includes(role)) {
+    return <Navigate to={firstAllowedPath} replace />;
+  }
 
   if (menuKey && Array.isArray(allowedMenus) && !allowedMenus.includes(menuKey)) {
     return <Navigate to={firstAllowedPath} replace />;

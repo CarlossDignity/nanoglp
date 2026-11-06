@@ -1,3 +1,4 @@
+import AccessLogs from './pages/AccessLogs';
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import { RefreshCw, ShieldAlert, AlertTriangle, CheckCircle2 } from 'lucide-react';
@@ -374,6 +375,7 @@ export default function App() {
                   </ProtectedRoute>
                 }
               />
+              <Route path="/access-logs" element={<ProtectedRoute sysadminOnly><AccessLogs /></ProtectedRoute>} />
               <Route
                 path="/users"
                 element={
