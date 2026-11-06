@@ -1,5 +1,6 @@
 """Inspect real DOCX parts; all database state is disposable."""
 
+import atexit
 import io
 import os
 import sys
@@ -16,6 +17,8 @@ TMP = tempfile.TemporaryDirectory(prefix="nanoglp_docx_")
 os.environ["DATABASE_URL"] = f"sqlite:///{TMP.name}/test.db"
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.database import Base, SessionLocal, engine
+
+atexit.register(engine.dispose)
 import app.models
 from app.models.study import Study, StudyStatus
 from app.models.study_step import StudyStep, StepStatus
@@ -71,6 +74,10 @@ class DocxIsolation(unittest.TestCase):
 
     def tearDown(self):
         self.db.close()
+
+    @classmethod
+    def tearDownClass(cls):
+        engine.dispose()
 
     def document(self, code="DOCX-B", **links):
         doc = DbDocument(

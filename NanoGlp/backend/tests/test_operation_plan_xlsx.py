@@ -1,5 +1,6 @@
 """Real XLSX HTTP downloads; no live database or planning mutations."""
 
+import atexit
 import io
 import os
 import sys
@@ -15,6 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from fastapi.testclient import TestClient
 from openpyxl import load_workbook
 from app.database import Base, SessionLocal, engine
+
+atexit.register(engine.dispose)
 from app.main import app
 from app.seed import reset_schema, seed_personnel, DEFAULT_PASSWORD
 from app.models.study import Study, StudyStatus
@@ -283,6 +286,14 @@ class OperationPlanXlsx(unittest.TestCase):
         self.assertEqual(ws["B9"].data_type, "s")
         self.assertEqual(ws["C9"].data_type, "s")
 
+    @classmethod
+    def tearDownClass(cls):
+        engine.dispose()
+
 
 if __name__ == "__main__":
-    unittest.main()
+    try:
+        unittest.main(verbosity=2)
+    finally:
+        engine.dispose()
+        TMP.cleanup()

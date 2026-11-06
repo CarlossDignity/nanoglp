@@ -1,5 +1,6 @@
 """Real PUT and DOCX contract for manual shared facts; disposable SQLite only."""
 
+import atexit
 import io
 import os
 import sys
@@ -18,6 +19,8 @@ from lxml import etree
 from fastapi.testclient import TestClient
 from sqlalchemy import event
 from app.database import Base, SessionLocal, engine
+
+atexit.register(engine.dispose)
 from app.main import app
 from app.seed import reset_schema, seed_personnel, DEFAULT_PASSWORD
 from app.models.sample import SampleRecord
@@ -85,6 +88,10 @@ class SampleStudySync(unittest.TestCase):
     def tearDown(self):
         self.client.close()
         self.db.close()
+
+    @classmethod
+    def tearDownClass(cls):
+        engine.dispose()
 
     def pair(self, code, status):
         study = Study(

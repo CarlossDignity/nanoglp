@@ -1,5 +1,6 @@
 """Full replan must not erase execution evidence; only disposable SQLite is used."""
 
+import atexit
 import os
 import sys
 import tempfile
@@ -14,6 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fastapi.testclient import TestClient
 from app.database import Base, SessionLocal, engine
+
+atexit.register(engine.dispose)
 from app.main import app
 from app.seed import reset_schema, seed_personnel
 from app.models.study import Study, StudyStatus
@@ -67,6 +70,10 @@ class ReplanExecutionGuard(unittest.TestCase):
     def tearDown(self):
         self.client.close()
         self.db.close()
+
+    @classmethod
+    def tearDownClass(cls):
+        engine.dispose()
 
     def fixture(self, status, actual, study_status=StudyStatus.DRAFT):
         self.serial += 1

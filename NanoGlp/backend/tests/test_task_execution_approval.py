@@ -1,5 +1,6 @@
 """Real HTTP calls and fresh-session snapshots against disposable SQLite only."""
 
+import atexit
 import os
 import sys
 import tempfile
@@ -13,6 +14,8 @@ os.environ["DATABASE_URL"] = f"sqlite:///{TMP.name}/test.db"
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from fastapi.testclient import TestClient
 from app.database import Base, SessionLocal, engine
+
+atexit.register(engine.dispose)
 from app.main import app
 from app.seed import DEFAULT_PASSWORD, reset_schema, seed_personnel
 from app.models.study import Study, StudyStatus
@@ -254,6 +257,14 @@ class TaskExecutionApproval(unittest.TestCase):
                         self.assertEqual(step.deviation_notes, "Late entry")
                         self.assertEqual(step.study.status, study_status)
 
+    @classmethod
+    def tearDownClass(cls):
+        engine.dispose()
+
 
 if __name__ == "__main__":
-    unittest.main()
+    try:
+        unittest.main(verbosity=2)
+    finally:
+        engine.dispose()
+        TMP.cleanup()

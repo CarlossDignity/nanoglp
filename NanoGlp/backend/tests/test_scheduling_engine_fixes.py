@@ -43,7 +43,7 @@ from app.services.scheduling_engine import (  # noqa: E402
     schedule_new_study,
 )
 
-assert "nanoglp_sched_fixes_" in settings.DATABASE_URL, "Test canlı veritabanını hedefleyemez!"
+assert "nanoglp_" in settings.DATABASE_URL and "nanolab_glp.db" not in settings.DATABASE_URL, "Test canlı veritabanını hedefleyemez!"
 
 
 def _login_headers(client: TestClient, username: str = "emine", password: str = DEFAULT_PASSWORD) -> dict:

@@ -1,5 +1,6 @@
 """Excel refresh contract; every run owns a disposable SQLite database."""
 
+import atexit
 import io
 import os
 import sys
@@ -14,6 +15,8 @@ os.environ["DATABASE_URL"] = f"sqlite:///{TMP.name}/test.db"
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from openpyxl import Workbook
 from app.database import SessionLocal, engine
+
+atexit.register(engine.dispose)
 from app.seed import reset_schema, seed_personnel
 from app.models.sample import SampleRecord
 from app.models.study import Study, StudyStatus
@@ -60,6 +63,10 @@ class ExcelUpdates(unittest.TestCase):
 
     def tearDown(self):
         self.db.close()
+
+    @classmethod
+    def tearDownClass(cls):
+        engine.dispose()
 
     def load(self, data=None, **kw):
         return ss.import_study_status_workbook(
