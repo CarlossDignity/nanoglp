@@ -67,6 +67,23 @@ export const getCalibration = () => api.get('/planning/calibration');
 export const updateCalibration = (data) => api.put('/planning/calibration', data);
 export const getSteps = (params) => api.get('/planning/steps', { params });
 export const getCalendar = () => api.get('/planning/calendar');
+
+export const downloadOperationPlanExcel = async (params) => {
+  const res = await api.get('/planning/export-excel', { params, responseType: 'blob' });
+  const blob = new Blob([res.data], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+  const url = window.URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = res.headers?.['content-disposition']?.match(/filename="([^"]+)"/)?.[1]
+    || `operasyon-plani-${params.view}-${params.target_date}.xlsx`;
+  try {
+    document.body.appendChild(a);
+    a.click();
+  } finally {
+    a.remove();
+    window.URL.revokeObjectURL(url);
+  }
+};
 export const getStudySchedule = (studyId) => api.get(`/planning/studies/${studyId}/schedule`);
 export const approveStudyPlan = (studyId) => api.post(`/planning/studies/${studyId}/approve`);
 export const getBiologicalRevisionPreview = (studyId) =>

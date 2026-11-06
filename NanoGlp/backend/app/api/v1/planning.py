@@ -1,6 +1,7 @@
 from datetime import date, datetime, time, timedelta, timezone
-from typing import List, Optional
+from typing import List, Optional, Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, model_validator
 from sqlalchemy.orm import Session, selectinload
 
@@ -600,6 +601,27 @@ def api_get_weekly_workload(
         "personnel": personnel_matrix,
         **cal_meta,
     }
+
+
+@router.get("/export-excel", summary="Günlük / Haftalık Operasyon Planı Excel (Salt-Okunur)")
+def api_export_operation_plan(
+    target_date: date = Query(..., description="Tesis yerel günü; haftalık görünümde haftanın herhangi bir günü"),
+    view: Literal["daily", "weekly"] = Query(...),
+    study_code: Optional[str] = Query(None, max_length=100),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_management_read),
+):
+    from app.services.operation_plan_xlsx import export_operation_plan
+
+    try:
+        stream, filename = export_operation_plan(db, target_date, view, study_code)
+    except OverflowError:
+        raise HTTPException(status_code=422, detail="Seçilen tarih için dönem sınırı hesaplanamıyor.")
+    return StreamingResponse(
+        stream,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get("/calendar", summary="Kalıcı Master Operasyon Takvimi — Tüm Çalışmalar, Adımlar ve Çakışmalar (FAZ 6.3)")

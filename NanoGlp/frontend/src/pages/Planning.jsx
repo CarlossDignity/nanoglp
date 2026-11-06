@@ -39,6 +39,8 @@ import {
   applyConflictResolution,
   recomputeConflicts,
   downloadStudyPlanDocx,
+  downloadOperationPlanExcel,
+  extractBlobError,
   extractError,
 } from '../services/api';
 import { useAuth } from '../state/AuthContext';
@@ -205,6 +207,7 @@ export default function Planning({ onScheduled }) {
   const [submitting, setSubmitting] = useState(false);
   const [approving, setApproving] = useState(false);
   const [downloadingDocx, setDownloadingDocx] = useState(false);
+  const [downloadingExcel, setDownloadingExcel] = useState(false);
   const [recomputingConflicts, setRecomputingConflicts] = useState(false);
   const [bioRevisionPreview, setBioRevisionPreview] = useState(null);
   const [loadingBioPreview, setLoadingBioPreview] = useState(false);
@@ -655,6 +658,51 @@ export default function Planning({ onScheduled }) {
       };
     });
   }, [weekStart]);
+
+  const handleExportOperationPlan = async (view) => {
+    setDownloadingExcel(true);
+    setError(null);
+    try {
+      await downloadOperationPlanExcel({
+        view,
+        target_date: view === 'weekly' ? toMondayISO(weekStart) : dailyDate,
+        ...(calendarStudyFilter === 'ALL' ? {} : { study_code: calendarStudyFilter }),
+      });
+    } catch (err) {
+      setError(await extractBlobError(err, 'Operasyon planı Excel çıktısı indirilemedi.'));
+    } finally {
+      setDownloadingExcel(false);
+    }
+  };
+
+  const calendarFilter = () => (
+    <select
+      aria-label="Operasyon planı çalışma filtresi"
+      value={calendarStudyFilter}
+      onChange={(e) => setCalendarStudyFilter(e.target.value)}
+      className="border border-slate-300 rounded-md px-2.5 py-1.5 text-xs bg-white font-medium text-slate-700"
+    >
+      <option value="ALL">Tüm Çalışmalar ({calendarData.studies.length})</option>
+      {calendarData.studies.map((st) => (
+        <option key={st.study_id} value={st.study_code}>
+          {st.study_code} ({st.study_status === 'DRAFT' ? 'TASLAK' : st.study_status || 'Bilinmiyor'})
+        </option>
+      ))}
+    </select>
+  );
+
+  const exportPlanButton = (view) => (
+    <button
+      type="button"
+      data-testid={`export-operation-${view}`}
+      disabled={downloadingExcel || !(view === 'weekly' ? weekStart : dailyDate)}
+      onClick={() => handleExportOperationPlan(view)}
+      className="inline-flex items-center gap-1 border border-slate-300 rounded-md px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+    >
+      {downloadingExcel ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <FileDown className="w-3.5 h-3.5" />}
+      Excel İndir (.xlsx)
+    </button>
+  );
 
   const filteredAllSteps = useMemo(() => {
     if (calendarStudyFilter === 'ALL') return calendarData.all_steps;
@@ -1859,18 +1907,8 @@ export default function Planning({ onScheduled }) {
               </div>
 
               <div className="flex flex-wrap items-center gap-2">
-                <select
-                  value={calendarStudyFilter}
-                  onChange={(e) => setCalendarStudyFilter(e.target.value)}
-                  className="border border-slate-300 rounded-md px-2.5 py-1.5 text-xs bg-white font-medium text-slate-700"
-                >
-                  <option value="ALL">Tüm Çalışmalar ({calendarData.studies.length})</option>
-                  {calendarData.studies.map((st) => (
-                    <option key={st.study_id} value={st.study_code}>
-                      {st.study_code} ({st.study_status === 'DRAFT' ? 'TASLAK' : 'ONAYLI'})
-                    </option>
-                  ))}
-                </select>
+                {calendarFilter()}
+                {exportPlanButton('weekly')}
 
                 <button
                   type="button"
@@ -1881,6 +1919,7 @@ export default function Planning({ onScheduled }) {
                 </button>
                 <input
                   type="date"
+                  aria-label="Haftalık plan tarihi"
                   value={weekStart}
                   onChange={(e) => setWeekStart(toMondayISO(e.target.value))}
                   className="border border-slate-300 rounded-md px-2.5 py-1 text-xs"
@@ -2013,10 +2052,12 @@ export default function Planning({ onScheduled }) {
                   Günlük Saatlik Operasyon Akışı — {fmtShortDateTR(dailyDate)} ({dailyDate})
                 </h3>
                 <p className="text-xs text-slate-500">
-                  08:00 – 18:00 mesai dilimlerinde yürütülen tüm GLP çalışma adımları, süreleri ve personel atamaları.
+                  08:00 – 18:00 mesai dilimlerinde yürütülen tüm GLP çalışma adımları, süreleri ve personel atamaları. Excel çıktısı seçilen günün tamamını kapsar.
                 </p>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                {calendarFilter()}
+                {exportPlanButton('daily')}
                 <button
                   type="button"
                   onClick={() => setDailyDate((d) => addDaysISO(d, -1))}
@@ -2026,6 +2067,7 @@ export default function Planning({ onScheduled }) {
                 </button>
                 <input
                   type="date"
+                  aria-label="Günlük plan tarihi"
                   value={dailyDate}
                   onChange={(e) => setDailyDate(e.target.value)}
                   className="border border-slate-300 rounded-md px-2.5 py-1 text-xs"
