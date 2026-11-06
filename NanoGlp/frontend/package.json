@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "test:dashboard": "node --test tests/dashboard-water-bath.test.mjs",
     "test:mytasks": "node --test tests/mytasks-approval.test.mjs",
-    "test:tracking": "node --test tests/sample-tracking-status.test.mjs"
+    "test:tracking": "node --test tests/sample-tracking-status.test.mjs",
+    "test:planning-export": "node --test tests/planning-export.test.mjs"
   },
   "dependencies": {
     "axios": "^1.6.8",
