@@ -34,6 +34,8 @@ api.interceptors.response.use(
 // Kimlik Doğrulama (FAZ 5, 5.1 & FAZ 10 Auth & RBAC)
 export const loginApi = (username, password) =>
   api.post('/auth/login', { username, password });
+export const logoutApi = () => api.post('/auth/logout', {}, { timeout: 5000 });
+export const getAccessLogs = (params) => api.get('/access-logs', { params });
 export const getMe = () => api.get('/auth/me');
 export const changePasswordApi = (currentPassword, newPassword) =>
   api.post('/auth/change-password', {

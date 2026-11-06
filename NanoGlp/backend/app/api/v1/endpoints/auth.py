@@ -7,6 +7,8 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.utils.client_ip import client_ip
+from app.services.access_log import record_access
 from app.models.audit_log import AuditLog
 from app.models.user import User
 from app.schemas.user import UserOut
@@ -36,12 +38,7 @@ def reset_login_rate_limiter() -> None:
 
 
 def _get_client_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    if request.client and request.client.host:
-        return request.client.host
-    return "127.0.0.1"
+    return client_ip(request) or "unknown"
 
 
 class LoginRequest(BaseModel):
@@ -106,6 +103,20 @@ async def login(request: Request, db: Session = Depends(get_db)):
     locked_until = _LOCKED_IPS.get(client_ip, 0.0)
     if locked_until > now:
         remaining = max(1, int(locked_until - now))
+        # Preserve 429 even for malformed bodies during lockout; log only identifier.
+        try:
+            ident, _ = await _extract_credentials(request)
+        except Exception:
+            # A malformed locked-out request must still receive the existing 429.
+            ident = None
+        known = (
+            db.query(User).filter(or_(
+                func.lower(User.username) == ident.lower(),
+                func.lower(User.email) == ident.lower(),
+            )).first()
+            if ident else None
+        )
+        record_access(db, request, "LOGIN_FAILED", known, ident)
         db.add(
             AuditLog(
                 user_id=None,
@@ -144,6 +155,12 @@ async def login(request: Request, db: Session = Depends(get_db)):
     pw_valid = _verify_user_password(password, user.hashed_password) if user is not None else False
 
     if not user or not pw_valid:
+        # An inactive account still has a known identity, but remains unable to log in.
+        snapshot_user = user or db.query(User).filter(or_(
+            func.lower(User.username) == ident_lower,
+            func.lower(User.email) == ident_lower,
+        )).first()
+        record_access(db, request, "LOGIN_FAILED", snapshot_user, ident)
         recent = [ts for ts in _FAILED_LOGIN_ATTEMPTS.get(client_ip, []) if now - ts <= RATE_LIMIT_WINDOW_SECONDS]
         recent.append(now)
         _FAILED_LOGIN_ATTEMPTS[client_ip] = recent
@@ -176,6 +193,7 @@ async def login(request: Request, db: Session = Depends(get_db)):
                     headers={"Retry-After": str(RATE_LIMIT_LOCKOUT_SECONDS)},
                 )
 
+        db.commit()  # Failed authentication still persists its access event.
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Kullanıcı adı veya şifre hatalı.",
@@ -186,6 +204,7 @@ async def login(request: Request, db: Session = Depends(get_db)):
     _FAILED_LOGIN_ATTEMPTS.pop(client_ip, None)
     _LOCKED_IPS.pop(client_ip, None)
 
+    record_access(db, request, "LOGIN", user, ident)
     role_val = user.role.value if hasattr(user.role, "value") else str(user.role)
     access_token = create_access_token(
         data={
@@ -258,3 +277,10 @@ def change_password(
 @router.get("/me", response_model=UserOut, summary="Mevcut Oturum Kullanıcı Bilgisi")
 def get_me(current_user: User = Depends(get_current_user)):
     return current_user
+
+
+@router.post("/logout", summary="Kullanıcının Açık Çıkış Eylemini Kaydet")
+def logout(request: Request, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    record_access(db, request, "LOGOUT", current_user)
+    db.commit()
+    return {"status": "ok"}
