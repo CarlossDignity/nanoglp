@@ -227,6 +227,7 @@ def create_user(
     user = User(
         username=user_in.username,
         email=user_in.email,
+        phone=user_in.phone,
         full_name=user_in.full_name.strip(),
         role=user_in.role,
         department=user_in.department,
@@ -279,13 +280,16 @@ def update_user(
             raise HTTPException(status_code=400, detail=f"'{user_in.username}' kullanıcı adı zaten kullanımda.")
         user.username = user_in.username
 
-    if user_in.email is not None:
+    if "email" in user_in.model_fields_set:
         clean_email = user_in.email.strip() if user_in.email else None
         if clean_email:
             conflict = db.query(User).filter(func.lower(User.email) == clean_email.lower(), User.id != user_id).first()
             if conflict:
                 raise HTTPException(status_code=400, detail="Bu e-posta adresi başka bir kullanıcıda kayıtlı.")
         user.email = clean_email
+
+    if "phone" in user_in.model_fields_set:
+        user.phone = user_in.phone
 
     if user_in.full_name is not None:
         user.full_name = user_in.full_name.strip()

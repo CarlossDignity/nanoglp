@@ -55,6 +55,7 @@ export const deleteRole = (roleCode) => api.delete(`/users/roles/${roleCode}`);
 export const getHealth = () => api.get('/health');
 export const getStudies = () => api.get('/studies/');
 export const createStudy = (data) => api.post('/studies/', data);
+export const updatePersonnelContact = (id, data) => api.patch(`/personnel/${id}/contact`, data);
 export const getPersonnel = () => api.get('/personnel/');
 export const createPersonnel = (data) => api.post('/personnel/', data);
 export const getEquipment = () => api.get('/equipment');

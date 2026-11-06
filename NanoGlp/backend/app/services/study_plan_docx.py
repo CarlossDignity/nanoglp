@@ -511,6 +511,7 @@ def generate_study_plan_docx(db: Session, study: Study) -> bytes:
         return _val(recorded, _val(sampled, dossier_fields.get(document_field)))
 
     sd_name = _val(study.study_director.full_name if study.study_director else None)
+    sd_phone = _val(study.study_director.phone if study.study_director else None)
     sd_email = _val(study.study_director.email if study.study_director else None)
     qa_name = _val(study.qa_officer.full_name if study.qa_officer else None)
     study_code = _val(code)
@@ -557,6 +558,7 @@ def generate_study_plan_docx(db: Session, study: Study) -> bytes:
     assigned = {u.id: u for st in steps for u in st.assignees}
     personnel = [u for u in assigned.values() if u.id != study.study_director_id]
     study_personnel_names = _val(", ".join(u.full_name for u in personnel))
+    personnel_phone = _val(", ".join(u.phone for u in personnel if u.phone))
     personnel_email = _val(", ".join(u.email for u in personnel if u.email))
     managers = [u for u in personnel if u.role in (UserRole.TFM, UserRole.EXECUTIVE)]
     management_name = _val(managers[0].full_name if len(managers) == 1 else None)
@@ -742,7 +744,7 @@ def generate_study_plan_docx(db: Session, study: Study) -> bytes:
                         if ptxt.startswith("Name:"):
                             slots.fill(p, [sd_name])
                         elif ptxt.startswith("Telephone:"):
-                            slots.fill(p, ["TBD"])
+                            slots.fill(p, [sd_phone])
                         elif ptxt.startswith("Email:"):
                             slots.fill(p, [sd_email])
                 elif role_lbl == "Study Personnel":
@@ -751,7 +753,7 @@ def generate_study_plan_docx(db: Session, study: Study) -> bytes:
                         if ptxt.startswith("Name:"):
                             slots.fill(p, [study_personnel_names])
                         elif ptxt.startswith("Telephone:"):
-                            slots.fill(p, ["TBD"])
+                            slots.fill(p, [personnel_phone])
                         elif ptxt.startswith("Email:"):
                             slots.fill(p, [personnel_email])
 

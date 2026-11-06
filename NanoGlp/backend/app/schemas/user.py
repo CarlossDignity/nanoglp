@@ -1,7 +1,7 @@
 import re
 from datetime import datetime
 from typing import List, Optional, Union
-from pydantic import BaseModel, EmailStr, field_validator
+from pydantic import BaseModel, EmailStr, Field, ConfigDict, field_validator
 from app.models.user import UserRole
 
 USERNAME_PATTERN = re.compile(r"^[a-zA-Z0-9_.-]+$")
@@ -28,7 +28,21 @@ def normalize_role_code(value: Union[str, UserRole]) -> str:
     return v
 
 
-class UserBase(BaseModel):
+class ContactFields(BaseModel):
+    email: Optional[EmailStr] = None
+    phone: Optional[str] = Field(None, max_length=60)
+
+    @field_validator("email", "phone", mode="before")
+    @classmethod
+    def _blank_contact(cls, value):
+        return (value.strip() or None) if isinstance(value, str) else value
+
+
+class PersonnelContactUpdate(ContactFields):
+    model_config = ConfigDict(extra="forbid")
+
+
+class UserBase(ContactFields):
     username: str
     email: Optional[EmailStr] = None
     full_name: str
@@ -53,7 +67,7 @@ class UserCreate(UserBase):
     password: Optional[str] = None
 
 
-class PersonnelCreate(BaseModel):
+class PersonnelCreate(ContactFields):
     """Personel ekranından hızlı ekleme için (username verilmezse full_name'den türetilir)."""
     username: Optional[str] = None
     email: Optional[EmailStr] = None
@@ -70,7 +84,7 @@ class PersonnelCreate(BaseModel):
         return normalize_role_code(v)
 
 
-class UserUpdate(BaseModel):
+class UserUpdate(ContactFields):
     username: Optional[str] = None
     email: Optional[EmailStr] = None
     full_name: Optional[str] = None

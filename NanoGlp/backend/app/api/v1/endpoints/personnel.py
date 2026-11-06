@@ -5,7 +5,9 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.user import User
-from app.schemas.user import UserOut, PersonnelCreate, validate_username_format
+from app.schemas.user import UserOut, PersonnelCreate, PersonnelContactUpdate, validate_username_format
+from app.models.audit_log import AuditLog
+from sqlalchemy.exc import IntegrityError
 from app.seed import DEFAULT_PASSWORD
 from app.utils.security import get_password_hash, require_management_read, require_management_write
 
@@ -74,6 +76,7 @@ def create_personnel(
     user = User(
         username=username,
         email=user_in.email,
+        phone=user_in.phone,
         full_name=user_in.full_name,
         role=user_in.role,
         is_active=user_in.is_active,
@@ -83,5 +86,35 @@ def create_personnel(
     )
     db.add(user)
     db.commit()
+    db.refresh(user)
+    return user
+
+
+@router.patch("/{user_id}/contact", response_model=UserOut, summary="Yalnız Personel İletişim Bilgilerini Güncelle")
+def update_personnel_contact(
+    user_id: int,
+    payload: "PersonnelContactUpdate",
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_management_write),
+):
+    user = db.get(User, user_id)
+    if user is None or _role_str(user) in EXCLUDED_PERSONNEL_ROLES:
+        raise HTTPException(status_code=404, detail="Personel bulunamadı.")
+    values = payload.model_dump(exclude_unset=True)
+    if values.get("email") and db.query(User).filter(
+        func.lower(User.email) == values["email"].lower(), User.id != user_id
+    ).first():
+        raise HTTPException(status_code=400, detail="Bu e-posta adresi başka bir kullanıcıda kayıtlı.")
+    old = {key: getattr(user, key) for key in values}
+    for key, value in values.items():
+        setattr(user, key, value)
+    if old != values:
+        db.add(AuditLog(user_id=current_user.id, entity_name="User", entity_id=user.id,
+                        action="UPDATE_PERSONNEL_CONTACT", old_values=old, new_values=values))
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="İletişim bilgisi başka bir kullanıcıda kayıtlı.")
     db.refresh(user)
     return user
