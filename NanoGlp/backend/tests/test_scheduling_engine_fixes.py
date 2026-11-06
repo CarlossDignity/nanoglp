@@ -357,6 +357,9 @@ class SchedulingEngineFixRound1Tests(unittest.TestCase):
         self.db.add(s_missing_ref)
         self.db.commit()
         schedule_new_study(self.db, s_missing_ref.id, date(2026, 11, 16))
+        # Execution validation requires an approved plan, even when reference time is missing.
+        s_missing_ref.status = StudyStatus.APPROVED
+        self.db.commit()
         ref_step_noref = (
             self.db.query(StudyStep)
             .filter(StudyStep.study_id == s_missing_ref.id, StudyStep.step_order == 3)

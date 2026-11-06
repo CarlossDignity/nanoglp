@@ -242,6 +242,9 @@ def main(_facility_clock):
         check(my_tasks.status_code == 200 and len(my_tasks.json()["todays_tasks"]) >= 1,
               "Teknisyen GET /my-tasks kendi görevlerini döndürüyor")
         step_id = my_tasks.json()["todays_tasks"][0]["id"]
+        # This case exercises technician permissions; execution needs an approved fixture.
+        db.get(StudyStep, step_id).study.status = StudyStatus.APPROVED
+        db.commit()
         upd = client.patch(f"/api/v1/planning/steps/{step_id}/status", headers=h_tech1,
                            json={"status": "IN_PROGRESS"})
         check(upd.status_code == 200 and upd.json()["status"] == "IN_PROGRESS",

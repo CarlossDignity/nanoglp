@@ -1218,6 +1218,18 @@ def api_update_step_status(
             detail="Yalnızca kendinize atanmış görevlerin durumunu güncelleyebilirsiniz.",
         )
 
+    # Gate every payload (including reference-only/late entries) before parsing,
+    # mutation, conflict revalidation or audit writes. Keep role/assignment checks above.
+    if step.study is None or step.study.status not in (StudyStatus.APPROVED, StudyStatus.IN_PROGRESS):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Görev yürütmek veya gerçekleşme kaydetmek için çalışma planı onaylanmış "
+                "(APPROVED) veya çalışma devam ediyor (IN_PROGRESS) olmalıdır. "
+                "Mevcut çalışma durumunda görev değiştirilemez."
+            ),
+        )
+
     old_status = step.status.value
     utc_now = datetime.utcnow()
     local_now = _facility_now()
