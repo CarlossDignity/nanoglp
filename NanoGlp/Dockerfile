@@ -16,7 +16,9 @@ FROM python:3.11-slim AS runtime
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     ENV=production \
-    APP_ENV=production
+    APP_ENV=production \
+    DATABASE_URL=sqlite:////app/backend/data/nanolab_glp.db \
+    UPLOAD_DIR=/app/backend/uploads
 
 WORKDIR /app
 
@@ -38,7 +40,7 @@ COPY ["Study Status last version (2).xlsx", "./Study Status last version (2).xls
 COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
 
 # Kalıcı veri ve yükleme dizinleri
-RUN mkdir -p /app/backend/uploads
+RUN mkdir -p /app/backend/data /app/backend/uploads
 
 WORKDIR /app/backend
 EXPOSE 8000

@@ -20,3 +20,6 @@ backend/.env
 *.log
 .DS_Store
 Thumbs.db
+
+# Docker persistent SQLite directory (including WAL/SHM)
+backend/data/
