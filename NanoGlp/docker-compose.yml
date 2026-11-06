@@ -17,8 +17,9 @@ services:
       - DATABASE_URL=sqlite:////app/backend/data/nanolab_glp.db
       - UPLOAD_DIR=/app/backend/uploads
     volumes:
+      # Mevcut veriler için önce docs/docker-data-migration.md yönergesini izleyin.
       # SQLite WAL veritabanı ve yüklenen PDF/Excel belgeleri için kalıcı (persistent) disk alanları
-      - ./backend/nanolab_glp.db:/app/backend/nanolab_glp.db
+      - ./backend/data:/app/backend/data
       - ./backend/uploads:/app/backend/uploads
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/api/v1/health"]
