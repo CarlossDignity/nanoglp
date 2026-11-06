@@ -1,3 +1,4 @@
+import AnimalOrder from '../components/AnimalOrder';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { Check, FileDown, Loader2, Plus, Trash2, UploadCloud, X } from 'lucide-react';
@@ -1766,7 +1767,9 @@ export default function SampleTracking() {
                                     </p>
                                   )}
 
-                                  {s.kind === 'approval' ? (
+                                  {s.no === 3 ? (
+                                    <AnimalOrder key={detail.id} step={s} busy={busy['wf-3']} onAction={body => doWorkflow(3, body)} />
+                                  ) : s.kind === 'approval' ? (
                                     <div className="mt-1.5 flex flex-wrap gap-1.5">
                                       {s.approvals.map((a) => (
                                         <span key={a.key} className="inline-flex items-center gap-1.5 border border-slate-200 rounded px-1.5 py-1 text-[11px]">

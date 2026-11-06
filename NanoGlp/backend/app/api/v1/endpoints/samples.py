@@ -5,7 +5,7 @@ from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -81,6 +81,9 @@ class PlanIn(BaseModel):
 class WorkflowActionIn(BaseModel):
     action: str                      # complete | undo | sign | revoke
     approver: Optional[str] = None   # CY | KG | TBY (adım 6 ve 11)
+    order_date: Optional[date] = None
+    estimated_delivery_days: Optional[int] = Field(None, ge=0)
+    received_date: Optional[date] = None
 
 
 def _get_or_404(db: Session, sample_id: int) -> SampleRecord:
@@ -411,7 +414,13 @@ def workflow_action(
             raise HTTPException(status_code=403, detail=f"'{step_def['title']}' adımını yalnızca {step_def['owner']} güncelleyebilir.")
         if step_no == 4 and sample.lab_arrival_date:
             raise HTTPException(status_code=409, detail="Laboratuvara geliş tarihi girildiği için bu adım otomatik tamamlandı.")
-        if action == "complete":
+        if step_no == 3:
+            from app.services.animal_order import transition_animal_order
+            updated = transition_animal_order(state, payload, current_user)
+            if updated == state:
+                return ss.serialize_sample(db, sample, perms, sync_schedule_dates=False)
+            wf["3"] = updated
+        elif action == "complete":
             wf[str(step_no)] = {"done": True, "done_by": current_user.full_name, "done_at": now}
         elif action == "undo":
             wf[str(step_no)] = {"done": False}
@@ -427,7 +436,7 @@ def workflow_action(
         )
     )
     db.commit()
-    out = ss.serialize_sample(db, sample, perms)
+    out = ss.serialize_sample(db, sample, perms, sync_schedule_dates=(step_no != 3))
     db.commit()
     return out
 
